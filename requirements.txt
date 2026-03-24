@@ -1,0 +1,9 @@
+langchain
+langchain-core
+langchain-openai
+langchain-community
+langchain-ollama
+langgraph>=0.1.0
+httpx
+pydantic
+python-dotenv

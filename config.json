@@ -1,0 +1,18 @@
+{
+    "default_model": "local_ollama",
+    "models": {
+        "local_ollama": {
+            "provider": "ollama",
+            "model": "lfm2.5-thinking:latest",
+            "base_url": "http://localhost:11434"
+        },
+        "remote_openai": {
+            "provider": "openai",
+            "model": "gpt-4o",
+            "base_url": "https://api.openai.com/v1",
+            "api_key": "YOUR_API_KEY_HERE"
+        }
+    },
+    "mcp_dir": "mcp_servers",
+    "skills_dir": "skills"
+}
