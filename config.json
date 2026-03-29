@@ -3,7 +3,7 @@
     "models": {
         "local_ollama": {
             "provider": "ollama",
-            "model": "lfm2.5-thinking:latest",
+            "model": "lfm2:latest",
             "base_url": "http://localhost:11434"
         },
         "remote_openai": {
