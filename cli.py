@@ -34,6 +34,18 @@ def start_cli():
                     print("Usage: /llm <provider> <model> [base_url] [api_key]")
             elif cmd == "/load_skill":
                 print("Skill loading feature placeholder.")
+            elif cmd == "/replay":
+                parts = user_input.split()
+                if len(parts) >= 2:
+                    print(agent.replay(int(parts[1]), parts[2:]))
+                else:
+                    print("Usage: /replay <memory_id> [injected features...]")
+            elif cmd == "/convert_skill":
+                parts = user_input.split()
+                if len(parts) >= 2:
+                    print(agent.convert_memory_to_skill(int(parts[1])))
+                else:
+                    print("Usage: /convert_skill <memory_id>")
             elif cmd == "/load_mcp":
                 parts = user_input.split()
                 if len(parts) >= 2:

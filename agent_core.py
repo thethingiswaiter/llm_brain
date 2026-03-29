@@ -228,10 +228,63 @@ class AgentCore:
             return "Graph is not initialized."
         try:
             inputs = {"messages": [HumanMessage(content=query)], "plan": [], "current_subtask_index": 0, "reflections": [], "global_keywords": []}
+            res = self.graph.invoke(inputs)
             return res["messages"][-1].content
         except Exception as e:
             import traceback
             traceback.print_exc()
             return f"Error invoking agent: {e}"
+
+    def replay(self, memory_id: int, injected_features: list[str] = None):
+        """
+        重现能力 (Replay)
+        """
+        memory_data = self.memory.load_full_memory(memory_id)
+        if not memory_data:
+            return "Memory not found."
+        
+        raw_input = memory_data.get("input", "")
+        if injected_features:
+            raw_input = f"[Injected features: {', '.join(injected_features)}]\n" + raw_input
+        print(f"Replaying memory {memory_id} with injection...")
+        return self.invoke(raw_input)
+
+    def convert_memory_to_skill(self, memory_id: int):
+        """
+        记忆-技能转化
+        """
+        import sqlite3
+        import json
+        import os
+        conn = sqlite3.connect(self.memory.db_path)
+        c = conn.cursor()
+        c.execute("SELECT summary, keywords FROM interactions WHERE id = ?", (memory_id,))
+        res = c.fetchone()
+        conn.close()
+        
+        if not res:
+            return "Memory not found."
+            
+        summary, keywords = res
+        keywords_list = json.loads(keywords)
+        memory_data = self.memory.load_full_memory(memory_id)
+        logic = memory_data.get("output", "None")
+        
+        name = summary.replace(" ", "_")[:20]
+        md_content = f"""---
+name: "{name}"
+confidence: 40
+keywords: {json.dumps(keywords_list)}
+description: "{summary}"
+entry_node: "main"
+---
+{logic}
+"""
+        filepath = os.path.join(self.skills.skills_md_dir, f"{name}.md")
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(md_content)
+            
+        self.skills.load_skill_md(f"{name}.md")
+        return f"Successfully converted memory {memory_id} to skill {name}.md"
 
 agent = AgentCore()
