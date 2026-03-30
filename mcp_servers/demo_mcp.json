@@ -1,0 +1,37 @@
+{
+  "name": "demo_mcp",
+  "description": "A minimal MCP-style server config that exposes local structured tools.",
+  "transport": "config",
+  "tools": [
+    {
+      "name": "lookup_release_note",
+      "description": "Return a mock release note for a named component.",
+      "parameters": {
+        "component": {
+          "type": "string",
+          "description": "Component or module name to inspect.",
+          "required": true
+        }
+      },
+      "response_template": "Release note for {component}: this MCP demo tool is active and responding from config."
+    },
+    {
+      "name": "summarize_incident_status",
+      "description": "Return a mock incident status summary for a given service and priority.",
+      "parameters": {
+        "service": {
+          "type": "string",
+          "description": "Service name.",
+          "required": true
+        },
+        "priority": {
+          "type": "string",
+          "description": "Priority level such as P1 or P2.",
+          "required": false,
+          "default": "P3"
+        }
+      },
+      "response_template": "Incident summary for {service}: current priority is {priority}, owner acknowledged, next update in 30 minutes."
+    }
+  ]
+}

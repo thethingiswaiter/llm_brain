@@ -1,4 +1,6 @@
 import os
+import re
+import uuid
 import importlib.util
 from typing import Annotated, Literal, TypedDict, List, Dict, Any
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
@@ -12,32 +14,137 @@ from cognitive.feature_extractor import CognitiveSystem
 from cognitive.planner import TaskPlanner
 from cognitive.reflector import Reflector
 from memory.memory_manager import MemoryManager
+from mcp_servers.mcp_manager import MCPManager
 from skills_md.skill_parser import SkillManager
 
 class AgentState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
-    # Advanced state variables for new architecture
-    plan: List[Dict[str, Any]]  
+    plan: List[Dict[str, Any]]
     current_subtask_index: int
     reflections: List[str]
     global_keywords: List[str]
+    session_id: str
+    session_memory_id: int
+    domain_label: str
+    memory_summaries: List[Dict[str, Any]]
+    retry_counts: Dict[str, int]
+    blocked: bool
+    final_response: str
 
 class AgentCore:
     def __init__(self):
         self.tools = []
-        self.mcp_servers = []
+        self.loaded_python_skill_files = set()
+        self.loaded_tool_names = set()
         self.graph = None
+        self.session_id = self._generate_session_id()
         
         # Instantiate sub-systems
         self.cognitive = CognitiveSystem()
         self.planner = TaskPlanner()
         self.reflector = Reflector()
         self.memory = MemoryManager()
+        self.mcp = MCPManager()
         self.skills = SkillManager()
         
         self._auto_load_skills()
         self._auto_load_mcp_servers()
         self._build_graph()
+
+    def _generate_session_id(self) -> str:
+        return f"session_{uuid.uuid4().hex[:12]}"
+
+    def start_session(self, session_id: str = None) -> str:
+        self.session_id = session_id or self._generate_session_id()
+        return self.session_id
+
+    def _tokenize_text(self, text: str) -> set[str]:
+        return {token for token in re.findall(r"[a-zA-Z0-9_]+", text.lower()) if len(token) > 2}
+
+    def _select_relevant_memories(self, memories: List[Dict[str, Any]], keywords: List[str], limit: int = 3):
+        keyword_set = {kw.strip().lower() for kw in keywords if isinstance(kw, str) and kw.strip()}
+        if not memories:
+            return []
+        if not keyword_set:
+            return memories[:limit]
+
+        relevant = []
+        for memory_item in memories:
+            overlap = memory_item.get("overlap_count")
+            if overlap is None:
+                memory_keyword_set = {
+                    kw.strip().lower() for kw in memory_item.get("keywords", [])
+                    if isinstance(kw, str) and kw.strip()
+                }
+                overlap = len(keyword_set & memory_keyword_set)
+            if overlap > 0:
+                enriched_item = dict(memory_item)
+                enriched_item["overlap_count"] = overlap
+                relevant.append(enriched_item)
+
+        relevant.sort(key=lambda item: (item.get("overlap_count", 0), item.get("weight", 0), item.get("id", 0)), reverse=True)
+        return relevant[:limit]
+
+    def _format_memory_context(self, memories: List[Dict[str, Any]]) -> str:
+        if not memories:
+            return ""
+
+        lines = ["Relevant memory summaries:"]
+        for memory_item in memories:
+            keywords = ", ".join(memory_item.get("keywords", [])[:5])
+            lines.append(
+                f"- Memory #{memory_item['id']}: {memory_item.get('summary', '')}"
+                f" | keywords: {keywords} | weight: {memory_item.get('weight', 0)}"
+            )
+        return "\n".join(lines)
+
+    def _load_detailed_memory_context(self, memories: List[Dict[str, Any]]) -> str:
+        if not memories or len(memories) > 1:
+            return ""
+
+        memory_data = self.memory.load_full_memory(memories[0]["id"])
+        if not memory_data:
+            return ""
+
+        details = []
+        raw_input = memory_data.get("input", "").strip()
+        raw_output = memory_data.get("output", "").strip()
+        if raw_input:
+            details.append(f"Input: {raw_input[:800]}")
+        if raw_output:
+            details.append(f"Output: {raw_output[:800]}")
+        if not details:
+            return ""
+        return "Relevant memory details:\n" + "\n".join(details)
+
+    def _record_step_memory(self, session_id: str, domain: str, subtask_desc: str,
+                            actual: str, reflection_note: str):
+        step_keywords, step_summary = self.cognitive.extract_features(subtask_desc)
+        memory_output = actual.strip()
+        if reflection_note:
+            memory_output = f"{memory_output}\n\nReflection: {reflection_note}".strip()
+        self.memory.add_memory(
+            session_id,
+            domain,
+            list(step_keywords)[:10],
+            f"Step: {step_summary}",
+            subtask_desc,
+            memory_output,
+            "",
+        )
+
+    def _finalize_session_memory(self, state: AgentState, final_output: str):
+        session_memory_id = state.get("session_memory_id")
+        if not session_memory_id:
+            return
+
+        reflections = state.get("reflections", [])
+        persisted_output = final_output.strip()
+        if reflections:
+            persisted_output = (
+                f"{persisted_output}\n\nReflection summary:\n" + "\n".join(reflections)
+            ).strip()
+        self.memory.update_memory(session_memory_id, raw_output=persisted_output)
 
     def _auto_load_skills(self):
         """Automatically scan and load python skills from the skills directory"""
@@ -48,30 +155,19 @@ class AgentCore:
 
         for filename in os.listdir(skills_path):
             if filename.endswith(".py") and not filename.startswith("__"):
-                module_name = filename[:-3]
-                file_path = os.path.join(skills_path, filename)
-                try:
-                    spec = importlib.util.spec_from_file_location(module_name, file_path)
-                    module = importlib.util.module_from_spec(spec)
-                    spec.loader.exec_module(module)
-                    # Convention: look for 'tools' list in the module
-                    if hasattr(module, "tools"):
-                        self.tools.extend(module.tools)
-                        print(f"Loaded skills from {filename}")
-                except Exception as e:
-                    print(f"Failed to load skill {filename}: {e}")
+                self._load_python_skill_file(os.path.join(skills_path, filename), rebuild_graph=False)
 
     def _auto_load_mcp_servers(self):
         """Automatically scan and load MCP servers from the mcp directory"""
-        mcp_path = os.path.join(os.path.dirname(__file__), config.mcp_dir)
+        mcp_path = config.resolve_path(config.mcp_dir)
         if not os.path.exists(mcp_path):
             os.makedirs(mcp_path)
             return
-            
-        # Placeholder for scanning MCP config files (like JSON/YAML)
-        for filename in os.listdir(mcp_path):
-            if filename.endswith(".json") or filename.endswith(".yaml"):
-                print(f"Found MCP server config: {filename} (Load logic to be implemented)")
+
+        for filename in sorted(os.listdir(mcp_path)):
+            if filename.endswith((".json", ".yaml", ".yml")):
+                success, message = self.load_mcp_server(filename, rebuild_graph=False)
+                print(message)
 
     def select_active_tools(self, query: str):
         """
@@ -79,17 +175,118 @@ class AgentCore:
         based on the user's query semantics, to prevent token overflow.
         Returns the subset of selected tools.
         """
-        # Right now we just return all tools, but you can add vector search or LLM routing here later.
-        selected_tools = self.tools
-        return selected_tools
+        capability_bundle = self.skills.assign_capabilities_to_task(query, list(self._tokenize_text(query)))
+        selected_tools = capability_bundle.get("tools", [])
+        if selected_tools:
+            return selected_tools
+        return []
 
     def add_tool(self, tool):
+        tool_name = getattr(tool, "name", None)
+        if tool_name and tool_name in self.loaded_tool_names:
+            return False
         self.tools.append(tool)
+        if tool_name:
+            self.loaded_tool_names.add(tool_name)
+        self.skills.register_tool(tool, source_type="runtime")
         self._build_graph()
+        return True
 
-    def load_mcp_server(self, server_url):
-        # Placeholder for real MCP connection logic since it's v1 phase
-        print(f"Loading MCP Server from {server_url}")
+    def _load_python_skill_file(self, file_path: str, rebuild_graph: bool = True):
+        filename = os.path.basename(file_path)
+        if filename in self.loaded_python_skill_files:
+            return False, f"Python skill {filename} is already loaded."
+
+        module_name = os.path.splitext(filename)[0]
+        try:
+            spec = importlib.util.spec_from_file_location(module_name, file_path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            if not hasattr(module, "tools"):
+                return False, f"Skill file {filename} does not export a tools list."
+
+            added_tools = []
+            for tool in module.tools:
+                tool_name = getattr(tool, "name", None)
+                if tool_name and tool_name in self.loaded_tool_names:
+                    continue
+                self.tools.append(tool)
+                if tool_name:
+                    self.loaded_tool_names.add(tool_name)
+                added_tools.append(tool)
+            self.skills.register_tools(added_tools, source_type="python", source_file=filename)
+            self.loaded_python_skill_files.add(filename)
+            if rebuild_graph:
+                self._build_graph()
+            print(f"Loaded skills from {filename}")
+            return True, f"Loaded Python skill file: {filename}"
+        except Exception as e:
+            return False, f"Failed to load skill {filename}: {e}"
+
+    def load_skill(self, skill_name: str):
+        normalized_name = skill_name.strip()
+        if not normalized_name:
+            return "Usage: /load_skill <skill_name.py|skill_name.md>"
+
+        if normalized_name.endswith(".md"):
+            skill = self.skills.load_skill_md(normalized_name)
+            if not skill:
+                return f"Markdown skill not found: {normalized_name}"
+            return f"Loaded Markdown skill: {skill['name']} ({normalized_name})"
+
+        python_name = normalized_name if normalized_name.endswith(".py") else f"{normalized_name}.py"
+        python_path = os.path.join(os.path.dirname(__file__), config.skills_dir, python_name)
+        if os.path.exists(python_path):
+            _, message = self._load_python_skill_file(python_path)
+            return message
+
+        markdown_name = normalized_name if normalized_name.endswith(".md") else f"{normalized_name}.md"
+        skill = self.skills.load_skill_md(markdown_name)
+        if skill:
+            return f"Loaded Markdown skill: {skill['name']} ({markdown_name})"
+
+        return f"Skill not found: {skill_name}"
+
+    def load_mcp_server(self, server_ref: str, rebuild_graph: bool = True):
+        normalized_ref = server_ref.strip()
+        if not normalized_ref:
+            return False, "Usage: /load_mcp <config_name.json|config_name.yaml|absolute_path>"
+
+        if os.path.isabs(normalized_ref):
+            config_path = normalized_ref
+        else:
+            config_path = config.resolve_path(os.path.join(config.mcp_dir, normalized_ref))
+            if not os.path.exists(config_path):
+                mcp_dir = config.resolve_path(config.mcp_dir)
+                for extension in (".json", ".yaml", ".yml"):
+                    candidate = os.path.join(mcp_dir, normalized_ref + extension)
+                    if os.path.exists(candidate):
+                        config_path = candidate
+                        break
+
+        success, message, _, tools = self.mcp.load_server(config_path)
+        if not success:
+            return False, message
+
+        added_tools = []
+        for tool in tools:
+            tool_name = getattr(tool, "name", None)
+            if tool_name and tool_name in self.loaded_tool_names:
+                continue
+            self.tools.append(tool)
+            if tool_name:
+                self.loaded_tool_names.add(tool_name)
+            added_tools.append(tool)
+
+        self.skills.register_tools(added_tools, source_type="mcp", source_file=os.path.basename(config_path))
+        added = len(added_tools)
+
+        if rebuild_graph and added:
+            self._build_graph()
+        elif rebuild_graph and not added:
+            message = f"{message} All declared tools were already registered."
+
+        return True, message
 
     def _build_graph(self):
         graph_builder = StateGraph(AgentState)
@@ -97,22 +294,43 @@ class AgentCore:
         def initial_planning(state: AgentState):
             msgs = state["messages"]
             last_message_content = msgs[-1].content if msgs else ""
+            session_id = state.get("session_id") or self.start_session()
             
             # 1. Feature Extraction (Global task constraints: max 30 keywords)
             keywords, summary = self.cognitive.extract_features(last_message_content)
+            normalized_keywords = list(keywords)[:30]
             domain = self.cognitive.determine_domain(last_message_content)
-            
-            # Save raw input to memory system
-            self.memory.add_memory("session_1", domain, list(keywords)[:30], summary, last_message_content, "", "")
+            memory_summaries = self.memory.retrieve_memory(
+                match_keywords=normalized_keywords,
+                limit=5,
+                exclude_conv_id=session_id,
+            )
+
+            session_memory_id = self.memory.add_memory(
+                session_id,
+                domain,
+                normalized_keywords,
+                summary,
+                last_message_content,
+                "",
+                "",
+            )
             
             # 2. Planning (Decompose complex tasks into granular subtasks)
             plan = self.planner.split_task(last_message_content)
             
             return {
-                "plan": plan, 
-                "current_subtask_index": 0, 
-                "global_keywords": list(keywords)[:30], 
-                "reflections": []
+                "plan": plan,
+                "current_subtask_index": 0,
+                "global_keywords": normalized_keywords,
+                "reflections": [],
+                "session_id": session_id,
+                "session_memory_id": session_memory_id,
+                "domain_label": domain,
+                "memory_summaries": memory_summaries,
+                "retry_counts": {},
+                "blocked": False,
+                "final_response": "",
             }
         
         def call_model_subtask(state: AgentState):
@@ -120,25 +338,59 @@ class AgentCore:
             idx = state.get("current_subtask_index", 0)
             
             if idx >= len(plan):
-                # All subtasks complete
-                return {"messages": [AIMessage(content="All subtasks completed successfully.")]}
+                final_response = state.get("final_response") or "All subtasks completed successfully."
+                return {"messages": [AIMessage(content=final_response)]}
                 
             current_subtask = plan[idx]
             subtask_desc = current_subtask.get("description", "")
             
             # Subtask feature extraction: 3-5 keywords
-            sub_kws, sub_sum = self.cognitive.extract_features(subtask_desc)
+            sub_kws, _ = self.cognitive.extract_features(subtask_desc)
             sub_kws = sub_kws[:5]
+
+            relevant_memories = self._select_relevant_memories(state.get("memory_summaries", []), sub_kws)
+            if not relevant_memories:
+                relevant_memories = self.memory.retrieve_memory(
+                    match_keywords=sub_kws,
+                    limit=3,
+                    exclude_conv_id=state.get("session_id"),
+                    exclude_ids=[state.get("session_memory_id", 0)],
+                )
+
+            memory_sections = []
+            summary_context = self._format_memory_context(relevant_memories)
+            if summary_context:
+                memory_sections.append(summary_context)
+            detailed_context = self._load_detailed_memory_context(relevant_memories)
+            if detailed_context:
+                memory_sections.append(detailed_context)
             
             # Assign Skill
-            assigned_skill = self.skills.assign_skill_to_task(subtask_desc, sub_kws)
+            capability_bundle = self.skills.assign_capabilities_to_task(subtask_desc, sub_kws)
+            assigned_skill = capability_bundle.get("prompt_skill")
             skill_context = f"\nUse skill: {assigned_skill['name']}\n{assigned_skill['body']}" if assigned_skill else ""
+            tool_skills = capability_bundle.get("tool_skills", [])
+            selected_tools = capability_bundle.get("tools", [])
+            if not selected_tools:
+                selected_tools = self.select_active_tools(subtask_desc)
             
             # Generate local prompt for LLM
-            prompt = f"Executing Subtask {idx+1}: {subtask_desc}\n{skill_context}"
+            prompt_sections = [
+                f"Original user request: {state['messages'][0].content}",
+                f"Executing Subtask {idx+1}: {subtask_desc}",
+            ]
+            if memory_sections:
+                prompt_sections.append("\n\n".join(memory_sections))
+            if skill_context:
+                prompt_sections.append(skill_context.strip())
+            if tool_skills:
+                tool_context = "Suggested tools:\n" + "\n".join(
+                    f"- {item['name']}: {item.get('description', '')}" for item in tool_skills
+                )
+                prompt_sections.append(tool_context)
+            prompt = "\n\n".join(prompt_sections)
             messages = state["messages"] + [HumanMessage(content=prompt)]
-            
-            selected_tools = self.select_active_tools(subtask_desc)
+
             llm = llm_manager.get_llm()
             if selected_tools:
                 llm = llm.bind_tools(selected_tools)
@@ -163,25 +415,68 @@ class AgentCore:
                 current_subtask.get("description", ""), expected, actual
             )
             
-            reflections = state.get("reflections", [])
+            reflections = list(state.get("reflections", []))
             reflections.append(f"Subtask {idx+1}: {reflection_note}")
+            self._record_step_memory(
+                state.get("session_id", self.session_id),
+                state.get("domain_label", "general"),
+                current_subtask.get("description", ""),
+                actual,
+                reflection_note,
+            )
+
+            retry_counts = dict(state.get("retry_counts", {}))
+            retry_key = str(idx)
+            retry_count = retry_counts.get(retry_key, 0)
             
             if not success and action == "ask_user":
+                blocked_message = (
+                    f"Error blocked subtask. Reflection analysis: {reflection_note}\nNeed user intervention."
+                )
+                self._finalize_session_memory(state, blocked_message)
                 return {
-                    "messages": [AIMessage(content=f"Error blocked subtask. Reflection analysis: {reflection_note}\nNeed user intervention.")],
-                    "reflections": reflections
+                    "messages": [AIMessage(content=blocked_message)],
+                    "reflections": reflections,
+                    "blocked": True,
+                    "final_response": blocked_message,
+                    "retry_counts": retry_counts,
                 }
             
             # Advance to next subtask if successful or if action is 'continue'
             if success or action == "continue":
+                next_index = idx + 1
+                if next_index >= len(plan):
+                    self._finalize_session_memory(state, actual)
                 return {
-                    "current_subtask_index": idx + 1,
-                    "reflections": reflections
+                    "current_subtask_index": next_index,
+                    "reflections": reflections,
+                    "blocked": False,
+                    "final_response": actual if next_index >= len(plan) else state.get("final_response", ""),
+                    "retry_counts": retry_counts,
                 }
             
-            # Handled 'retry' implicitly (index not incremented, will re-run subtask)
-            return {"reflections": reflections}
-            
+            retry_count += 1
+            retry_counts[retry_key] = retry_count
+            if retry_count >= 2:
+                blocked_message = (
+                    f"Subtask {idx+1} exceeded retry limit. Reflection analysis: {reflection_note}\n"
+                    "Need user intervention."
+                )
+                self._finalize_session_memory(state, blocked_message)
+                return {
+                    "messages": [AIMessage(content=blocked_message)],
+                    "reflections": reflections,
+                    "blocked": True,
+                    "final_response": blocked_message,
+                    "retry_counts": retry_counts,
+                }
+
+            return {
+                "reflections": reflections,
+                "retry_counts": retry_counts,
+                "blocked": False,
+            }
+
         def should_continue(state: AgentState) -> Literal["tools", "reflect_and_advance", "__end__"]:
             messages = state["messages"]
             last_message = messages[-1]
@@ -189,16 +484,17 @@ class AgentCore:
             if last_message.tool_calls:
                 return "tools"
             
+            return "reflect_and_advance"
+
+        def should_continue_after_reflection(state: AgentState) -> Literal["agent", "__end__"]:
+            if state.get("blocked"):
+                return "__end__"
+
             plan = state.get("plan", [])
             idx = state.get("current_subtask_index", 0)
             if idx >= len(plan):
                 return "__end__"
-                
-            # Need user intervention check
-            if "Need user intervention" in last_message.content:
-                return "__end__"
-                
-            return "reflect_and_advance"
+            return "agent"
             
         # Add nodes
         graph_builder.add_node("planner", initial_planning)
@@ -218,16 +514,33 @@ class AgentCore:
         })
         if self.tools:
             graph_builder.add_edge("tools", "agent")
-            
-        graph_builder.add_edge("reflect_and_advance", "agent")
+
+        graph_builder.add_conditional_edges("reflect_and_advance", should_continue_after_reflection, {
+            "agent": "agent",
+            "__end__": END
+        })
         
         self.graph = graph_builder.compile()
 
-    def invoke(self, query: str):
+    def invoke(self, query: str, session_id: str = None):
         if not self.graph:
             return "Graph is not initialized."
         try:
-            inputs = {"messages": [HumanMessage(content=query)], "plan": [], "current_subtask_index": 0, "reflections": [], "global_keywords": []}
+            active_session_id = session_id or self.session_id or self.start_session()
+            inputs = {
+                "messages": [HumanMessage(content=query)],
+                "plan": [],
+                "current_subtask_index": 0,
+                "reflections": [],
+                "global_keywords": [],
+                "session_id": active_session_id,
+                "session_memory_id": 0,
+                "domain_label": "general",
+                "memory_summaries": [],
+                "retry_counts": {},
+                "blocked": False,
+                "final_response": "",
+            }
             res = self.graph.invoke(inputs)
             return res["messages"][-1].content
         except Exception as e:

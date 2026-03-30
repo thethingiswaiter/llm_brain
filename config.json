@@ -14,5 +14,8 @@
         }
     },
     "mcp_dir": "mcp_servers",
-    "skills_dir": "skills"
+    "skills_dir": "skills",
+    "skills_md_dir": "skills_md",
+    "memory_db_path": "memory/memory.db",
+    "memory_backup_dir": "memory/backups"
 }

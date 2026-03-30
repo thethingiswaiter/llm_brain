@@ -12,13 +12,22 @@ class LLMConfig(BaseModel):
 
 class AppConfig:
     def __init__(self):
-        self.config_path = os.path.join(os.path.dirname(__file__), "config.json")
+        self.base_dir = os.path.dirname(__file__)
+        self.config_path = os.path.join(self.base_dir, "config.json")
         self.models_config = {}
         self.default_model_key = ""
         self.mcp_dir = "mcp_servers"
         self.skills_dir = "skills"
+        self.skills_md_dir = "skills_md"
+        self.memory_db_path = os.path.join("memory", "memory.db")
+        self.memory_backup_dir = os.path.join("memory", "backups")
         self.llm_config = LLMConfig()
         self._load_config()
+
+    def resolve_path(self, path: str) -> str:
+        if os.path.isabs(path):
+            return path
+        return os.path.abspath(os.path.join(self.base_dir, path))
 
     def _load_config(self):
         if os.path.exists(self.config_path):
@@ -29,6 +38,9 @@ class AppConfig:
             self.default_model_key = data.get("default_model", "")
             self.mcp_dir = data.get("mcp_dir", "mcp_servers")
             self.skills_dir = data.get("skills_dir", "skills")
+            self.skills_md_dir = data.get("skills_md_dir", "skills_md")
+            self.memory_db_path = data.get("memory_db_path", os.path.join("memory", "memory.db"))
+            self.memory_backup_dir = data.get("memory_backup_dir", os.path.join("memory", "backups"))
             
             # Load default model
             if self.default_model_key in self.models_config:
