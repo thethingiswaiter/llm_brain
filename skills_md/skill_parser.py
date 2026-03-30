@@ -6,7 +6,8 @@ from config import config
 
 class SkillManager:
     STOPWORDS = {
-        "the", "and", "for", "with", "that", "this", "from", "into", "your", "have",
+        "a", "an", "the", "and", "for", "with", "that", "this", "from", "into", "your", "have",
+        "in", "on", "at", "to", "of", "is", "are", "me", "my", "our", "please", "current",
         "will", "would", "could", "should", "about", "there", "their", "then", "than",
         "when", "where", "which", "what", "tell", "give", "show", "user", "name", "tool",
     }
@@ -35,6 +36,16 @@ class SkillManager:
         tokens = re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]{2,}", prepared_text)
         return [token for token in tokens if len(token) > 1 and token not in self.STOPWORDS]
 
+    def _match_ratio(self, overlap: int, task_terms: set[str]) -> float:
+        if not task_terms:
+            return 0.0
+        return overlap / len(task_terms)
+
+    def _passes_threshold(self, overlap: int, task_terms: set[str], min_overlap: int, min_ratio: float) -> bool:
+        if overlap < min_overlap:
+            return False
+        return self._match_ratio(overlap, task_terms) >= min_ratio
+
     def refresh_skills(self) -> int:
         self.loaded_skills = []
         self.loaded_skill_files = set()
@@ -43,8 +54,18 @@ class SkillManager:
                 self.load_skill_md(filename)
         return len(self.loaded_skills)
 
-    def load_skill_md(self, filename: str) -> Optional[Dict[str, Any]]:
+    def _evict_skill_cache(self, filename: str):
+        self.loaded_skills = [
+            skill for skill in self.loaded_skills
+            if skill.get("source_file") != filename
+        ]
+        self.loaded_skill_files.discard(filename)
+
+    def load_skill_md(self, filename: str, force_reload: bool = False) -> Optional[Dict[str, Any]]:
         filename = os.path.basename(filename)
+        if force_reload:
+            self._evict_skill_cache(filename)
+
         if filename in self.loaded_skill_files:
             for skill in self.loaded_skills:
                 if skill.get("source_file") == filename:
@@ -117,6 +138,13 @@ class SkillManager:
         normalized_keywords = set(self._normalize_keywords(keywords))
         for skill in self.loaded_skills:
             overlap = len(normalized_keywords & set(skill.get("keywords", [])))
+            if not self._passes_threshold(
+                overlap,
+                normalized_keywords,
+                config.prompt_skill_min_overlap,
+                config.prompt_skill_min_match_ratio,
+            ):
+                continue
             if overlap > max_overlap:
                 max_overlap = overlap
                 best_skill = skill
@@ -131,12 +159,18 @@ class SkillManager:
         for tool_skill in self.loaded_tool_skills.values():
             tool_terms = set(tool_skill.get("keywords", []))
             overlap = len(task_terms & tool_terms)
-            if overlap == 0:
+            if not self._passes_threshold(
+                overlap,
+                task_terms,
+                config.tool_skill_min_overlap,
+                config.tool_skill_min_match_ratio,
+            ):
                 continue
-            ranked_tools.append((overlap, len(tool_terms), tool_skill))
+            match_ratio = self._match_ratio(overlap, task_terms)
+            ranked_tools.append((overlap, match_ratio, len(tool_terms), tool_skill))
 
-        ranked_tools.sort(key=lambda item: (item[0], item[1], item[2]["name"]), reverse=True)
-        return [item[2] for item in ranked_tools[:limit]]
+        ranked_tools.sort(key=lambda item: (item[0], item[1], item[2], item[3]["name"]), reverse=True)
+        return [item[3] for item in ranked_tools[:limit]]
 
     def assign_capabilities_to_task(self, task_description: str, extracted_keywords: List[str]) -> Dict[str, Any]:
         prompt_skill = self.find_best_skill(extracted_keywords)

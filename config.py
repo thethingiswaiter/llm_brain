@@ -21,6 +21,13 @@ class AppConfig:
         self.skills_md_dir = "skills_md"
         self.memory_db_path = os.path.join("memory", "memory.db")
         self.memory_backup_dir = os.path.join("memory", "backups")
+        self.log_dir = "logs"
+        self.llm_log_file = "llm_trace.log"
+        self.llm_log_max_chars = 4000
+        self.prompt_skill_min_overlap = 1
+        self.prompt_skill_min_match_ratio = 0.34
+        self.tool_skill_min_overlap = 1
+        self.tool_skill_min_match_ratio = 0.34
         self.llm_config = LLMConfig()
         self._load_config()
 
@@ -41,6 +48,13 @@ class AppConfig:
             self.skills_md_dir = data.get("skills_md_dir", "skills_md")
             self.memory_db_path = data.get("memory_db_path", os.path.join("memory", "memory.db"))
             self.memory_backup_dir = data.get("memory_backup_dir", os.path.join("memory", "backups"))
+            self.log_dir = data.get("log_dir", "logs")
+            self.llm_log_file = data.get("llm_log_file", "llm_trace.log")
+            self.llm_log_max_chars = data.get("llm_log_max_chars", 4000)
+            self.prompt_skill_min_overlap = data.get("prompt_skill_min_overlap", 1)
+            self.prompt_skill_min_match_ratio = data.get("prompt_skill_min_match_ratio", 0.34)
+            self.tool_skill_min_overlap = data.get("tool_skill_min_overlap", 1)
+            self.tool_skill_min_match_ratio = data.get("tool_skill_min_match_ratio", 0.34)
             
             # Load default model
             if self.default_model_key in self.models_config:

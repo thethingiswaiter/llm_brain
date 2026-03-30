@@ -3,9 +3,6 @@ from typing import List, Dict, Any
 from llm_manager import llm_manager
 
 class TaskPlanner:
-    def __init__(self):
-        self.llm = llm_manager.get_llm()
-
     def split_task(self, user_query: str) -> List[Dict[str, Any]]:
         """
         根据核心需求规范，将复杂任务拆解成细粒度的“子任务”。
@@ -30,7 +27,7 @@ class TaskPlanner:
         {user_query}
         """
         try:
-            response = self.llm.invoke(prompt)
+            response = llm_manager.invoke(prompt, source="planner.split_task")
             # Find JSON content
             content = response.content.strip()
             if content.startswith("```json"):
@@ -41,6 +38,6 @@ class TaskPlanner:
                 return subtasks
             return []
         except Exception as e:
-            print(f"Task splitting failed: {e}")
+            llm_manager.log_event(f"Task splitting failed: {e}", level=40)
             # Fallback to single task
             return [{"id": 1, "description": user_query, "expected_outcome": "User request fulfilled."}]

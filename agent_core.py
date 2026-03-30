@@ -23,6 +23,7 @@ class AgentState(TypedDict):
     current_subtask_index: int
     reflections: List[str]
     global_keywords: List[str]
+    request_id: str
     session_id: str
     session_memory_id: int
     domain_label: str
@@ -38,6 +39,7 @@ class AgentCore:
         self.loaded_tool_names = set()
         self.graph = None
         self.session_id = self._generate_session_id()
+        self.last_request_id = ""
         
         # Instantiate sub-systems
         self.cognitive = CognitiveSystem()
@@ -53,6 +55,9 @@ class AgentCore:
 
     def _generate_session_id(self) -> str:
         return f"session_{uuid.uuid4().hex[:12]}"
+
+    def _generate_request_id(self) -> str:
+        return f"req_{uuid.uuid4().hex[:12]}"
 
     def start_session(self, session_id: str = None) -> str:
         self.session_id = session_id or self._generate_session_id()
@@ -117,7 +122,7 @@ class AgentCore:
             return ""
         return "Relevant memory details:\n" + "\n".join(details)
 
-    def _record_step_memory(self, session_id: str, domain: str, subtask_desc: str,
+    def _record_step_memory(self, session_id: str, request_id: str, domain: str, subtask_desc: str,
                             actual: str, reflection_note: str):
         step_keywords, step_summary = self.cognitive.extract_features(subtask_desc)
         memory_output = actual.strip()
@@ -131,6 +136,7 @@ class AgentCore:
             subtask_desc,
             memory_output,
             "",
+            request_id=request_id,
         )
 
     def _finalize_session_memory(self, state: AgentState, final_output: str):
@@ -144,7 +150,11 @@ class AgentCore:
             persisted_output = (
                 f"{persisted_output}\n\nReflection summary:\n" + "\n".join(reflections)
             ).strip()
-        self.memory.update_memory(session_memory_id, raw_output=persisted_output)
+        self.memory.update_memory(
+            session_memory_id,
+            raw_output=persisted_output,
+            request_id=state.get("request_id", ""),
+        )
 
     def _auto_load_skills(self):
         """Automatically scan and load python skills from the skills directory"""
@@ -295,6 +305,13 @@ class AgentCore:
             msgs = state["messages"]
             last_message_content = msgs[-1].content if msgs else ""
             session_id = state.get("session_id") or self.start_session()
+            request_id = state.get("request_id") or self._generate_request_id()
+            llm_manager.log_checkpoint(
+                "planning_started",
+                details=f"session_id={session_id}",
+                request_id=request_id,
+                console=True,
+            )
             
             # 1. Feature Extraction (Global task constraints: max 30 keywords)
             keywords, summary = self.cognitive.extract_features(last_message_content)
@@ -314,10 +331,17 @@ class AgentCore:
                 last_message_content,
                 "",
                 "",
+                request_id=request_id,
             )
             
             # 2. Planning (Decompose complex tasks into granular subtasks)
             plan = self.planner.split_task(last_message_content)
+            llm_manager.log_checkpoint(
+                "planning_completed",
+                details=f"subtask_count={len(plan)} | domain={domain}",
+                request_id=request_id,
+                console=True,
+            )
             
             return {
                 "plan": plan,
@@ -325,6 +349,7 @@ class AgentCore:
                 "global_keywords": normalized_keywords,
                 "reflections": [],
                 "session_id": session_id,
+                "request_id": request_id,
                 "session_memory_id": session_memory_id,
                 "domain_label": domain,
                 "memory_summaries": memory_summaries,
@@ -336,6 +361,7 @@ class AgentCore:
         def call_model_subtask(state: AgentState):
             plan = state.get("plan", [])
             idx = state.get("current_subtask_index", 0)
+            request_id = state.get("request_id", "")
             
             if idx >= len(plan):
                 final_response = state.get("final_response") or "All subtasks completed successfully."
@@ -343,6 +369,12 @@ class AgentCore:
                 
             current_subtask = plan[idx]
             subtask_desc = current_subtask.get("description", "")
+            llm_manager.log_checkpoint(
+                "subtask_started",
+                details=f"index={idx + 1} | description={subtask_desc[:120]}",
+                request_id=request_id,
+                console=True,
+            )
             
             # Subtask feature extraction: 3-5 keywords
             sub_kws, _ = self.cognitive.extract_features(subtask_desc)
@@ -394,14 +426,20 @@ class AgentCore:
             llm = llm_manager.get_llm()
             if selected_tools:
                 llm = llm.bind_tools(selected_tools)
+            llm_manager.log_checkpoint(
+                "subtask_llm_dispatch",
+                details=f"index={idx + 1} | tool_count={len(selected_tools)}",
+                request_id=request_id,
+            )
                 
-            response = llm.invoke(messages)
+            response = llm_manager.invoke(messages, source="agent.execute_subtask", llm=llm)
             return {"messages": [response]}
 
         def reflect_and_advance(state: AgentState):
             messages = state["messages"]
             plan = state.get("plan", [])
             idx = state.get("current_subtask_index", 0)
+            request_id = state.get("request_id", "")
             
             if idx >= len(plan):
                 return {}
@@ -414,11 +452,18 @@ class AgentCore:
             success, reflection_note, action = self.reflector.verify_and_reflect(
                 current_subtask.get("description", ""), expected, actual
             )
+            llm_manager.log_checkpoint(
+                "reflection_completed",
+                details=f"index={idx + 1} | success={success} | action={action}",
+                request_id=request_id,
+                console=True,
+            )
             
             reflections = list(state.get("reflections", []))
             reflections.append(f"Subtask {idx+1}: {reflection_note}")
             self._record_step_memory(
                 state.get("session_id", self.session_id),
+                request_id,
                 state.get("domain_label", "general"),
                 current_subtask.get("description", ""),
                 actual,
@@ -433,6 +478,13 @@ class AgentCore:
                 blocked_message = (
                     f"Error blocked subtask. Reflection analysis: {reflection_note}\nNeed user intervention."
                 )
+                llm_manager.log_checkpoint(
+                    "agent_blocked",
+                    details=f"index={idx + 1} | action=ask_user",
+                    request_id=request_id,
+                    level=40,
+                    console=True,
+                )
                 self._finalize_session_memory(state, blocked_message)
                 return {
                     "messages": [AIMessage(content=blocked_message)],
@@ -446,7 +498,19 @@ class AgentCore:
             if success or action == "continue":
                 next_index = idx + 1
                 if next_index >= len(plan):
+                    llm_manager.log_checkpoint(
+                        "agent_completed",
+                        details=f"subtask_count={len(plan)}",
+                        request_id=request_id,
+                        console=True,
+                    )
                     self._finalize_session_memory(state, actual)
+                else:
+                    llm_manager.log_checkpoint(
+                        "subtask_advanced",
+                        details=f"next_index={next_index + 1}",
+                        request_id=request_id,
+                    )
                 return {
                     "current_subtask_index": next_index,
                     "reflections": reflections,
@@ -461,6 +525,13 @@ class AgentCore:
                 blocked_message = (
                     f"Subtask {idx+1} exceeded retry limit. Reflection analysis: {reflection_note}\n"
                     "Need user intervention."
+                )
+                llm_manager.log_checkpoint(
+                    "agent_blocked",
+                    details=f"index={idx + 1} | action=retry_limit",
+                    request_id=request_id,
+                    level=40,
+                    console=True,
                 )
                 self._finalize_session_memory(state, blocked_message)
                 return {
@@ -525,28 +596,50 @@ class AgentCore:
     def invoke(self, query: str, session_id: str = None):
         if not self.graph:
             return "Graph is not initialized."
+        request_id = self._generate_request_id()
+        self.last_request_id = request_id
         try:
             active_session_id = session_id or self.session_id or self.start_session()
-            inputs = {
-                "messages": [HumanMessage(content=query)],
-                "plan": [],
-                "current_subtask_index": 0,
-                "reflections": [],
-                "global_keywords": [],
-                "session_id": active_session_id,
-                "session_memory_id": 0,
-                "domain_label": "general",
-                "memory_summaries": [],
-                "retry_counts": {},
-                "blocked": False,
-                "final_response": "",
-            }
-            res = self.graph.invoke(inputs)
-            return res["messages"][-1].content
+            with llm_manager.request_scope(request_id):
+                llm_manager.console_event("agent_started", request_id=request_id)
+                llm_manager.log_event(
+                    f"Agent request | session_id={active_session_id}\n{query}"
+                )
+                inputs = {
+                    "messages": [HumanMessage(content=query)],
+                    "plan": [],
+                    "current_subtask_index": 0,
+                    "reflections": [],
+                    "global_keywords": [],
+                    "request_id": request_id,
+                    "session_id": active_session_id,
+                    "session_memory_id": 0,
+                    "domain_label": "general",
+                    "memory_summaries": [],
+                    "retry_counts": {},
+                    "blocked": False,
+                    "final_response": "",
+                }
+                res = self.graph.invoke(inputs)
+                final_output = res["messages"][-1].content
+                llm_manager.console_event("agent_finished", request_id=request_id)
+                llm_manager.log_event(
+                    f"Agent response | session_id={active_session_id}\n{final_output}"
+                )
+                return final_output
         except Exception as e:
             import traceback
             traceback.print_exc()
+            llm_manager.console_event("agent_error", request_id=request_id, level=40)
+            llm_manager.log_event(
+                f"Agent error | session_id={session_id or self.session_id} | error={e}",
+                level=40,
+                request_id=request_id,
+            )
             return f"Error invoking agent: {e}"
+
+    def get_last_request_id(self) -> str:
+        return self.last_request_id
 
     def replay(self, memory_id: int, injected_features: list[str] = None):
         """
@@ -559,7 +652,10 @@ class AgentCore:
         raw_input = memory_data.get("input", "")
         if injected_features:
             raw_input = f"[Injected features: {', '.join(injected_features)}]\n" + raw_input
-        print(f"Replaying memory {memory_id} with injection...")
+        llm_manager.log_checkpoint(
+            "replay_started",
+            details=f"memory_id={memory_id} | injected_features={len(injected_features or [])}",
+        )
         return self.invoke(raw_input)
 
     def convert_memory_to_skill(self, memory_id: int):
@@ -581,9 +677,16 @@ class AgentCore:
         summary, keywords = res
         keywords_list = json.loads(keywords)
         memory_data = self.memory.load_full_memory(memory_id)
+        if not memory_data:
+            return "Memory details not found."
+
         logic = memory_data.get("output", "None")
-        
-        name = summary.replace(" ", "_")[:20]
+
+        slug = re.sub(r"[^a-zA-Z0-9]+", "_", summary).strip("_").lower()[:20]
+        if not slug:
+            slug = "memory_skill"
+
+        name = f"{slug}_{memory_id}"
         md_content = f"""---
 name: "{name}"
 confidence: 40
@@ -596,8 +699,8 @@ entry_node: "main"
         filepath = os.path.join(self.skills.skills_md_dir, f"{name}.md")
         with open(filepath, "w", encoding="utf-8") as f:
             f.write(md_content)
-            
-        self.skills.load_skill_md(f"{name}.md")
+
+        self.skills.load_skill_md(f"{name}.md", force_reload=True)
         return f"Successfully converted memory {memory_id} to skill {name}.md"
 
 agent = AgentCore()

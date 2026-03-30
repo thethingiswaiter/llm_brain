@@ -41,7 +41,11 @@ def start_cli():
             elif cmd == "/replay":
                 parts = user_input.split()
                 if len(parts) >= 2:
-                    print(agent.replay(int(parts[1]), parts[2:]))
+                    response = agent.replay(int(parts[1]), parts[2:])
+                    request_id = agent.get_last_request_id()
+                    if request_id:
+                        print(f"Request ID: {request_id}")
+                    print(f"\nResponse: {response}")
                 else:
                     print("Usage: /replay <memory_id> [injected features...]")
             elif cmd == "/convert_skill":
@@ -62,6 +66,9 @@ def start_cli():
                 print(f"Started new session: {session_id}")
             else:
                 response = agent.invoke(user_input, session_id=session_id)
+                request_id = agent.get_last_request_id()
+                if request_id:
+                    print(f"Request ID: {request_id}")
                 print(f"\nResponse: {response}")
                 
         except KeyboardInterrupt:

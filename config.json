@@ -17,5 +17,12 @@
     "skills_dir": "skills",
     "skills_md_dir": "skills_md",
     "memory_db_path": "memory/memory.db",
-    "memory_backup_dir": "memory/backups"
+    "memory_backup_dir": "memory/backups",
+    "log_dir": "logs",
+    "llm_log_file": "llm_trace.log",
+    "llm_log_max_chars": 4000,
+    "prompt_skill_min_overlap": 1,
+    "prompt_skill_min_match_ratio": 0.34,
+    "tool_skill_min_overlap": 1,
+    "tool_skill_min_match_ratio": 0.34
 }

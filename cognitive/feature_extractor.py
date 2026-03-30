@@ -1,11 +1,9 @@
 from typing import List, Dict, Optional
 import json
-from langchain_core.messages import BaseMessage
 from llm_manager import llm_manager
 
 class CognitiveSystem:
     def __init__(self):
-        self.llm = llm_manager.get_llm()
         self.domain_tree = [
             "Technology/Software", "Technology/Hardware", "Science/Math", "Science/Physics",
             "Art/Literature", "Art/Music", "Daily Life/Food", "Daily Life/Travel", "Other"
@@ -31,11 +29,11 @@ class CognitiveSystem:
         {text}
         """
         try:
-            response = self.llm.invoke(prompt)
+            response = llm_manager.invoke(prompt, source="feature_extractor.extract_features")
             data = json.loads(response.content)
             return data.get("keywords", []), data.get("summary", "")
         except Exception as e:
-            print(f"Feature extraction failed: {e}")
+            llm_manager.log_event(f"Feature extraction failed: {e}", level=40)
             return [], text[:50] + "..."
 
     def determine_domain(self, text: str) -> str:
@@ -48,7 +46,7 @@ class CognitiveSystem:
         {text}
         """
         try:
-            response = self.llm.invoke(prompt)
+            response = llm_manager.invoke(prompt, source="feature_extractor.determine_domain")
             chosen = response.content.strip()
             if chosen in self.domain_tree:
                 return chosen

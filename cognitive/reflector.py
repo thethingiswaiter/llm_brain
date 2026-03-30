@@ -3,9 +3,6 @@ import json
 from llm_manager import llm_manager
 
 class Reflector:
-    def __init__(self):
-        self.llm = llm_manager.get_llm()
-
     def verify_and_reflect(self, subtask: str, expected_outcome: str, actual_result: str) -> Tuple[bool, str, str]:
         """
         根据核心需求规范，验证“预测结果”与“实际结果”。
@@ -36,7 +33,7 @@ class Reflector:
         }}
         """
         try:
-            response = self.llm.invoke(prompt)
+            response = llm_manager.invoke(prompt, source="reflector.verify_and_reflect")
             content = response.content.strip()
             if content.startswith("```json"):
                 content = content.strip("`").replace("json\n", "", 1)
@@ -48,5 +45,5 @@ class Reflector:
                 data.get("action", "ask_user")
             )
         except Exception as e:
-            print(f"Reflection failed: {e}")
+            llm_manager.log_event(f"Reflection failed: {e}", level=40)
             return False, f"Failed to parse reflection: {e}", "ask_user"

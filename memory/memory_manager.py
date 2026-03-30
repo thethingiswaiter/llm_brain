@@ -11,6 +11,12 @@ class MemoryManager:
         self.backup_dir = config.resolve_path(backup_dir or config.memory_backup_dir)
         self._init_db()
 
+    def _ensure_column(self, cursor, table_name: str, column_name: str, column_definition: str):
+        cursor.execute(f"PRAGMA table_info({table_name})")
+        columns = {row[1] for row in cursor.fetchall()}
+        if column_name not in columns:
+            cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_definition}")
+
     def _init_db(self):
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
         os.makedirs(self.backup_dir, exist_ok=True)
@@ -19,6 +25,7 @@ class MemoryManager:
         c.execute("""CREATE TABLE IF NOT EXISTS interactions (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         conv_id TEXT,
+                        request_id TEXT,
                         timestamp TEXT,
                         domain_label TEXT,
                         keywords TEXT,
@@ -28,11 +35,13 @@ class MemoryManager:
                         large_file_path TEXT,
                         weight INTEGER DEFAULT 1
                     )""")
+        self._ensure_column(c, "interactions", "request_id", "TEXT")
         conn.commit()
         conn.close()
 
     def add_memory(self, conv_id: str, domain_label: str, keywords: list, summary: str,
-                   raw_input: str, raw_output: str, large_file_path: str = "") -> int:
+                   raw_input: str, raw_output: str, large_file_path: str = "",
+                   request_id: Optional[str] = None) -> int:
         timestamp = datetime.now().isoformat()
         keywords_str = json.dumps(keywords)
         
@@ -45,8 +54,10 @@ class MemoryManager:
 
         conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
-        c.execute("INSERT INTO interactions (conv_id, timestamp, domain_label, keywords, summary, raw_input, raw_output, large_file_path) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                  (conv_id, timestamp, domain_label, keywords_str, summary, raw_input, raw_output, large_file_path))
+        c.execute(
+            "INSERT INTO interactions (conv_id, request_id, timestamp, domain_label, keywords, summary, raw_input, raw_output, large_file_path) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (conv_id, request_id, timestamp, domain_label, keywords_str, summary, raw_input, raw_output, large_file_path),
+        )
         memory_id = c.lastrowid
         conn.commit()
         conn.close()
@@ -54,7 +65,7 @@ class MemoryManager:
 
     def update_memory(self, memory_id: int, raw_output: Optional[str] = None,
                       summary: Optional[str] = None, keywords: Optional[list] = None,
-                      raw_input: Optional[str] = None):
+                      raw_input: Optional[str] = None, request_id: Optional[str] = None):
         updates = []
         values = []
 
@@ -70,6 +81,9 @@ class MemoryManager:
         if raw_input is not None:
             updates.append("raw_input = ?")
             values.append(raw_input)
+        if request_id is not None:
+            updates.append("request_id = ?")
+            values.append(request_id)
 
         if not updates:
             return False
@@ -88,7 +102,7 @@ class MemoryManager:
         """Two-stage read: First read keywords and summary."""
         conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
-        query = "SELECT id, conv_id, summary, keywords, weight FROM interactions WHERE weight >= ?"
+        query = "SELECT id, conv_id, request_id, summary, keywords, weight FROM interactions WHERE weight >= ?"
         c.execute(query, (threshold,))
         results = c.fetchall()
 
@@ -99,7 +113,7 @@ class MemoryManager:
         excluded_ids = set(exclude_ids or [])
         ranked_results = []
 
-        for memory_id, conv_id, summary, keywords_raw, weight in results:
+        for memory_id, conv_id, request_id, summary, keywords_raw, weight in results:
             if exclude_conv_id and conv_id == exclude_conv_id:
                 continue
             if memory_id in excluded_ids:
@@ -113,6 +127,7 @@ class MemoryManager:
             overlap_count = len(normalized_keywords & keyword_set)
             ranked_results.append({
                 "id": memory_id,
+                "request_id": request_id,
                 "summary": summary,
                 "keywords": parsed_keywords,
                 "weight": weight,
@@ -138,15 +153,15 @@ class MemoryManager:
         """Second-stage: Load full details if summary is not enough."""
         conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
-        c.execute("SELECT raw_input, raw_output, large_file_path FROM interactions WHERE id = ?", (memory_id,))
+        c.execute("SELECT conv_id, request_id, raw_input, raw_output, large_file_path FROM interactions WHERE id = ?", (memory_id,))
         result = c.fetchone()
         conn.close()
 
         if not result:
             return None
         
-        raw_in, raw_out, large_file = result
+        conv_id, request_id, raw_in, raw_out, large_file = result
         if large_file and os.path.exists(large_file):
             with open(large_file, "r", encoding="utf-8") as f:
                 raw_in = f.read()
-        return {"input": raw_in, "output": raw_out}
+        return {"conv_id": conv_id, "request_id": request_id, "input": raw_in, "output": raw_out}
