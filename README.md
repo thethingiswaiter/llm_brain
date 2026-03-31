@@ -5,6 +5,7 @@
 ## 文档入口
 
 - 项目总览：./docs/project_overview.md
+- 结构评审：./docs/codebase_structure_review.md
 - 完备化路线图：./docs/completeness_roadmap.md
 - 架构问题清单：./docs/architecture_issues.md
 - 需求目标文档：./docs/requirements.md
@@ -38,10 +39,49 @@
 3. 运行 `python cli.py` 启动命令行交互。
 
 CLI 中可使用 `/load_skill <skill_name.py|skill_name.md>` 动态加载本地技能文件。
-CLI 中也可使用 `/load_mcp <config_name.json|config_name.yaml|absolute_path>` 加载 MCP 配置文件，例如仓库内置的 `demo_mcp.json`。
+CLI 中也可使用 `/load_mcp <config_name.json|config_name.yaml|absolute_path|server.py|stdio:command ...>` 加载 MCP 工具源：既支持原有 JSON/YAML 配置，也支持真实 MCP stdio server。
+CLI 中也可使用 `/list_mcp` 查看已加载的 MCP server。
+CLI 中也可使用 `/refresh_mcp <server_name|source>` 刷新某个 MCP server 并重新枚举工具。
+CLI 中也可使用 `/unload_mcp <server_name|source>` 卸载某个 MCP server，并移除其工具。
 CLI 中也可使用 `/cancel_request <request_id>` 对活跃请求发起协作式取消。
 CLI 中也可使用 `/list_snapshots <request_id>` 查看某次请求的可用恢复点。
 CLI 中也可使用 `/resume_snapshot <request_id> [latest|index|stage|snapshot_file]` 从运行时快照恢复继续执行。
+CLI 中也可使用 `/request_summary <request_id>` 聚合查看该次请求的状态、快照、关键 checkpoint 和关联 memory。
+CLI 中也可使用 `/recent_requests [limit]` 查看最近若干次请求的状态和关键指标摘要。
+
+## Python MCP Server
+
+仓库新增了一个独立可运行的 Python MCP server：`mcp_servers/system_mcp_server.py`。
+
+它提供三个工具：
+
+- `execute_terminal_command`：执行终端命令，默认限制在工作区内，并默认拦截明显破坏性命令。
+- `get_system_info`：查看主机、平台、Python 版本、磁盘空间等系统信息。
+- `inspect_file_system_path`：查看文件或目录信息，并可选返回 UTF-8 文本预览。
+
+当前还增加了一层基础安全控制：
+
+- 命令白名单：默认只允许 `echo`、`python`、`dir`、`ls`、`type`、`cat`、`pwd`、`whoami`、`hostname`、`systeminfo` 等前缀。
+- 路径白名单：默认只允许访问工作区根目录；可通过环境变量 `LLM_BRAIN_MCP_ALLOWED_ROOTS` 追加额外根目录。
+- 审计日志：每次工具调用都会写入 `runtime_state/audit/system_mcp_audit.jsonl`。
+
+如果需要调整命令白名单，可通过环境变量 `LLM_BRAIN_MCP_ALLOWED_COMMANDS` 传入逗号分隔前缀列表。
+
+运行方式：
+
+1. 安装 `requirements.txt` 中的新依赖 `mcp`。
+2. 运行 `python mcp_servers/system_mcp_server.py`。
+
+现在 agent 侧已经补了基础版真实 MCP stdio transport：
+
+- `/load_mcp mcp_servers/system_mcp_server.py` 可直接把本仓库里的 Python MCP server 作为真实 server 接入。
+- `/load_mcp stdio:python mcp_servers/system_mcp_server.py` 也可通过显式命令行方式接入。
+- `/load_mcp some_config.json` 仍然兼容原有配置式 MCP 工具定义。
+- 真实 stdio server 现在会在加载后复用连接，而不是每次工具调用都重新拉起进程。
+- `/list_mcp` 和 `/unload_mcp` 可用于查看和释放已加载的 MCP server 生命周期。
+- 连接失活后，下次工具调用会自动重建 stdio 连接；也可以通过 `/refresh_mcp` 主动重建并刷新工具列表。
+
+说明：当前实现的是基础版可复用 stdio transport，已经具备连接复用、自动重连和显式刷新/卸载，但仍未补工具刷新订阅和更细粒度的连接健康检查。
 
 ## 补充说明
 

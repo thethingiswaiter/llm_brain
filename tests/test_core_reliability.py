@@ -1,7 +1,9 @@
 import copy
 import importlib
 import json
+import logging
 import os
+import pathlib
 import tempfile
 import time
 import unittest
@@ -78,12 +80,14 @@ class AgentStateSnapshotTests(unittest.TestCase):
             "current_subtask_index": 0,
             "reflections": [],
             "global_keywords": ["hello"],
+            "failed_tools": {"0": ["weather_tool"]},
             "request_id": "req_unit_test",
             "session_id": "session_unit_test",
             "session_memory_id": 1,
             "domain_label": "Other",
             "memory_summaries": [],
             "retry_counts": {},
+            "replan_counts": {"0": 1},
             "blocked": False,
             "final_response": "",
         }
@@ -103,6 +107,8 @@ class AgentStateSnapshotTests(unittest.TestCase):
         self.assertEqual(payload["stage"], "request_received")
         self.assertEqual(payload["state"]["session_id"], "session_unit_test")
         self.assertEqual(payload["state"]["messages"][0]["content"], "hello world")
+        self.assertEqual(payload["state"]["failed_tools"], {"0": ["weather_tool"]})
+        self.assertEqual(payload["state"]["replan_counts"], {"0": 1})
         self.assertEqual(payload["extra"]["query"], "hello world")
 
 
@@ -622,6 +628,123 @@ class RequestCancellationTests(unittest.TestCase):
         finally:
             self.agent.graph = original_graph
             config.request_timeout_seconds = original_timeout
+
+
+class ObservabilityTests(unittest.TestCase):
+    def setUp(self):
+        self.original_memory_db_path = config.memory_db_path
+        self.original_memory_backup_dir = config.memory_backup_dir
+        self.original_state_snapshot_dir = config.state_snapshot_dir
+        self.original_log_dir = config.log_dir
+        self.original_llm_log_file = config.llm_log_file
+        self.tempdir = tempfile.TemporaryDirectory()
+
+        config.memory_db_path = os.path.join(self.tempdir.name, "memory.db")
+        config.memory_backup_dir = os.path.join(self.tempdir.name, "backups")
+        config.state_snapshot_dir = os.path.join(self.tempdir.name, "snapshots")
+        config.log_dir = os.path.join(self.tempdir.name, "logs")
+        config.llm_log_file = "observability.log"
+
+        import llm_manager
+        import agent_core
+
+        self.llm_manager_module = importlib.reload(llm_manager)
+        self.agent_core_module = importlib.reload(agent_core)
+        self.agent = self.agent_core_module.AgentCore()
+
+    def tearDown(self):
+        logger = logging.getLogger("llm_brain.llm")
+        for handler in list(logger.handlers):
+            logger.removeHandler(handler)
+            try:
+                handler.close()
+            except Exception:
+                pass
+        config.memory_db_path = self.original_memory_db_path
+        config.memory_backup_dir = self.original_memory_backup_dir
+        config.state_snapshot_dir = self.original_state_snapshot_dir
+        config.log_dir = self.original_log_dir
+        config.llm_log_file = self.original_llm_log_file
+        self.tempdir.cleanup()
+
+    def test_request_summary_aggregates_snapshots_memories_and_checkpoints(self):
+        request_id = "req_observability"
+        state = {
+            "messages": [HumanMessage(content="hello")],
+            "plan": [{"id": 1, "description": "step one", "expected_outcome": "done"}],
+            "current_subtask_index": 1,
+            "reflections": ["complete"],
+            "global_keywords": ["hello"],
+            "failed_tools": {},
+            "request_id": request_id,
+            "session_id": "session_observability",
+            "session_memory_id": 1,
+            "domain_label": "general",
+            "memory_summaries": [],
+            "retry_counts": {},
+            "blocked": False,
+            "final_response": "all done",
+        }
+
+        self.agent._persist_state_snapshot(request_id, "planning_completed", state, extra={"query": "hello"})
+        self.agent._persist_state_snapshot(request_id, "request_completed", state, extra={"final_output": "all done"})
+        self.agent.memory.add_memory(
+            "session_observability",
+            "general",
+            ["hello"],
+            "session summary",
+            "hello",
+            "all done",
+            request_id=request_id,
+            memory_type="session_main",
+            quality_tags=["success"],
+        )
+        self.agent.memory.add_memory(
+            "session_observability",
+            "general",
+            ["step", "hello"],
+            "step summary",
+            "step one",
+            "done",
+            request_id=request_id,
+            memory_type="step",
+            quality_tags=["success"],
+        )
+        self.llm_manager_module.llm_manager.log_checkpoint(
+            "planning_completed",
+            details="subtask_count=1",
+            request_id=request_id,
+        )
+
+        summary = self.agent.get_request_summary(request_id)
+
+        self.assertIsNotNone(summary)
+        self.assertEqual(summary["status"], "completed")
+        self.assertEqual(summary["session_id"], "session_observability")
+        self.assertEqual(summary["final_response"], "all done")
+        self.assertEqual(summary["snapshot_count"], 2)
+        self.assertEqual(summary["memory_count"], 2)
+        self.assertEqual(summary["checkpoint_count"], 1)
+        self.assertEqual(summary["checkpoints"][0]["stage"], "planning_completed")
+
+    def test_structured_logs_are_written_as_json_events(self):
+        request_id = "req_json_log"
+        self.llm_manager_module.llm_manager.log_checkpoint(
+            "subtask_started",
+            details="index=1",
+            request_id=request_id,
+        )
+
+        log_path = pathlib.Path(self.llm_manager_module.llm_manager.get_log_path())
+        self.assertTrue(log_path.exists())
+
+        log_line = log_path.read_text(encoding="utf-8").strip().splitlines()[-1]
+        payload = json.loads(log_line.split(" | ", 2)[2])
+
+        self.assertEqual(payload["event_type"], "checkpoint")
+        self.assertEqual(payload["request_id"], request_id)
+        self.assertEqual(payload["stage"], "subtask_started")
+        self.assertEqual(payload["details"], "index=1")
 
 
 if __name__ == "__main__":

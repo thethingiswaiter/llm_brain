@@ -5,6 +5,7 @@ import uuid
 import importlib.util
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from contextvars import copy_context
 from datetime import datetime, timezone
 from threading import Event, Lock
 from typing import Annotated, Literal, TypedDict, List, Dict, Any
@@ -37,6 +38,7 @@ class AgentState(TypedDict):
     domain_label: str
     memory_summaries: List[Dict[str, Any]]
     retry_counts: Dict[str, int]
+    replan_counts: Dict[str, int]
     blocked: bool
     final_response: str
 
@@ -167,6 +169,7 @@ class AgentCore:
             "domain_label": state.get("domain_label", ""),
             "memory_summaries": state.get("memory_summaries", []),
             "retry_counts": state.get("retry_counts", {}),
+            "replan_counts": state.get("replan_counts", {}),
             "blocked": state.get("blocked", False),
             "final_response": state.get("final_response", ""),
             "messages": [self._serialize_message(message) for message in messages],
@@ -264,6 +267,184 @@ class AgentCore:
             )
         return summaries
 
+    def _derive_request_status(self, latest_stage: str, latest_state: Dict[str, Any], active: bool) -> str:
+        if active:
+            return "active"
+        if latest_state.get("blocked"):
+            return "blocked"
+
+        stage_to_status = {
+            "request_completed": "completed",
+            "agent_completed": "completed",
+            "request_failed": "failed",
+            "request_cancelled": "cancelled",
+            "request_timed_out": "timed_out",
+            "agent_blocked": "blocked",
+        }
+        if latest_stage in stage_to_status:
+            return stage_to_status[latest_stage]
+        if latest_stage:
+            return "in_progress"
+        return "not_found"
+
+    def _extract_bool_from_event(self, event: Dict[str, Any], key: str) -> bool | None:
+        value = event.get(key)
+        if isinstance(value, bool):
+            return value
+        details = str(event.get("details", ""))
+        match = re.search(rf"{re.escape(key)}=(True|False|true|false)", details)
+        if not match:
+            return None
+        return match.group(1).lower() == "true"
+
+    def _parse_logged_at(self, value: str) -> datetime | None:
+        if not value:
+            return None
+        for fmt in ("%Y-%m-%d %H:%M:%S,%f", "%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z"):
+            try:
+                return datetime.strptime(value, fmt)
+            except ValueError:
+                continue
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            return None
+
+    def _build_request_metrics(self, events: List[Dict[str, Any]], latest_state: Dict[str, Any], status: str) -> Dict[str, Any]:
+        llm_events = [event for event in events if event.get("event_type") in {"llm_response", "llm_error"}]
+        checkpoint_events = [event for event in events if event.get("event_type") == "checkpoint"]
+        stage_counts: Dict[str, int] = {}
+        for event in checkpoint_events:
+            stage = str(event.get("stage", ""))
+            if stage:
+                stage_counts[stage] = stage_counts.get(stage, 0) + 1
+
+        logged_times = [self._parse_logged_at(str(event.get("logged_at", ""))) for event in events]
+        logged_times = [item for item in logged_times if item is not None]
+        total_duration_ms = None
+        if len(logged_times) >= 2:
+            total_duration_ms = round((max(logged_times) - min(logged_times)).total_seconds() * 1000, 2)
+
+        llm_total_duration_ms = round(
+            sum(float(event.get("duration_ms", 0) or 0) for event in llm_events),
+            2,
+        )
+        reflection_failure_count = 0
+        for event in checkpoint_events:
+            if event.get("stage") != "reflection_completed":
+                continue
+            success = self._extract_bool_from_event(event, "success")
+            if success is False:
+                reflection_failure_count += 1
+
+        retry_count = sum(int(value) for value in (latest_state.get("retry_counts", {}) or {}).values())
+        tool_started = stage_counts.get("tool_started", 0)
+        tool_success = stage_counts.get("tool_succeeded", 0)
+        tool_failures = stage_counts.get("tool_failed", 0)
+        tool_rejections = stage_counts.get("tool_rejected", 0)
+        tool_cancelled = stage_counts.get("tool_cancelled", 0)
+        subtask_count = stage_counts.get("subtask_started", 0) or len(latest_state.get("plan", []))
+
+        return {
+            "total_duration_ms": total_duration_ms,
+            "llm_call_count": sum(1 for event in events if event.get("event_type") == "llm_request"),
+            "llm_error_count": sum(1 for event in events if event.get("event_type") == "llm_error"),
+            "llm_total_duration_ms": llm_total_duration_ms,
+            "tool_call_count": tool_started,
+            "tool_success_count": tool_success,
+            "tool_failure_count": tool_failures,
+            "tool_rejection_count": tool_rejections,
+            "tool_cancelled_count": tool_cancelled,
+            "tool_hit_rate": round((tool_success / tool_started), 4) if tool_started else 0.0,
+            "retry_count": retry_count,
+            "subtask_count": subtask_count,
+            "reflection_failure_count": reflection_failure_count,
+            "blocked_rate": 1.0 if status == "blocked" else 0.0,
+        }
+
+    def get_request_summary(self, request_id: str) -> Dict[str, Any] | None:
+        snapshots = self.list_snapshots(request_id)
+        latest_payload = self._load_snapshot_payload(request_id)
+        latest_state = latest_payload.get("state", {}) if latest_payload else {}
+        latest_extra = latest_payload.get("extra", {}) if latest_payload else {}
+        events = llm_manager.get_request_events(request_id)
+        memories = self.memory.list_memories_by_request_id(request_id)
+
+        if not snapshots and not events and not memories and not self.is_request_active(request_id):
+            return None
+
+        checkpoints = []
+        for event in events:
+            stage = event.get("stage")
+            if event.get("event_type") != "checkpoint" and not stage:
+                continue
+            checkpoints.append(
+                {
+                    "logged_at": event.get("logged_at", ""),
+                    "level": event.get("level", ""),
+                    "stage": stage or "",
+                    "message": event.get("message", ""),
+                    "details": event.get("details", ""),
+                }
+            )
+
+        latest_stage = ""
+        if latest_payload:
+            latest_stage = latest_payload.get("stage", "")
+        elif checkpoints:
+            latest_stage = checkpoints[-1].get("stage", "")
+
+        final_response = latest_state.get("final_response") or latest_extra.get("final_output", "")
+        status = self._derive_request_status(latest_stage, latest_state, self.is_request_active(request_id))
+        session_id = latest_state.get("session_id", "") or (memories[-1].get("conv_id", "") if memories else "")
+        metrics = self._build_request_metrics(events, latest_state, status)
+
+        return {
+            "request_id": request_id,
+            "status": status,
+            "active": self.is_request_active(request_id),
+            "session_id": session_id,
+            "source_request_id": latest_extra.get("source_request_id", ""),
+            "latest_stage": latest_stage,
+            "created_at": snapshots[0].get("created_at", "") if snapshots else (events[0].get("logged_at", "") if events else ""),
+            "updated_at": snapshots[-1].get("created_at", "") if snapshots else (events[-1].get("logged_at", "") if events else ""),
+            "subtask_index": latest_state.get("current_subtask_index", 0),
+            "plan_length": len(latest_state.get("plan", [])),
+            "blocked": latest_state.get("blocked", False),
+            "final_response": final_response,
+            "snapshot_count": len(snapshots),
+            "snapshots": snapshots,
+            "memory_count": len(memories),
+            "memories": memories,
+            "checkpoint_count": len(checkpoints),
+            "checkpoints": checkpoints,
+            "metrics": metrics,
+        }
+
+    def get_recent_request_summaries(self, limit: int = 10) -> List[Dict[str, Any]]:
+        snapshot_root = config.resolve_path(config.state_snapshot_dir)
+        if not os.path.exists(snapshot_root):
+            return []
+
+        request_ids = []
+        for name in os.listdir(snapshot_root):
+            candidate = os.path.join(snapshot_root, name)
+            if os.path.isdir(candidate):
+                request_ids.append(name)
+
+        summarized_requests = []
+        for request_id in request_ids:
+            summary = self.get_request_summary(request_id)
+            if not summary:
+                continue
+            summarized_requests.append(summary)
+
+        summarized_requests.sort(
+            key=lambda item: self._parse_logged_at(item.get("updated_at", "")) or datetime.min,
+            reverse=True,
+        )
+        return summarized_requests[: max(0, limit)]
+
     def _load_snapshot_payload(self, request_id: str, snapshot_name: str | None = None) -> Dict[str, Any] | None:
         snapshot_path = self._resolve_snapshot_path(request_id, snapshot_name=snapshot_name)
         if not snapshot_path:
@@ -292,9 +473,60 @@ class AgentCore:
             "domain_label": stored_state.get("domain_label", "general"),
             "memory_summaries": stored_state.get("memory_summaries", []),
             "retry_counts": stored_state.get("retry_counts", {}),
+            "replan_counts": stored_state.get("replan_counts", {}),
             "blocked": stored_state.get("blocked", False),
             "final_response": stored_state.get("final_response", ""),
         }
+
+    def _plans_are_meaningfully_different(self, original_plan: List[Dict[str, Any]], candidate_plan: List[Dict[str, Any]]) -> bool:
+        if not candidate_plan:
+            return False
+        if len(candidate_plan) != len(original_plan):
+            return True
+
+        def normalize(plan: List[Dict[str, Any]]) -> List[tuple[str, str]]:
+            normalized = []
+            for item in plan:
+                normalized.append(
+                    (
+                        str(item.get("description", "")).strip().lower(),
+                        str(item.get("expected_outcome", "")).strip().lower(),
+                    )
+                )
+            return normalized
+
+        return normalize(original_plan) != normalize(candidate_plan)
+
+    def _replan_subtask_after_failure(
+        self,
+        original_request: str,
+        current_subtask: Dict[str, Any],
+        actual_output: str,
+        reflection_note: str,
+        recent_tool_failures: List[Dict[str, Any]] | None = None,
+    ) -> List[Dict[str, Any]]:
+        failure_lines = []
+        for item in recent_tool_failures or []:
+            failure_lines.append(
+                f"- tool={item.get('tool')} | error_type={item.get('error_type')} | retryable={item.get('retryable')} | message={item.get('message')}"
+            )
+
+        replan_prompt_sections = [
+            "Replan the failed subtask into a safer sequence of smaller subtasks.",
+            f"Original user request: {original_request}",
+            f"Failed subtask: {current_subtask.get('description', '')}",
+            f"Expected outcome: {current_subtask.get('expected_outcome', '')}",
+            f"Observed output: {actual_output}",
+            f"Reflection note: {reflection_note}",
+            "Planning goal: avoid repeating the exact failed approach; prefer collecting missing information, decomposing the task further, or switching to a safer sequence.",
+        ]
+        if failure_lines:
+            replan_prompt_sections.append("Recent tool failures:\n" + "\n".join(failure_lines))
+
+        replanned = self.planner.split_task("\n\n".join(replan_prompt_sections))
+        if not self._plans_are_meaningfully_different([current_subtask], replanned):
+            return []
+        return replanned
 
     def _tokenize_text(self, text: str) -> set[str]:
         return {token for token in re.findall(r"[a-zA-Z0-9_]+", text.lower()) if len(token) > 2}
@@ -398,11 +630,13 @@ class AgentCore:
         def safe_tool_runner(**kwargs):
             request_id = llm_manager.get_request_id()
             self._raise_if_request_cancelled(request_id or "")
+            started_at = time.monotonic()
             llm_manager.log_checkpoint(
                 "tool_started",
                 details=f"tool={tool_name}",
                 request_id=request_id,
                 console=True,
+                tool_name=tool_name,
             )
             executor = ThreadPoolExecutor(max_workers=1)
             try:
@@ -414,6 +648,9 @@ class AgentCore:
                         request_id=request_id,
                         level=40,
                         console=True,
+                        duration_ms=(time.monotonic() - started_at) * 1000,
+                        tool_name=tool_name,
+                        error_type="invalid_arguments",
                     )
                     llm_manager.log_event(
                         f"Tool prevalidation rejected call | tool={tool_name} | payload={validation_error}",
@@ -443,6 +680,8 @@ class AgentCore:
                     details=f"tool={tool_name}",
                     request_id=request_id,
                     console=True,
+                    duration_ms=(time.monotonic() - started_at) * 1000,
+                    tool_name=tool_name,
                 )
                 return result
             except RequestCancelledError as exc:
@@ -452,6 +691,9 @@ class AgentCore:
                     request_id=request_id,
                     level=40,
                     console=True,
+                    duration_ms=(time.monotonic() - started_at) * 1000,
+                    tool_name=tool_name,
+                    error_type="cancelled",
                 )
                 return json.dumps(
                     {
@@ -471,6 +713,10 @@ class AgentCore:
                     request_id=request_id,
                     level=40,
                     console=True,
+                    duration_ms=(time.monotonic() - started_at) * 1000,
+                    tool_name=tool_name,
+                    error_type=error_type,
+                    retryable=retryable,
                 )
                 llm_manager.log_event(
                     f"Tool execution failed | tool={tool_name} | error_type={error_type} | retryable={retryable} | error={exc}",
@@ -838,24 +1084,30 @@ class AgentCore:
     def load_mcp_server(self, server_ref: str, rebuild_graph: bool = True):
         normalized_ref = server_ref.strip()
         if not normalized_ref:
-            return False, "Usage: /load_mcp <config_name.json|config_name.yaml|absolute_path>"
+            return False, "Usage: /load_mcp <config_name.json|config_name.yaml|absolute_path|server.py|stdio:command ...>"
 
-        if os.path.isabs(normalized_ref):
-            config_path = normalized_ref
+        if normalized_ref.startswith("stdio:"):
+            resolved_ref = normalized_ref
+        elif os.path.isabs(normalized_ref):
+            resolved_ref = normalized_ref
         else:
-            config_path = config.resolve_path(os.path.join(config.mcp_dir, normalized_ref))
-            if not os.path.exists(config_path):
+            direct_path = config.resolve_path(normalized_ref)
+            if os.path.exists(direct_path):
+                resolved_ref = direct_path
+            else:
+                resolved_ref = config.resolve_path(os.path.join(config.mcp_dir, normalized_ref))
+            if not os.path.exists(resolved_ref):
                 mcp_dir = config.resolve_path(config.mcp_dir)
                 for extension in (".json", ".yaml", ".yml"):
                     candidate = os.path.join(mcp_dir, normalized_ref + extension)
                     if os.path.exists(candidate):
-                        config_path = candidate
+                        resolved_ref = candidate
                         break
 
-        success, message, _, tools = self.mcp.load_server(config_path)
+        success, message, _, tools = self.mcp.load_server(resolved_ref)
         if not success:
             llm_manager.log_event(
-                f"MCP server load failed | source={config_path} | message={message}",
+                f"MCP server load failed | source={resolved_ref} | message={message}",
                 level=40,
             )
             return False, message
@@ -871,7 +1123,8 @@ class AgentCore:
                 self.loaded_tool_names.add(tool_name)
             added_tools.append(safe_tool)
 
-        self.skills.register_tools(added_tools, source_type="mcp", source_file=os.path.basename(config_path))
+        source_label = os.path.basename(resolved_ref) if not normalized_ref.startswith("stdio:") else normalized_ref
+        self.skills.register_tools(added_tools, source_type="mcp", source_file=source_label)
         added = len(added_tools)
 
         if rebuild_graph and added:
@@ -880,9 +1133,68 @@ class AgentCore:
             message = f"{message} All declared tools were already registered."
 
         llm_manager.log_event(
-            f"MCP server loaded | source={config_path} | added_tools={added} | rebuild_graph={rebuild_graph} | message={message}"
+            f"MCP server loaded | source={resolved_ref} | added_tools={added} | rebuild_graph={rebuild_graph} | message={message}"
         )
 
+        return True, message
+
+    def list_mcp_servers(self) -> List[Dict[str, Any]]:
+        return self.mcp.list_servers()
+
+    def unload_mcp_server(self, server_ref: str, rebuild_graph: bool = True):
+        success, message, server_info = self.mcp.unload_server(server_ref)
+        if not success:
+            llm_manager.log_event(
+                f"MCP server unload failed | source={server_ref} | message={message}",
+                level=40,
+            )
+            return False, message
+
+        removed_names = set(server_info.get("tool_names", []))
+        if removed_names:
+            self.tools = [tool for tool in self.tools if getattr(tool, "name", None) not in removed_names]
+            for tool_name in removed_names:
+                self.loaded_tool_names.discard(tool_name)
+            self.skills.unregister_tools(list(removed_names))
+
+        if rebuild_graph:
+            self._build_graph()
+
+        llm_manager.log_event(
+            f"MCP server unloaded | source={server_info.get('source', server_ref)} | removed_tools={len(removed_names)} | rebuild_graph={rebuild_graph} | message={message}"
+        )
+        return True, message
+
+    def refresh_mcp_server(self, server_ref: str, rebuild_graph: bool = True):
+        success, message, server_info, tools = self.mcp.refresh_server(server_ref)
+        if not success:
+            llm_manager.log_event(
+                f"MCP server refresh failed | source={server_ref} | message={message}",
+                level=40,
+            )
+            return False, message
+
+        added_tools = []
+        for tool in tools:
+            safe_tool = self._wrap_tool_for_runtime(tool)
+            tool_name = getattr(safe_tool, "name", None)
+            if tool_name and tool_name in self.loaded_tool_names:
+                continue
+            self.tools.append(safe_tool)
+            if tool_name:
+                self.loaded_tool_names.add(tool_name)
+            added_tools.append(safe_tool)
+
+        source = server_info.get("source", server_ref)
+        source_label = os.path.basename(source) if not str(source).startswith("stdio:") else source
+        self.skills.register_tools(added_tools, source_type="mcp", source_file=source_label)
+
+        if rebuild_graph:
+            self._build_graph()
+
+        llm_manager.log_event(
+            f"MCP server refreshed | source={source} | added_tools={len(added_tools)} | rebuild_graph={rebuild_graph} | message={message}"
+        )
         return True, message
 
     def _build_graph(self):
@@ -901,11 +1213,13 @@ class AgentCore:
             session_id = state.get("session_id") or self.start_session()
             request_id = state.get("request_id") or self._generate_request_id()
             self._raise_if_request_cancelled(request_id)
+            planning_started_at = time.monotonic()
             llm_manager.log_checkpoint(
                 "planning_started",
                 details=f"session_id={session_id}",
                 request_id=request_id,
                 console=True,
+                session_id=session_id,
             )
             
             # 1. Feature Extraction (Global task constraints: max 30 keywords)
@@ -940,6 +1254,10 @@ class AgentCore:
                 details=f"subtask_count={len(plan)} | domain={domain}",
                 request_id=request_id,
                 console=True,
+                session_id=session_id,
+                duration_ms=(time.monotonic() - planning_started_at) * 1000,
+                subtask_count=len(plan),
+                domain=domain,
             )
             
             next_state = {
@@ -954,6 +1272,7 @@ class AgentCore:
                 "domain_label": domain,
                 "memory_summaries": memory_summaries,
                 "retry_counts": {},
+                "replan_counts": {},
                 "blocked": False,
                 "final_response": "",
             }
@@ -985,6 +1304,9 @@ class AgentCore:
                 details=f"index={idx + 1} | description={subtask_desc[:120]}",
                 request_id=request_id,
                 console=True,
+                session_id=state.get("session_id", ""),
+                subtask_index=idx + 1,
+                subtask_description=subtask_desc[:120],
             )
             
             # Subtask feature extraction: 3-5 keywords
@@ -1111,6 +1433,9 @@ class AgentCore:
                 "subtask_llm_dispatch",
                 details=f"index={idx + 1} | tool_count={len(selected_tools)}",
                 request_id=request_id,
+                session_id=state.get("session_id", ""),
+                subtask_index=idx + 1,
+                tool_count=len(selected_tools),
             )
                 
             response = llm_manager.invoke(messages, source="agent.execute_subtask", llm=llm)
@@ -1139,6 +1464,10 @@ class AgentCore:
                 details=f"index={idx + 1} | success={success} | action={action}",
                 request_id=request_id,
                 console=True,
+                session_id=state.get("session_id", ""),
+                subtask_index=idx + 1,
+                success=success,
+                action=action,
             )
             
             reflections = list(state.get("reflections", []))
@@ -1155,6 +1484,7 @@ class AgentCore:
             )
 
             retry_counts = dict(state.get("retry_counts", {}))
+            replan_counts = dict(state.get("replan_counts", {}))
             retry_key = str(idx)
             retry_count = retry_counts.get(retry_key, 0)
             
@@ -1182,6 +1512,7 @@ class AgentCore:
                     "blocked": True,
                     "final_response": blocked_message,
                     "retry_counts": retry_counts,
+                    "replan_counts": replan_counts,
                 }
             
             # Advance to next subtask if successful or if action is 'continue'
@@ -1221,10 +1552,63 @@ class AgentCore:
                     "blocked": False,
                     "final_response": actual if next_index >= len(plan) else state.get("final_response", ""),
                     "retry_counts": retry_counts,
+                    "replan_counts": replan_counts,
                 }
             
             retry_count += 1
             retry_counts[retry_key] = retry_count
+            replan_key = str(idx)
+            replan_count = replan_counts.get(replan_key, 0)
+            recent_tool_failures = self._collect_recent_tool_failures(messages)
+
+            if retry_count == 1 and replan_count < 1:
+                replanned_subtasks = self._replan_subtask_after_failure(
+                    state["messages"][0].content,
+                    current_subtask,
+                    actual,
+                    reflection_note,
+                    recent_tool_failures=recent_tool_failures,
+                )
+                if replanned_subtasks:
+                    updated_plan = list(plan[:idx]) + replanned_subtasks + list(plan[idx + 1:])
+                    replan_counts[replan_key] = replan_count + 1
+                    retry_counts.pop(retry_key, None)
+                    failed_tools_state.pop(str(idx), None)
+                    llm_manager.log_checkpoint(
+                        "subtask_replanned",
+                        details=f"index={idx + 1} | new_subtask_count={len(replanned_subtasks)}",
+                        request_id=request_id,
+                        console=True,
+                        session_id=state.get("session_id", ""),
+                        subtask_index=idx + 1,
+                        new_subtask_count=len(replanned_subtasks),
+                    )
+                    self._persist_state_snapshot(
+                        request_id,
+                        "subtask_replanned",
+                        {
+                            **state,
+                            "plan": updated_plan,
+                            "reflections": reflections,
+                            "retry_counts": retry_counts,
+                            "replan_counts": replan_counts,
+                            "failed_tools": failed_tools_state,
+                        },
+                        extra={
+                            "subtask_index": idx + 1,
+                            "replacement_count": len(replanned_subtasks),
+                            "reflection_note": reflection_note,
+                        },
+                    )
+                    return {
+                        "plan": updated_plan,
+                        "reflections": reflections,
+                        "failed_tools": failed_tools_state,
+                        "retry_counts": retry_counts,
+                        "replan_counts": replan_counts,
+                        "blocked": False,
+                    }
+
             if retry_count >= 2:
                 blocked_message = (
                     f"Subtask {idx+1} exceeded retry limit. Reflection analysis: {reflection_note}\n"
@@ -1250,12 +1634,14 @@ class AgentCore:
                     "blocked": True,
                     "final_response": blocked_message,
                     "retry_counts": retry_counts,
+                    "replan_counts": replan_counts,
                 }
 
             return {
                 "reflections": reflections,
                 "failed_tools": failed_tools_state,
                 "retry_counts": retry_counts,
+                "replan_counts": replan_counts,
                 "blocked": False,
             }
 
@@ -1314,6 +1700,7 @@ class AgentCore:
         self.last_request_id = request_id
         self._register_request(request_id)
         inputs = None
+        request_started_at = time.monotonic()
         try:
             active_session_id = session_id or self.session_id or self.start_session()
             with llm_manager.request_scope(request_id, cancel_checker=lambda: self.is_request_cancelled(request_id)):
@@ -1334,6 +1721,7 @@ class AgentCore:
                     "domain_label": "general",
                     "memory_summaries": [],
                     "retry_counts": {},
+                    "replan_counts": {},
                     "blocked": False,
                     "final_response": "",
                 }
@@ -1344,7 +1732,8 @@ class AgentCore:
                     extra={"query": query},
                 )
                 executor = ThreadPoolExecutor(max_workers=1)
-                future = executor.submit(lambda: self.graph.invoke(inputs))
+                execution_context = copy_context()
+                future = executor.submit(lambda: execution_context.run(self.graph.invoke, inputs))
                 try:
                     res = self._wait_for_graph_result(future, request_id, config.request_timeout_seconds)
                 except RequestCancelledError:
@@ -1354,6 +1743,15 @@ class AgentCore:
                         "Execution stopped cooperatively; inspect snapshots and logs if partial work was produced."
                     )
                     llm_manager.console_event("agent_cancelled", request_id=request_id, level=40)
+                    llm_manager.log_structured_event(
+                        "agent_request",
+                        message="Agent request cancelled",
+                        request_id=request_id,
+                        session_id=active_session_id,
+                        stage="request_cancelled",
+                        duration_ms=(time.monotonic() - request_started_at) * 1000,
+                        outcome="cancelled",
+                    )
                     llm_manager.log_event(cancel_message, level=40, request_id=request_id)
                     self._persist_state_snapshot(
                         request_id,
@@ -1366,6 +1764,15 @@ class AgentCore:
                     future.cancel()
                     timeout_message = str(exc)
                     llm_manager.console_event("agent_timeout", request_id=request_id, level=40)
+                    llm_manager.log_structured_event(
+                        "agent_request",
+                        message="Agent request timed out",
+                        request_id=request_id,
+                        session_id=active_session_id,
+                        stage="request_timed_out",
+                        duration_ms=(time.monotonic() - request_started_at) * 1000,
+                        outcome="timed_out",
+                    )
                     llm_manager.log_event(
                         timeout_message,
                         level=40,
@@ -1388,6 +1795,15 @@ class AgentCore:
                     extra={"final_output": final_output},
                 )
                 llm_manager.console_event("agent_finished", request_id=request_id)
+                llm_manager.log_structured_event(
+                    "agent_request",
+                    message="Agent request completed",
+                    request_id=request_id,
+                    session_id=active_session_id,
+                    stage="request_completed",
+                    duration_ms=(time.monotonic() - request_started_at) * 1000,
+                    outcome="completed",
+                )
                 llm_manager.log_event(
                     f"Agent response | session_id={active_session_id}\n{final_output}"
                 )
@@ -1399,6 +1815,15 @@ class AgentCore:
                 "Execution stop was requested by keyboard interrupt."
             )
             llm_manager.console_event("agent_cancelled", request_id=request_id, level=40)
+            llm_manager.log_structured_event(
+                "agent_request",
+                message="Agent request cancelled by keyboard interrupt",
+                request_id=request_id,
+                session_id=session_id or self.session_id,
+                stage="request_cancelled",
+                duration_ms=(time.monotonic() - request_started_at) * 1000,
+                outcome="cancelled",
+            )
             llm_manager.log_event(cancel_message, level=40, request_id=request_id)
             if inputs is not None:
                 self._persist_state_snapshot(
@@ -1412,6 +1837,16 @@ class AgentCore:
             import traceback
             traceback.print_exc()
             llm_manager.console_event("agent_error", request_id=request_id, level=40)
+            llm_manager.log_structured_event(
+                "agent_request",
+                message="Agent request failed",
+                request_id=request_id,
+                session_id=session_id or self.session_id,
+                stage="request_failed",
+                duration_ms=(time.monotonic() - request_started_at) * 1000,
+                outcome="failed",
+                error=str(e),
+            )
             llm_manager.log_event(
                 f"Agent error | session_id={session_id or self.session_id} | error={e}",
                 level=40,
@@ -1468,7 +1903,8 @@ class AgentCore:
                 )
 
                 executor = ThreadPoolExecutor(max_workers=1)
-                future = executor.submit(lambda: self.graph.invoke(restored_state))
+                execution_context = copy_context()
+                future = executor.submit(lambda: execution_context.run(self.graph.invoke, restored_state))
                 try:
                     result = self._wait_for_graph_result(future, new_request_id, config.request_timeout_seconds)
                 except RequestCancelledError:

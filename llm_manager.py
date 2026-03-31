@@ -1,7 +1,9 @@
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from contextlib import contextmanager
 from contextvars import ContextVar
+import json
 import logging
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -27,20 +29,31 @@ class LLMManager:
 
     def _build_file_logger(self) -> logging.Logger:
         logger = logging.getLogger("llm_brain.llm")
-        if logger.handlers:
-            return logger
-
         log_dir = Path(config.resolve_path(config.log_dir))
         log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / config.llm_log_file
+
+        existing_paths = {
+            getattr(handler, "baseFilename", None)
+            for handler in logger.handlers
+            if isinstance(handler, logging.FileHandler)
+        }
+        if str(log_path) not in existing_paths:
+            for handler in list(logger.handlers):
+                logger.removeHandler(handler)
+                try:
+                    handler.close()
+                except Exception:
+                    pass
 
         logger.setLevel(logging.INFO)
         logger.propagate = False
         formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
 
-        file_handler = logging.FileHandler(log_path, encoding="utf-8")
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
+        if not logger.handlers:
+            file_handler = logging.FileHandler(log_path, encoding="utf-8")
+            file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
 
         return logger
 
@@ -136,8 +149,110 @@ class LLMManager:
             return message
         return f"request_id={active_request_id} | {message}"
 
-    def log_event(self, message: str, level: int = logging.INFO, request_id: str | None = None) -> None:
-        self._logger.log(level, self._with_request_id(message, request_id=request_id))
+    def _stringify_field(self, value: Any) -> Any:
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        if isinstance(value, (list, dict)):
+            return value
+        return str(value)
+
+    def _build_structured_payload(
+        self,
+        event_type: str,
+        message: str = "",
+        request_id: str | None = None,
+        session_id: str | None = None,
+        stage: str | None = None,
+        duration_ms: float | None = None,
+        **fields,
+    ) -> dict[str, Any]:
+        payload = {
+            "event_type": event_type,
+            "message": message,
+            "request_id": request_id or self.get_request_id(),
+            "session_id": session_id,
+            "stage": stage,
+            "duration_ms": round(duration_ms, 2) if duration_ms is not None else None,
+        }
+        for key, value in fields.items():
+            payload[key] = self._stringify_field(value)
+        return {key: value for key, value in payload.items() if value not in (None, "")}
+
+    def log_structured_event(
+        self,
+        event_type: str,
+        message: str = "",
+        level: int = logging.INFO,
+        request_id: str | None = None,
+        session_id: str | None = None,
+        stage: str | None = None,
+        duration_ms: float | None = None,
+        **fields,
+    ) -> None:
+        payload = self._build_structured_payload(
+            event_type,
+            message=message,
+            request_id=request_id,
+            session_id=session_id,
+            stage=stage,
+            duration_ms=duration_ms,
+            **fields,
+        )
+        self._logger.log(level, json.dumps(payload, ensure_ascii=False, sort_keys=True))
+
+    def _parse_text_log_message(self, raw_message: str) -> dict[str, Any]:
+        payload = {
+            "event_type": "text_event",
+            "message": raw_message,
+        }
+        request_match = re.search(r"request_id=([^|]+)", raw_message)
+        if request_match:
+            payload["request_id"] = request_match.group(1).strip()
+        stage_match = re.search(r"stage=([^|]+)", raw_message)
+        if stage_match:
+            payload["stage"] = stage_match.group(1).strip()
+        return payload
+
+    def get_log_path(self) -> str:
+        return str(Path(config.resolve_path(config.log_dir)) / config.llm_log_file)
+
+    def get_request_events(self, request_id: str, limit: int = 200) -> list[dict[str, Any]]:
+        log_path = Path(self.get_log_path())
+        if not request_id or not log_path.exists():
+            return []
+
+        events = []
+        with open(log_path, "r", encoding="utf-8") as file_handle:
+            for line in file_handle:
+                parts = line.rstrip("\n").split(" | ", 2)
+                raw_message = parts[2] if len(parts) == 3 else line.strip()
+                if request_id not in raw_message:
+                    continue
+
+                try:
+                    payload = json.loads(raw_message)
+                except json.JSONDecodeError:
+                    payload = self._parse_text_log_message(raw_message)
+
+                if payload.get("request_id") != request_id:
+                    continue
+
+                payload["logged_at"] = parts[0] if len(parts) >= 1 else ""
+                payload["level"] = parts[1] if len(parts) >= 2 else ""
+                events.append(payload)
+
+        if limit > 0:
+            return events[-limit:]
+        return events
+
+    def log_event(self, message: str, level: int = logging.INFO, request_id: str | None = None, **fields) -> None:
+        self.log_structured_event(
+            "text_event",
+            message=message,
+            level=level,
+            request_id=request_id,
+            **fields,
+        )
 
     def console_event(self, stage: str, request_id: str | None = None, level: int = logging.INFO) -> None:
         self._console_logger.log(level, self._with_request_id(f"stage={stage}", request_id=request_id))
@@ -149,11 +264,21 @@ class LLMManager:
         request_id: str | None = None,
         level: int = logging.INFO,
         console: bool = False,
+        session_id: str | None = None,
+        duration_ms: float | None = None,
+        **fields,
     ) -> None:
-        message = f"Checkpoint | stage={stage}"
-        if details:
-            message = f"{message} | {details}"
-        self.log_event(message, level=level, request_id=request_id)
+        self.log_structured_event(
+            "checkpoint",
+            message=f"Checkpoint {stage}",
+            level=level,
+            request_id=request_id,
+            session_id=session_id,
+            stage=stage,
+            duration_ms=duration_ms,
+            details=details,
+            **fields,
+        )
         if console:
             self.console_event(stage, request_id=request_id, level=level)
 
@@ -182,10 +307,15 @@ class LLMManager:
 
     def invoke(self, payload: Any, source: str = "unknown", llm = None):
         target_llm = llm or self.get_llm()
-        self.log_event(
-            f"LLM request | source={source} | provider={config.llm_config.provider} | model={config.llm_config.model}\n"
-            f"{self._truncate_text(self._stringify_payload(payload))}"
+        self.log_structured_event(
+            "llm_request",
+            message="LLM request",
+            source=source,
+            provider=config.llm_config.provider,
+            model=config.llm_config.model,
+            payload=self._truncate_text(self._stringify_payload(payload)),
         )
+        started_at = time.monotonic()
         try:
             response = self._run_with_timeout(
                 lambda: target_llm.invoke(payload),
@@ -193,15 +323,26 @@ class LLMManager:
                 f"LLM invocation timed out after {config.llm_timeout_seconds} seconds.",
             )
         except Exception as exc:
-            self.log_event(
-                f"LLM error | source={source} | provider={config.llm_config.provider} | model={config.llm_config.model} | error={exc}",
+            self.log_structured_event(
+                "llm_error",
+                message="LLM invocation failed",
                 level=logging.ERROR,
+                source=source,
+                provider=config.llm_config.provider,
+                model=config.llm_config.model,
+                duration_ms=(time.monotonic() - started_at) * 1000,
+                error=str(exc),
             )
             raise
 
-        self.log_event(
-            f"LLM response | source={source} | provider={config.llm_config.provider} | model={config.llm_config.model}\n"
-            f"{self._truncate_text(self._stringify_response(response))}"
+        self.log_structured_event(
+            "llm_response",
+            message="LLM response",
+            source=source,
+            provider=config.llm_config.provider,
+            model=config.llm_config.model,
+            duration_ms=(time.monotonic() - started_at) * 1000,
+            response=self._truncate_text(self._stringify_response(response)),
         )
         return response
 

@@ -145,6 +145,7 @@ class MemoryQualityTests(unittest.TestCase):
 
         agent_core_module = importlib.reload(agent_core)
         agent = agent_core_module.AgentCore()
+        agent.cognitive.extract_features = lambda text, domain_hint="": (["weather", "beijing"], "weather lookup")
 
         session_memory_id = agent.memory.add_memory(
             "session_case",

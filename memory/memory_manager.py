@@ -317,3 +317,33 @@ class MemoryManager:
             "input": raw_in,
             "output": raw_out,
         }
+
+    def list_memories_by_request_id(self, request_id: str, limit: int = 20):
+        if not request_id:
+            return []
+
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        c.execute(
+            "SELECT id, conv_id, request_id, timestamp, memory_type, quality_tags, summary, keywords, weight FROM interactions WHERE request_id = ? ORDER BY id ASC LIMIT ?",
+            (request_id, limit),
+        )
+        results = c.fetchall()
+        conn.close()
+
+        memories = []
+        for memory_id, conv_id, stored_request_id, timestamp, memory_type, quality_tags_raw, summary, keywords_raw, weight in results:
+            memories.append(
+                {
+                    "id": memory_id,
+                    "conv_id": conv_id,
+                    "request_id": stored_request_id,
+                    "timestamp": timestamp,
+                    "memory_type": memory_type,
+                    "quality_tags": self._normalize_quality_tags(json.loads(quality_tags_raw or "[]")),
+                    "summary": summary,
+                    "keywords": json.loads(keywords_raw or "[]"),
+                    "weight": weight,
+                }
+            )
+        return memories

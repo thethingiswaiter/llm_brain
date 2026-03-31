@@ -142,6 +142,14 @@ class SkillManager:
                 registered.append(tool_skill)
         return registered
 
+    def unregister_tools(self, tool_names: List[str]) -> int:
+        removed = 0
+        for tool_name in tool_names:
+            if tool_name in self.loaded_tool_skills:
+                self.loaded_tool_skills.pop(tool_name, None)
+                removed += 1
+        return removed
+
     def find_best_skill(self, keywords: List[str]) -> Optional[Dict[str, Any]]:
         """Match markdown prompt skill by keywords."""
         best_skill = None
