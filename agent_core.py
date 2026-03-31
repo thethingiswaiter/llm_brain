@@ -4,15 +4,12 @@ import re
 import uuid
 import importlib.util
 import time
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
-from contextvars import copy_context
 from datetime import datetime, timezone
 from threading import Event, Lock
 from typing import Annotated, Literal, TypedDict, List, Dict, Any
-from pydantic import ValidationError
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage, ToolMessage
 from langgraph.graph import StateGraph, START, END, add_messages
-from llm_manager import llm_manager, RequestCancelledError
+from llm_manager import llm_manager
 from langgraph.prebuilt import ToolNode
 from langchain_core.tools import StructuredTool
 from config import config
@@ -21,6 +18,10 @@ from config import config
 from cognitive.feature_extractor import CognitiveSystem
 from cognitive.planner import TaskPlanner
 from cognitive.reflector import Reflector
+from agent_observability import AgentObservability
+from agent_runtime import AgentRuntime
+from agent_snapshots import AgentSnapshotStore
+from agent_tools import AgentToolRuntime
 from memory.memory_manager import MemoryManager
 from mcp_servers.mcp_manager import MCPManager
 from skills_md.skill_parser import SkillManager
@@ -52,6 +53,7 @@ class AgentCore:
         self.last_request_id = ""
         self._request_cancellations: Dict[str, Event] = {}
         self._request_lock = Lock()
+        self._request_event_factory = Event
         
         # Instantiate sub-systems
         self.cognitive = CognitiveSystem()
@@ -60,6 +62,10 @@ class AgentCore:
         self.memory = MemoryManager()
         self.mcp = MCPManager()
         self.skills = SkillManager()
+        self.snapshot_store = AgentSnapshotStore(self)
+        self.observability = AgentObservability(self)
+        self.runtime = AgentRuntime(self)
+        self.tool_runtime = AgentToolRuntime(self)
         
         self._auto_load_skills()
         self._auto_load_mcp_servers()
@@ -76,104 +82,37 @@ class AgentCore:
         return self.session_id
 
     def _register_request(self, request_id: str) -> Event:
-        with self._request_lock:
-            cancel_event = Event()
-            self._request_cancellations[request_id] = cancel_event
-            return cancel_event
+        return self.runtime.register_request(request_id)
 
     def _clear_request(self, request_id: str) -> None:
-        with self._request_lock:
-            self._request_cancellations.pop(request_id, None)
+        self.runtime.clear_request(request_id)
 
     def is_request_cancelled(self, request_id: str) -> bool:
-        with self._request_lock:
-            cancel_event = self._request_cancellations.get(request_id)
-            return bool(cancel_event and cancel_event.is_set())
+        return self.runtime.is_request_cancelled(request_id)
 
     def is_request_active(self, request_id: str) -> bool:
-        with self._request_lock:
-            return request_id in self._request_cancellations
+        return self.runtime.is_request_active(request_id)
 
     def cancel_request(self, request_id: str) -> str:
-        with self._request_lock:
-            cancel_event = self._request_cancellations.get(request_id)
-            if not cancel_event:
-                return f"Request is not active: {request_id}"
-            cancel_event.set()
-        llm_manager.console_event("agent_cancel_requested", request_id=request_id, level=40)
-        llm_manager.log_event("Agent cancellation requested by user.", level=40, request_id=request_id)
-        return f"Cancellation requested for {request_id}."
+        return self.runtime.cancel_request(request_id)
 
     def _raise_if_request_cancelled(self, request_id: str) -> None:
-        if request_id and self.is_request_cancelled(request_id):
-            raise RequestCancelledError(f"Request cancelled: {request_id}")
+        self.runtime.raise_if_request_cancelled(request_id)
 
     def _wait_for_graph_result(self, future, request_id: str, timeout_seconds: int):
-        start = time.monotonic()
-        while True:
-            self._raise_if_request_cancelled(request_id)
-            elapsed = time.monotonic() - start
-            remaining = timeout_seconds - elapsed
-            if remaining <= 0:
-                future.cancel()
-                raise TimeoutError(
-                    f"Request timed out after {timeout_seconds} seconds. "
-                    "Execution was cancelled logically; inspect snapshots and logs with the request ID."
-                )
-            try:
-                return future.result(timeout=min(0.1, remaining))
-            except FuturesTimeoutError:
-                continue
+        return self.runtime.wait_for_graph_result(future, request_id, timeout_seconds)
 
     def _snapshot_request_dir(self, request_id: str, create: bool = True) -> str:
-        snapshot_dir = config.resolve_path(config.state_snapshot_dir)
-        request_dir = os.path.join(snapshot_dir, request_id)
-        if create:
-            os.makedirs(request_dir, exist_ok=True)
-        return request_dir
+        return self.snapshot_store.snapshot_request_dir(request_id, create=create)
 
     def _serialize_message(self, message: BaseMessage) -> Dict[str, Any]:
-        content = getattr(message, "content", "")
-        if isinstance(content, list):
-            content = str(content)
-        return {
-            "type": getattr(message, "type", message.__class__.__name__),
-            "content": str(content)[:config.llm_log_max_chars],
-            "tool_calls": getattr(message, "tool_calls", None),
-            "tool_call_id": getattr(message, "tool_call_id", None),
-        }
+        return self.snapshot_store.serialize_message(message)
 
     def _deserialize_message(self, payload: Dict[str, Any]) -> BaseMessage:
-        message_type = str(payload.get("type", "ai")).lower()
-        content = str(payload.get("content", ""))
-        tool_calls = payload.get("tool_calls") or []
-        if message_type == "human":
-            return HumanMessage(content=content)
-        if message_type == "system":
-            return SystemMessage(content=content)
-        if message_type == "tool":
-            return ToolMessage(content=content, tool_call_id=payload.get("tool_call_id") or "restored_tool_call")
-        return AIMessage(content=content, tool_calls=tool_calls)
+        return self.snapshot_store.deserialize_message(payload)
 
     def _serialize_state_snapshot(self, state: Dict[str, Any]) -> Dict[str, Any]:
-        messages = state.get("messages", [])
-        return {
-            "request_id": state.get("request_id", ""),
-            "session_id": state.get("session_id", ""),
-            "session_memory_id": state.get("session_memory_id", 0),
-            "current_subtask_index": state.get("current_subtask_index", 0),
-            "plan": state.get("plan", []),
-            "global_keywords": state.get("global_keywords", []),
-            "reflections": state.get("reflections", []),
-            "failed_tools": state.get("failed_tools", {}),
-            "domain_label": state.get("domain_label", ""),
-            "memory_summaries": state.get("memory_summaries", []),
-            "retry_counts": state.get("retry_counts", {}),
-            "replan_counts": state.get("replan_counts", {}),
-            "blocked": state.get("blocked", False),
-            "final_response": state.get("final_response", ""),
-            "messages": [self._serialize_message(message) for message in messages],
-        }
+        return self.snapshot_store.serialize_state_snapshot(state)
 
     def _persist_state_snapshot(
         self,
@@ -182,301 +121,46 @@ class AgentCore:
         state: Dict[str, Any] | None = None,
         extra: Dict[str, Any] | None = None,
     ) -> str:
-        if not request_id:
-            return ""
-
-        request_dir = self._snapshot_request_dir(request_id)
-        snapshot_index = len([name for name in os.listdir(request_dir) if name.endswith(".json")]) + 1
-        snapshot_path = os.path.join(request_dir, f"{snapshot_index:03d}_{stage}.json")
-        payload = {
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "stage": stage,
-            "request_id": request_id,
-            "state": self._serialize_state_snapshot(state or {}),
-            "extra": extra or {},
-        }
-        with open(snapshot_path, "w", encoding="utf-8") as file_handle:
-            json.dump(payload, file_handle, ensure_ascii=False, indent=2)
-        llm_manager.log_event(
-            f"State snapshot persisted | stage={stage} | path={snapshot_path}",
-            request_id=request_id,
-        )
-        return snapshot_path
+        return self.snapshot_store.persist_state_snapshot(request_id, stage, state=state, extra=extra)
 
     def _resolve_snapshot_path(self, request_id: str, snapshot_name: str | None = None) -> str:
-        request_dir = self._snapshot_request_dir(request_id, create=False)
-        if not os.path.exists(request_dir):
-            return ""
-
-        snapshot_files = sorted(
-            [name for name in os.listdir(request_dir) if name.endswith(".json")]
-        )
-        if not snapshot_files:
-            return ""
-
-        if snapshot_name:
-            selector = os.path.basename(snapshot_name).strip().lower()
-            if selector == "latest":
-                return os.path.join(request_dir, snapshot_files[-1])
-
-            direct_match = os.path.join(request_dir, os.path.basename(snapshot_name))
-            if os.path.exists(direct_match):
-                return direct_match
-
-            if selector.isdigit():
-                numeric_prefix = f"{int(selector):03d}_"
-                for filename in snapshot_files:
-                    if filename.startswith(numeric_prefix):
-                        return os.path.join(request_dir, filename)
-
-            for filename in reversed(snapshot_files):
-                lowered = filename.lower()
-                if lowered.endswith(f"_{selector}.json"):
-                    return os.path.join(request_dir, filename)
-
-        return os.path.join(request_dir, snapshot_files[-1])
+        return self.snapshot_store.resolve_snapshot_path(request_id, snapshot_name=snapshot_name)
 
     def list_snapshots(self, request_id: str) -> List[Dict[str, Any]]:
-        request_dir = self._snapshot_request_dir(request_id, create=False)
-        if not os.path.exists(request_dir):
-            return []
-
-        snapshot_files = sorted(
-            [name for name in os.listdir(request_dir) if name.endswith(".json")]
-        )
-        summaries: List[Dict[str, Any]] = []
-        for index, filename in enumerate(snapshot_files, start=1):
-            snapshot_path = os.path.join(request_dir, filename)
-            try:
-                with open(snapshot_path, "r", encoding="utf-8") as file_handle:
-                    payload = json.load(file_handle)
-            except (OSError, json.JSONDecodeError):
-                continue
-
-            state = payload.get("state", {})
-            summaries.append(
-                {
-                    "index": index,
-                    "file": filename,
-                    "stage": payload.get("stage", ""),
-                    "created_at": payload.get("created_at", ""),
-                    "subtask_index": state.get("current_subtask_index", 0),
-                    "blocked": state.get("blocked", False),
-                    "completed": bool(state.get("final_response")) and state.get("current_subtask_index", 0) >= len(state.get("plan", [])),
-                }
-            )
-        return summaries
+        return self.snapshot_store.list_snapshots(request_id)
 
     def _derive_request_status(self, latest_stage: str, latest_state: Dict[str, Any], active: bool) -> str:
-        if active:
-            return "active"
-        if latest_state.get("blocked"):
-            return "blocked"
-
-        stage_to_status = {
-            "request_completed": "completed",
-            "agent_completed": "completed",
-            "request_failed": "failed",
-            "request_cancelled": "cancelled",
-            "request_timed_out": "timed_out",
-            "agent_blocked": "blocked",
-        }
-        if latest_stage in stage_to_status:
-            return stage_to_status[latest_stage]
-        if latest_stage:
-            return "in_progress"
-        return "not_found"
+        return self.observability.derive_request_status(latest_stage, latest_state, active)
 
     def _extract_bool_from_event(self, event: Dict[str, Any], key: str) -> bool | None:
-        value = event.get(key)
-        if isinstance(value, bool):
-            return value
-        details = str(event.get("details", ""))
-        match = re.search(rf"{re.escape(key)}=(True|False|true|false)", details)
-        if not match:
-            return None
-        return match.group(1).lower() == "true"
+        return self.observability.extract_bool_from_event(event, key)
 
     def _parse_logged_at(self, value: str) -> datetime | None:
-        if not value:
-            return None
-        for fmt in ("%Y-%m-%d %H:%M:%S,%f", "%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z"):
-            try:
-                return datetime.strptime(value, fmt)
-            except ValueError:
-                continue
-        try:
-            return datetime.fromisoformat(value)
-        except ValueError:
-            return None
+        return self.observability.parse_logged_at(value)
 
     def _build_request_metrics(self, events: List[Dict[str, Any]], latest_state: Dict[str, Any], status: str) -> Dict[str, Any]:
-        llm_events = [event for event in events if event.get("event_type") in {"llm_response", "llm_error"}]
-        checkpoint_events = [event for event in events if event.get("event_type") == "checkpoint"]
-        stage_counts: Dict[str, int] = {}
-        for event in checkpoint_events:
-            stage = str(event.get("stage", ""))
-            if stage:
-                stage_counts[stage] = stage_counts.get(stage, 0) + 1
-
-        logged_times = [self._parse_logged_at(str(event.get("logged_at", ""))) for event in events]
-        logged_times = [item for item in logged_times if item is not None]
-        total_duration_ms = None
-        if len(logged_times) >= 2:
-            total_duration_ms = round((max(logged_times) - min(logged_times)).total_seconds() * 1000, 2)
-
-        llm_total_duration_ms = round(
-            sum(float(event.get("duration_ms", 0) or 0) for event in llm_events),
-            2,
-        )
-        reflection_failure_count = 0
-        for event in checkpoint_events:
-            if event.get("stage") != "reflection_completed":
-                continue
-            success = self._extract_bool_from_event(event, "success")
-            if success is False:
-                reflection_failure_count += 1
-
-        retry_count = sum(int(value) for value in (latest_state.get("retry_counts", {}) or {}).values())
-        tool_started = stage_counts.get("tool_started", 0)
-        tool_success = stage_counts.get("tool_succeeded", 0)
-        tool_failures = stage_counts.get("tool_failed", 0)
-        tool_rejections = stage_counts.get("tool_rejected", 0)
-        tool_cancelled = stage_counts.get("tool_cancelled", 0)
-        subtask_count = stage_counts.get("subtask_started", 0) or len(latest_state.get("plan", []))
-
-        return {
-            "total_duration_ms": total_duration_ms,
-            "llm_call_count": sum(1 for event in events if event.get("event_type") == "llm_request"),
-            "llm_error_count": sum(1 for event in events if event.get("event_type") == "llm_error"),
-            "llm_total_duration_ms": llm_total_duration_ms,
-            "tool_call_count": tool_started,
-            "tool_success_count": tool_success,
-            "tool_failure_count": tool_failures,
-            "tool_rejection_count": tool_rejections,
-            "tool_cancelled_count": tool_cancelled,
-            "tool_hit_rate": round((tool_success / tool_started), 4) if tool_started else 0.0,
-            "retry_count": retry_count,
-            "subtask_count": subtask_count,
-            "reflection_failure_count": reflection_failure_count,
-            "blocked_rate": 1.0 if status == "blocked" else 0.0,
-        }
+        return self.observability.build_request_metrics(events, latest_state, status)
 
     def get_request_summary(self, request_id: str) -> Dict[str, Any] | None:
-        snapshots = self.list_snapshots(request_id)
-        latest_payload = self._load_snapshot_payload(request_id)
-        latest_state = latest_payload.get("state", {}) if latest_payload else {}
-        latest_extra = latest_payload.get("extra", {}) if latest_payload else {}
-        events = llm_manager.get_request_events(request_id)
-        memories = self.memory.list_memories_by_request_id(request_id)
+        return self.observability.get_request_summary(request_id)
 
-        if not snapshots and not events and not memories and not self.is_request_active(request_id):
-            return None
-
-        checkpoints = []
-        for event in events:
-            stage = event.get("stage")
-            if event.get("event_type") != "checkpoint" and not stage:
-                continue
-            checkpoints.append(
-                {
-                    "logged_at": event.get("logged_at", ""),
-                    "level": event.get("level", ""),
-                    "stage": stage or "",
-                    "message": event.get("message", ""),
-                    "details": event.get("details", ""),
-                }
-            )
-
-        latest_stage = ""
-        if latest_payload:
-            latest_stage = latest_payload.get("stage", "")
-        elif checkpoints:
-            latest_stage = checkpoints[-1].get("stage", "")
-
-        final_response = latest_state.get("final_response") or latest_extra.get("final_output", "")
-        status = self._derive_request_status(latest_stage, latest_state, self.is_request_active(request_id))
-        session_id = latest_state.get("session_id", "") or (memories[-1].get("conv_id", "") if memories else "")
-        metrics = self._build_request_metrics(events, latest_state, status)
-
-        return {
-            "request_id": request_id,
-            "status": status,
-            "active": self.is_request_active(request_id),
-            "session_id": session_id,
-            "source_request_id": latest_extra.get("source_request_id", ""),
-            "latest_stage": latest_stage,
-            "created_at": snapshots[0].get("created_at", "") if snapshots else (events[0].get("logged_at", "") if events else ""),
-            "updated_at": snapshots[-1].get("created_at", "") if snapshots else (events[-1].get("logged_at", "") if events else ""),
-            "subtask_index": latest_state.get("current_subtask_index", 0),
-            "plan_length": len(latest_state.get("plan", [])),
-            "blocked": latest_state.get("blocked", False),
-            "final_response": final_response,
-            "snapshot_count": len(snapshots),
-            "snapshots": snapshots,
-            "memory_count": len(memories),
-            "memories": memories,
-            "checkpoint_count": len(checkpoints),
-            "checkpoints": checkpoints,
-            "metrics": metrics,
-        }
-
-    def get_recent_request_summaries(self, limit: int = 10) -> List[Dict[str, Any]]:
-        snapshot_root = config.resolve_path(config.state_snapshot_dir)
-        if not os.path.exists(snapshot_root):
-            return []
-
-        request_ids = []
-        for name in os.listdir(snapshot_root):
-            candidate = os.path.join(snapshot_root, name)
-            if os.path.isdir(candidate):
-                request_ids.append(name)
-
-        summarized_requests = []
-        for request_id in request_ids:
-            summary = self.get_request_summary(request_id)
-            if not summary:
-                continue
-            summarized_requests.append(summary)
-
-        summarized_requests.sort(
-            key=lambda item: self._parse_logged_at(item.get("updated_at", "")) or datetime.min,
-            reverse=True,
+    def get_recent_request_summaries(
+        self,
+        limit: int = 10,
+        statuses: List[str] | None = None,
+        resumed_only: bool = False,
+    ) -> List[Dict[str, Any]]:
+        return self.observability.get_recent_request_summaries(
+            limit=limit,
+            statuses=statuses,
+            resumed_only=resumed_only,
         )
-        return summarized_requests[: max(0, limit)]
 
     def _load_snapshot_payload(self, request_id: str, snapshot_name: str | None = None) -> Dict[str, Any] | None:
-        snapshot_path = self._resolve_snapshot_path(request_id, snapshot_name=snapshot_name)
-        if not snapshot_path:
-            return None
-
-        with open(snapshot_path, "r", encoding="utf-8") as file_handle:
-            payload = json.load(file_handle)
-        payload["snapshot_path"] = snapshot_path
-        return payload
+        return self.snapshot_store.load_snapshot_payload(request_id, snapshot_name=snapshot_name)
 
     def _restore_state_from_snapshot(self, payload: Dict[str, Any], request_id: str) -> Dict[str, Any]:
-        stored_state = payload.get("state", {})
-        restored_messages = [
-            self._deserialize_message(message_payload)
-            for message_payload in stored_state.get("messages", [])
-        ]
-        return {
-            "messages": restored_messages,
-            "plan": stored_state.get("plan", []),
-            "current_subtask_index": stored_state.get("current_subtask_index", 0),
-            "reflections": stored_state.get("reflections", []),
-            "global_keywords": stored_state.get("global_keywords", []),
-            "request_id": request_id,
-            "session_id": stored_state.get("session_id", self.session_id),
-            "session_memory_id": stored_state.get("session_memory_id", 0),
-            "domain_label": stored_state.get("domain_label", "general"),
-            "memory_summaries": stored_state.get("memory_summaries", []),
-            "retry_counts": stored_state.get("retry_counts", {}),
-            "replan_counts": stored_state.get("replan_counts", {}),
-            "blocked": stored_state.get("blocked", False),
-            "final_response": stored_state.get("final_response", ""),
-        }
+        return self.snapshot_store.restore_state_from_snapshot(payload, request_id)
 
     def _plans_are_meaningfully_different(self, original_plan: List[Dict[str, Any]], candidate_plan: List[Dict[str, Any]]) -> bool:
         if not candidate_plan:
@@ -532,211 +216,19 @@ class AgentCore:
         return {token for token in re.findall(r"[a-zA-Z0-9_]+", text.lower()) if len(token) > 2}
 
     def _classify_tool_exception(self, exc: Exception) -> tuple[str, bool]:
-        if isinstance(exc, (TypeError, ValueError)):
-            return "invalid_arguments", False
-        if isinstance(exc, TimeoutError):
-            return "timeout", True
-        if isinstance(exc, (ConnectionError, OSError)):
-            return "dependency_unavailable", True
-        return "execution_error", True
+        return self.tool_runtime.classify_tool_exception(exc)
 
     def _build_tool_error_payload(self, tool_name: str, error_type: str, retryable: bool, message: str) -> str:
-        return json.dumps(
-            {
-                "ok": False,
-                "tool": tool_name,
-                "error_type": error_type,
-                "retryable": retryable,
-                "message": message,
-            },
-            ensure_ascii=False,
-        )
+        return self.tool_runtime.build_tool_error_payload(tool_name, error_type, retryable, message)
 
     def _validate_named_argument_heuristics(self, field_name: str, value: Any) -> str:
-        normalized_name = field_name.strip().lower()
-        if value is None:
-            return ""
-
-        if "city" in normalized_name or "location" in normalized_name:
-            if not isinstance(value, str) or not value.strip():
-                return f"Argument {field_name} must be a non-empty city/location name."
-            compact = value.strip()
-            if compact.isdigit() or not re.search(r"[a-zA-Z\u4e00-\u9fff]", compact):
-                return f"Argument {field_name} does not look like a valid city/location name: {value}"
-
-        date_pattern = r"^\d{4}[-/]\d{2}[-/]\d{2}$"
-        time_pattern = r"^\d{2}:\d{2}(:\d{2})?$"
-        datetime_pattern = r"^\d{4}[-/]\d{2}[-/]\d{2}[ T]\d{2}:\d{2}(:\d{2})?$"
-
-        if "date" in normalized_name and isinstance(value, str):
-            if not re.match(date_pattern, value.strip()):
-                return f"Argument {field_name} must use a recognizable date format like YYYY-MM-DD."
-
-        if normalized_name in {"time", "timestamp", "datetime"} or normalized_name.endswith("_time"):
-            if isinstance(value, str) and not (
-                re.match(time_pattern, value.strip()) or re.match(datetime_pattern, value.strip())
-            ):
-                return f"Argument {field_name} must use a recognizable time format like HH:MM or YYYY-MM-DD HH:MM:SS."
-
-        return ""
+        return self.tool_runtime.validate_named_argument_heuristics(field_name, value)
 
     def _prevalidate_tool_arguments(self, tool_name: str, args_schema, kwargs: Dict[str, Any]) -> tuple[Dict[str, Any] | None, str | None]:
-        if not args_schema:
-            return kwargs, None
-
-        try:
-            if hasattr(args_schema, "model_validate"):
-                validated = args_schema.model_validate(kwargs)
-                normalized_kwargs = validated.model_dump()
-            else:
-                validated = args_schema(**kwargs)
-                normalized_kwargs = validated.dict()
-        except ValidationError as exc:
-            return None, self._build_tool_error_payload(
-                tool_name,
-                "invalid_arguments",
-                False,
-                f"Argument schema validation failed: {exc}",
-            )
-        except Exception as exc:
-            return None, self._build_tool_error_payload(
-                tool_name,
-                "invalid_arguments",
-                False,
-                f"Argument validation failed: {exc}",
-            )
-
-        for field_name, value in normalized_kwargs.items():
-            heuristic_error = self._validate_named_argument_heuristics(field_name, value)
-            if heuristic_error:
-                return None, self._build_tool_error_payload(
-                    tool_name,
-                    "invalid_arguments",
-                    False,
-                    heuristic_error,
-                )
-
-        return normalized_kwargs, None
+        return self.tool_runtime.prevalidate_tool_arguments(tool_name, args_schema, kwargs)
 
     def _wrap_tool_for_runtime(self, tool):
-        if getattr(tool, "_llm_brain_safe_tool", False):
-            return tool
-
-        tool_name = getattr(tool, "name", "runtime_tool")
-        description = getattr(tool, "description", "") or ""
-        args_schema = getattr(tool, "args_schema", None)
-        return_direct = getattr(tool, "return_direct", False)
-
-        def safe_tool_runner(**kwargs):
-            request_id = llm_manager.get_request_id()
-            self._raise_if_request_cancelled(request_id or "")
-            started_at = time.monotonic()
-            llm_manager.log_checkpoint(
-                "tool_started",
-                details=f"tool={tool_name}",
-                request_id=request_id,
-                console=True,
-                tool_name=tool_name,
-            )
-            executor = ThreadPoolExecutor(max_workers=1)
-            try:
-                normalized_kwargs, validation_error = self._prevalidate_tool_arguments(tool_name, args_schema, kwargs)
-                if validation_error:
-                    llm_manager.log_checkpoint(
-                        "tool_rejected",
-                        details=f"tool={tool_name} | error_type=invalid_arguments",
-                        request_id=request_id,
-                        level=40,
-                        console=True,
-                        duration_ms=(time.monotonic() - started_at) * 1000,
-                        tool_name=tool_name,
-                        error_type="invalid_arguments",
-                    )
-                    llm_manager.log_event(
-                        f"Tool prevalidation rejected call | tool={tool_name} | payload={validation_error}",
-                        level=40,
-                        request_id=request_id,
-                    )
-                    return validation_error
-
-                future = executor.submit(lambda: tool.invoke(normalized_kwargs))
-                start = time.monotonic()
-                while True:
-                    self._raise_if_request_cancelled(request_id or "")
-                    elapsed = time.monotonic() - start
-                    remaining = config.tool_timeout_seconds - elapsed
-                    if remaining <= 0:
-                        future.cancel()
-                        raise TimeoutError(
-                            f"Tool {tool_name} timed out after {config.tool_timeout_seconds} seconds."
-                        )
-                    try:
-                        result = future.result(timeout=min(0.1, remaining))
-                        break
-                    except FuturesTimeoutError:
-                        continue
-                llm_manager.log_checkpoint(
-                    "tool_succeeded",
-                    details=f"tool={tool_name}",
-                    request_id=request_id,
-                    console=True,
-                    duration_ms=(time.monotonic() - started_at) * 1000,
-                    tool_name=tool_name,
-                )
-                return result
-            except RequestCancelledError as exc:
-                llm_manager.log_checkpoint(
-                    "tool_cancelled",
-                    details=f"tool={tool_name}",
-                    request_id=request_id,
-                    level=40,
-                    console=True,
-                    duration_ms=(time.monotonic() - started_at) * 1000,
-                    tool_name=tool_name,
-                    error_type="cancelled",
-                )
-                return json.dumps(
-                    {
-                        "ok": False,
-                        "tool": tool_name,
-                        "error_type": "cancelled",
-                        "retryable": False,
-                        "message": str(exc),
-                    },
-                    ensure_ascii=False,
-                )
-            except Exception as exc:
-                error_type, retryable = self._classify_tool_exception(exc)
-                llm_manager.log_checkpoint(
-                    "tool_failed",
-                    details=f"tool={tool_name} | error_type={error_type}",
-                    request_id=request_id,
-                    level=40,
-                    console=True,
-                    duration_ms=(time.monotonic() - started_at) * 1000,
-                    tool_name=tool_name,
-                    error_type=error_type,
-                    retryable=retryable,
-                )
-                llm_manager.log_event(
-                    f"Tool execution failed | tool={tool_name} | error_type={error_type} | retryable={retryable} | error={exc}",
-                    level=40,
-                    request_id=request_id,
-                )
-                return self._build_tool_error_payload(tool_name, error_type, retryable, str(exc))
-            finally:
-                executor.shutdown(wait=False, cancel_futures=True)
-
-        wrapped_tool = StructuredTool.from_function(
-            func=safe_tool_runner,
-            name=tool_name,
-            description=description,
-            args_schema=args_schema,
-            return_direct=return_direct,
-        )
-        setattr(wrapped_tool, "_llm_brain_safe_tool", True)
-        setattr(wrapped_tool, "_llm_brain_original_tool", tool)
-        return wrapped_tool
+        return self.tool_runtime.wrap_tool_for_runtime(tool)
 
     def _select_relevant_memories(self, memories: List[Dict[str, Any]], keywords: List[str], limit: int = 3):
         keyword_set = {kw.strip().lower() for kw in keywords if isinstance(kw, str) and kw.strip()}
@@ -763,26 +255,10 @@ class AgentCore:
         return relevant[:limit]
 
     def _parse_tool_error_payload(self, content: str) -> Dict[str, Any] | None:
-        try:
-            payload = json.loads(content)
-        except (TypeError, json.JSONDecodeError):
-            return None
-        if not isinstance(payload, dict) or payload.get("ok", True):
-            return None
-        if not payload.get("tool"):
-            return None
-        return payload
+        return self.tool_runtime.parse_tool_error_payload(content)
 
     def _collect_recent_tool_failures(self, messages: List[BaseMessage]) -> List[Dict[str, Any]]:
-        failures: List[Dict[str, Any]] = []
-        for message in reversed(messages):
-            if not isinstance(message, ToolMessage):
-                break
-            payload = self._parse_tool_error_payload(getattr(message, "content", ""))
-            if payload:
-                failures.append(payload)
-        failures.reverse()
-        return failures
+        return self.tool_runtime.collect_recent_tool_failures(messages)
 
     def _merge_failed_tools(
         self,
@@ -790,16 +266,7 @@ class AgentCore:
         subtask_index: int,
         recent_failures: List[Dict[str, Any]],
     ) -> Dict[str, List[str]]:
-        merged = {key: list(value) for key, value in (failed_tools or {}).items()}
-        if not recent_failures:
-            return merged
-
-        key = str(subtask_index)
-        existing = set(merged.get(key, []))
-        for item in recent_failures:
-            existing.add(str(item.get("tool", "")))
-        merged[key] = sorted(name for name in existing if name)
-        return merged
+        return self.tool_runtime.merge_failed_tools(failed_tools, subtask_index, recent_failures)
 
     def _filter_failed_tools_for_subtask(
         self,
@@ -808,13 +275,7 @@ class AgentCore:
         tool_skills: List[Dict[str, Any]],
         failed_tools: Dict[str, List[str]],
     ) -> tuple[List[Any], List[Dict[str, Any]], List[str]]:
-        failed_names = set((failed_tools or {}).get(str(subtask_index), []))
-        if not failed_names:
-            return selected_tools, tool_skills, []
-
-        filtered_tools = [tool for tool in selected_tools if getattr(tool, "name", "") not in failed_names]
-        filtered_tool_skills = [item for item in tool_skills if item.get("name") not in failed_names]
-        return filtered_tools, filtered_tool_skills, sorted(failed_names)
+        return self.tool_runtime.filter_failed_tools_for_subtask(subtask_index, selected_tools, tool_skills, failed_tools)
 
     def _expand_tool_candidates(
         self,
@@ -824,21 +285,13 @@ class AgentCore:
         excluded_tool_names: List[str] | None = None,
         limit: int = 6,
     ) -> List[Dict[str, Any]]:
-        excluded = set(excluded_tool_names or []) | set(failed_tool_names or [])
-        ranked_tool_skills = self.skills.find_relevant_tools(
+        return self.tool_runtime.expand_tool_candidates(
             task_description,
             extracted_keywords,
-            limit=max(limit, len(self.skills.loaded_tool_skills) or limit),
+            failed_tool_names,
+            excluded_tool_names=excluded_tool_names,
+            limit=limit,
         )
-        alternatives: List[Dict[str, Any]] = []
-        for tool_skill in ranked_tool_skills:
-            tool_name = tool_skill.get("name", "")
-            if not tool_name or tool_name in excluded:
-                continue
-            alternatives.append(tool_skill)
-            if len(alternatives) >= limit:
-                break
-        return alternatives
 
     def _build_tool_reroute_plan(
         self,
@@ -849,59 +302,14 @@ class AgentCore:
         recent_failures: List[Dict[str, Any]],
         failed_tool_names: List[str],
     ) -> Dict[str, Any]:
-        if not recent_failures:
-            return {
-                "mode": "normal",
-                "selected_tools": selected_tools,
-                "tool_skills": tool_skills,
-                "alternatives": [],
-                "reason": "",
-            }
-
-        error_types = {str(item.get("error_type", "")) for item in recent_failures}
-        retryable_failures = [item for item in recent_failures if bool(item.get("retryable", False))]
-        non_retryable_failures = [item for item in recent_failures if not bool(item.get("retryable", False))]
-
-        if non_retryable_failures and "invalid_arguments" in error_types:
-            return {
-                "mode": "fallback_invalid_arguments",
-                "selected_tools": [],
-                "tool_skills": [],
-                "alternatives": [],
-                "reason": "latest tool failures indicate invalid arguments or missing required input",
-            }
-
-        alternative_tool_skills = self._expand_tool_candidates(
+        return self.tool_runtime.build_tool_reroute_plan(
             subtask_description,
             extracted_keywords,
+            selected_tools,
+            tool_skills,
+            recent_failures,
             failed_tool_names,
-            excluded_tool_names=[getattr(tool, "name", "") for tool in selected_tools],
         )
-        if alternative_tool_skills:
-            return {
-                "mode": "alternative_tools",
-                "selected_tools": [item["tool"] for item in alternative_tool_skills],
-                "tool_skills": alternative_tool_skills,
-                "alternatives": [item.get("name", "") for item in alternative_tool_skills],
-                "reason": "retryable tool failures triggered a broader alternative-tool search",
-            }
-
-        if retryable_failures:
-            return {
-                "mode": "fallback_retryable_no_alternative",
-                "selected_tools": [],
-                "tool_skills": [],
-                "alternatives": [],
-                "reason": "retryable tool failures occurred but no viable alternative tool matched the subtask",
-            }
-
-        return {
-            "mode": "fallback_no_tools",
-            "selected_tools": [],
-            "tool_skills": [],
-            "alternatives": [],
-            "reason": "tool failures left no safe tool route for the current subtask",
-        }
 
     def _format_memory_context(self, memories: List[Dict[str, Any]]) -> str:
         if not memories:
@@ -981,8 +389,21 @@ class AgentCore:
             return
 
         for filename in os.listdir(skills_path):
-            if filename.endswith(".py") and not filename.startswith("__"):
-                self._load_python_skill_file(os.path.join(skills_path, filename), rebuild_graph=False)
+            if not self._is_auto_loadable_skill_file(filename):
+                if filename.endswith(".py") and not filename.startswith("__"):
+                    llm_manager.log_event(
+                        f"Python skill auto-load skipped | file={filename} | reason=reserved_example_or_test_prefix"
+                    )
+                continue
+            self._load_python_skill_file(os.path.join(skills_path, filename), rebuild_graph=False)
+
+    def _is_auto_loadable_skill_file(self, filename: str) -> bool:
+        normalized = os.path.basename(filename).strip().lower()
+        if not normalized.endswith(".py"):
+            return False
+        if normalized.startswith("__"):
+            return False
+        return not (normalized.startswith("test_") or normalized.startswith("sample_"))
 
     def _auto_load_mcp_servers(self):
         """Automatically scan and load MCP servers from the mcp directory"""
@@ -1649,7 +1070,7 @@ class AgentCore:
             messages = state["messages"]
             last_message = messages[-1]
             
-            if last_message.tool_calls:
+            if self.tools and last_message.tool_calls:
                 return "tools"
             
             return "reflect_and_advance"
@@ -1678,11 +1099,13 @@ class AgentCore:
             "agent": "agent",
         })
         graph_builder.add_edge("planner", "agent")
-        graph_builder.add_conditional_edges("agent", should_continue, {
-            "tools": "tools",
+        agent_routes = {
             "reflect_and_advance": "reflect_and_advance",
-            "__end__": END
-        })
+            "__end__": END,
+        }
+        if self.tools:
+            agent_routes["tools"] = "tools"
+        graph_builder.add_conditional_edges("agent", should_continue, agent_routes)
         if self.tools:
             graph_builder.add_edge("tools", "agent")
 
@@ -1694,293 +1117,13 @@ class AgentCore:
         self.graph = graph_builder.compile()
 
     def invoke(self, query: str, session_id: str = None):
-        if not self.graph:
-            return "Graph is not initialized."
-        request_id = self._generate_request_id()
-        self.last_request_id = request_id
-        self._register_request(request_id)
-        inputs = None
-        request_started_at = time.monotonic()
-        try:
-            active_session_id = session_id or self.session_id or self.start_session()
-            with llm_manager.request_scope(request_id, cancel_checker=lambda: self.is_request_cancelled(request_id)):
-                llm_manager.console_event("agent_started", request_id=request_id)
-                llm_manager.log_event(
-                    f"Agent request | session_id={active_session_id}\n{query}"
-                )
-                inputs = {
-                    "messages": [HumanMessage(content=query)],
-                    "plan": [],
-                    "current_subtask_index": 0,
-                    "reflections": [],
-                    "global_keywords": [],
-                    "failed_tools": {},
-                    "request_id": request_id,
-                    "session_id": active_session_id,
-                    "session_memory_id": 0,
-                    "domain_label": "general",
-                    "memory_summaries": [],
-                    "retry_counts": {},
-                    "replan_counts": {},
-                    "blocked": False,
-                    "final_response": "",
-                }
-                self._persist_state_snapshot(
-                    request_id,
-                    "request_received",
-                    inputs,
-                    extra={"query": query},
-                )
-                executor = ThreadPoolExecutor(max_workers=1)
-                execution_context = copy_context()
-                future = executor.submit(lambda: execution_context.run(self.graph.invoke, inputs))
-                try:
-                    res = self._wait_for_graph_result(future, request_id, config.request_timeout_seconds)
-                except RequestCancelledError:
-                    future.cancel()
-                    cancel_message = (
-                        f"Request cancelled: {request_id}. "
-                        "Execution stopped cooperatively; inspect snapshots and logs if partial work was produced."
-                    )
-                    llm_manager.console_event("agent_cancelled", request_id=request_id, level=40)
-                    llm_manager.log_structured_event(
-                        "agent_request",
-                        message="Agent request cancelled",
-                        request_id=request_id,
-                        session_id=active_session_id,
-                        stage="request_cancelled",
-                        duration_ms=(time.monotonic() - request_started_at) * 1000,
-                        outcome="cancelled",
-                    )
-                    llm_manager.log_event(cancel_message, level=40, request_id=request_id)
-                    self._persist_state_snapshot(
-                        request_id,
-                        "request_cancelled",
-                        inputs,
-                        extra={"query": query},
-                    )
-                    return cancel_message
-                except TimeoutError as exc:
-                    future.cancel()
-                    timeout_message = str(exc)
-                    llm_manager.console_event("agent_timeout", request_id=request_id, level=40)
-                    llm_manager.log_structured_event(
-                        "agent_request",
-                        message="Agent request timed out",
-                        request_id=request_id,
-                        session_id=active_session_id,
-                        stage="request_timed_out",
-                        duration_ms=(time.monotonic() - request_started_at) * 1000,
-                        outcome="timed_out",
-                    )
-                    llm_manager.log_event(
-                        timeout_message,
-                        level=40,
-                        request_id=request_id,
-                    )
-                    self._persist_state_snapshot(
-                        request_id,
-                        "request_timed_out",
-                        inputs,
-                        extra={"timeout_seconds": config.request_timeout_seconds, "query": query},
-                    )
-                    return timeout_message
-                finally:
-                    executor.shutdown(wait=False, cancel_futures=True)
-                final_output = res["messages"][-1].content
-                self._persist_state_snapshot(
-                    request_id,
-                    "request_completed",
-                    res,
-                    extra={"final_output": final_output},
-                )
-                llm_manager.console_event("agent_finished", request_id=request_id)
-                llm_manager.log_structured_event(
-                    "agent_request",
-                    message="Agent request completed",
-                    request_id=request_id,
-                    session_id=active_session_id,
-                    stage="request_completed",
-                    duration_ms=(time.monotonic() - request_started_at) * 1000,
-                    outcome="completed",
-                )
-                llm_manager.log_event(
-                    f"Agent response | session_id={active_session_id}\n{final_output}"
-                )
-                return final_output
-        except KeyboardInterrupt:
-            self.cancel_request(request_id)
-            cancel_message = (
-                f"Request cancelled: {request_id}. "
-                "Execution stop was requested by keyboard interrupt."
-            )
-            llm_manager.console_event("agent_cancelled", request_id=request_id, level=40)
-            llm_manager.log_structured_event(
-                "agent_request",
-                message="Agent request cancelled by keyboard interrupt",
-                request_id=request_id,
-                session_id=session_id or self.session_id,
-                stage="request_cancelled",
-                duration_ms=(time.monotonic() - request_started_at) * 1000,
-                outcome="cancelled",
-            )
-            llm_manager.log_event(cancel_message, level=40, request_id=request_id)
-            if inputs is not None:
-                self._persist_state_snapshot(
-                    request_id,
-                    "request_cancelled",
-                    inputs,
-                    extra={"query": query, "source": "keyboard_interrupt"},
-                )
-            return cancel_message
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            llm_manager.console_event("agent_error", request_id=request_id, level=40)
-            llm_manager.log_structured_event(
-                "agent_request",
-                message="Agent request failed",
-                request_id=request_id,
-                session_id=session_id or self.session_id,
-                stage="request_failed",
-                duration_ms=(time.monotonic() - request_started_at) * 1000,
-                outcome="failed",
-                error=str(e),
-            )
-            llm_manager.log_event(
-                f"Agent error | session_id={session_id or self.session_id} | error={e}",
-                level=40,
-                request_id=request_id,
-            )
-            self._persist_state_snapshot(
-                request_id,
-                "request_failed",
-                inputs or {},
-                extra={"error": str(e)},
-            )
-            return f"Error invoking agent: {e}"
-        finally:
-            self._clear_request(request_id)
+        return self.runtime.invoke(query, session_id=session_id)
 
     def get_last_request_id(self) -> str:
         return self.last_request_id
 
     def resume_from_snapshot(self, request_id: str, snapshot_name: str = None):
-        payload = self._load_snapshot_payload(request_id, snapshot_name=snapshot_name)
-        if not payload:
-            return (
-                f"Snapshot not found for request_id={request_id}. "
-                "Use /list_snapshots <request_id> to inspect available recovery points."
-            )
-
-        stored_state = payload.get("state", {})
-        if stored_state.get("blocked"):
-            return stored_state.get("final_response") or "Snapshot is already in a blocked terminal state."
-        if stored_state.get("final_response") and stored_state.get("current_subtask_index", 0) >= len(stored_state.get("plan", [])):
-            return stored_state.get("final_response")
-
-        new_request_id = self._generate_request_id()
-        self.last_request_id = new_request_id
-        self._register_request(new_request_id)
-        restored_state = self._restore_state_from_snapshot(payload, request_id=new_request_id)
-        self.session_id = restored_state.get("session_id", self.session_id)
-
-        try:
-            with llm_manager.request_scope(new_request_id, cancel_checker=lambda: self.is_request_cancelled(new_request_id)):
-                llm_manager.console_event("agent_resumed", request_id=new_request_id)
-                llm_manager.log_event(
-                    f"Agent resumed from snapshot | source_request_id={request_id} | snapshot_path={payload.get('snapshot_path', '')}",
-                    request_id=new_request_id,
-                )
-                self._persist_state_snapshot(
-                    new_request_id,
-                    "resume_requested",
-                    restored_state,
-                    extra={
-                        "source_request_id": request_id,
-                        "source_snapshot_path": payload.get("snapshot_path", ""),
-                    },
-                )
-
-                executor = ThreadPoolExecutor(max_workers=1)
-                execution_context = copy_context()
-                future = executor.submit(lambda: execution_context.run(self.graph.invoke, restored_state))
-                try:
-                    result = self._wait_for_graph_result(future, new_request_id, config.request_timeout_seconds)
-                except RequestCancelledError:
-                    future.cancel()
-                    cancel_message = (
-                        f"Resumed request cancelled: {new_request_id}. "
-                        "Execution stopped cooperatively; inspect snapshots and logs for partial state."
-                    )
-                    llm_manager.console_event("agent_cancelled", request_id=new_request_id, level=40)
-                    llm_manager.log_event(cancel_message, level=40, request_id=new_request_id)
-                    self._persist_state_snapshot(
-                        new_request_id,
-                        "request_cancelled",
-                        restored_state,
-                        extra={
-                            "source_request_id": request_id,
-                            "source_snapshot_path": payload.get("snapshot_path", ""),
-                        },
-                    )
-                    return cancel_message
-                except TimeoutError as exc:
-                    future.cancel()
-                    timeout_message = str(exc)
-                    llm_manager.console_event("agent_timeout", request_id=new_request_id, level=40)
-                    llm_manager.log_event(timeout_message, level=40, request_id=new_request_id)
-                    self._persist_state_snapshot(
-                        new_request_id,
-                        "request_timed_out",
-                        restored_state,
-                        extra={
-                            "source_request_id": request_id,
-                            "source_snapshot_path": payload.get("snapshot_path", ""),
-                            "timeout_seconds": config.request_timeout_seconds,
-                        },
-                    )
-                    return timeout_message
-                finally:
-                    executor.shutdown(wait=False, cancel_futures=True)
-
-                final_output = result["messages"][-1].content
-                self._persist_state_snapshot(
-                    new_request_id,
-                    "request_completed",
-                    result,
-                    extra={
-                        "source_request_id": request_id,
-                        "source_snapshot_path": payload.get("snapshot_path", ""),
-                        "final_output": final_output,
-                    },
-                )
-                llm_manager.console_event("agent_finished", request_id=new_request_id)
-                llm_manager.log_event(
-                    f"Agent resume response | source_request_id={request_id}\n{final_output}",
-                    request_id=new_request_id,
-                )
-                return final_output
-        except Exception as exc:
-            llm_manager.console_event("agent_error", request_id=new_request_id, level=40)
-            llm_manager.log_event(
-                f"Agent resume error | source_request_id={request_id} | error={exc}",
-                level=40,
-                request_id=new_request_id,
-            )
-            self._persist_state_snapshot(
-                new_request_id,
-                "request_failed",
-                restored_state,
-                extra={
-                    "source_request_id": request_id,
-                    "source_snapshot_path": payload.get("snapshot_path", ""),
-                    "error": str(exc),
-                },
-            )
-            return f"Error resuming snapshot: {exc}"
-        finally:
-            self._clear_request(new_request_id)
+        return self.runtime.resume_from_snapshot(request_id, snapshot_name=snapshot_name)
 
     def replay(self, memory_id: int, injected_features: list[str] = None):
         """

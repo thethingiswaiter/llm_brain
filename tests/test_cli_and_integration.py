@@ -66,6 +66,15 @@ class FakeCLIAgent:
                 "retry_count": 0,
                 "reflection_failure_count": 0,
             },
+            "triage": {
+                "needs_attention": False,
+                "is_resumed": False,
+                "latest_failure_stage": "",
+                "latest_failure_details": "",
+                "last_error_message": "",
+                "last_error_event_type": "",
+                "tool_attention_count": 0,
+            },
             "checkpoints": [
                 {"logged_at": "2026-03-31T00:00:00", "stage": "planning_completed", "details": "subtask_count=1"},
                 {"logged_at": "2026-03-31T00:00:01", "stage": "request_completed", "details": ""},
@@ -77,9 +86,20 @@ class FakeCLIAgent:
         }
         self._recent = [
             {
+                "request_id": "req_recent_3",
+                "status": "failed",
+                "session_id": "session_c",
+                "source_request_id": "req_original_resume",
+                "latest_stage": "request_failed",
+                "updated_at": "2026-03-31T00:00:03+00:00",
+                "metrics": {"total_duration_ms": 330.0, "llm_call_count": 3, "tool_call_count": 1},
+            },
+            {
                 "request_id": "req_recent_2",
                 "status": "blocked",
                 "session_id": "session_b",
+                "source_request_id": "",
+                "latest_stage": "agent_blocked",
                 "updated_at": "2026-03-31T00:00:02+00:00",
                 "metrics": {"total_duration_ms": 220.0, "llm_call_count": 2, "tool_call_count": 1},
             },
@@ -87,6 +107,8 @@ class FakeCLIAgent:
                 "request_id": "req_recent_1",
                 "status": "completed",
                 "session_id": "session_a",
+                "source_request_id": "",
+                "latest_stage": "request_completed",
                 "updated_at": "2026-03-31T00:00:01+00:00",
                 "metrics": {"total_duration_ms": 120.0, "llm_call_count": 1, "tool_call_count": 0},
             },
@@ -104,8 +126,14 @@ class FakeCLIAgent:
         self._last_request_id = "req_message"
         return f"echo:{query}:{session_id}"
 
-    def get_recent_request_summaries(self, limit=10):
-        return self._recent[:limit]
+    def get_recent_request_summaries(self, limit=10, statuses=None, resumed_only=False):
+        items = list(self._recent)
+        if statuses:
+            allowed = {item.lower() for item in statuses}
+            items = [item for item in items if item.get("status", "").lower() in allowed]
+        if resumed_only:
+            items = [item for item in items if item.get("source_request_id")]
+        return items[:limit]
 
     def get_last_request_id(self):
         return self._last_request_id
@@ -130,6 +158,22 @@ class FakeCLIAgent:
 
 
 class CLITestCases(unittest.TestCase):
+    def test_help_command_lists_registered_commands(self):
+        import cli
+
+        output = FakeCLIOutput()
+        cli.start_cli(
+            input_func=FakeCLIInput(["help", "quit"]),
+            output_func=output,
+            agent_instance=FakeCLIAgent(),
+            llm_manager_instance=FakeCLIManager(),
+        )
+
+        rendered = output.joined()
+        self.assertIn("Available commands:", rendered)
+        self.assertIn("/request_summary <request_id>", rendered)
+        self.assertIn("/new_session - Start a new memory session", rendered)
+
     def test_request_summary_command_renders_aggregated_output(self):
         import cli
 
@@ -145,6 +189,7 @@ class CLITestCases(unittest.TestCase):
         self.assertIn("Request ID: req_cli", rendered)
         self.assertIn("Status: completed", rendered)
         self.assertIn("Metrics: total_ms=123.0 | llm_calls=1 | tool_calls=0 | retries=0 | reflection_failures=0", rendered)
+        self.assertIn("Triage: needs_attention=False | resumed=False | failure_stage=- | tool_attention=0", rendered)
         self.assertIn("Recent checkpoints:", rendered)
         self.assertIn("Related memories:", rendered)
 
@@ -176,8 +221,43 @@ class CLITestCases(unittest.TestCase):
 
         rendered = output.joined()
         self.assertIn("Recent requests:", rendered)
+        self.assertIn("req_recent_3 | status=failed", rendered)
+        self.assertIn("resumed_from=req_original_resume", rendered)
         self.assertIn("req_recent_2 | status=blocked", rendered)
-        self.assertIn("req_recent_1 | status=completed", rendered)
+
+    def test_failed_requests_command_filters_failed_statuses(self):
+        import cli
+
+        output = FakeCLIOutput()
+        cli.start_cli(
+            input_func=FakeCLIInput(["/failed_requests 5", "quit"]),
+            output_func=output,
+            agent_instance=FakeCLIAgent(),
+            llm_manager_instance=FakeCLIManager(),
+        )
+
+        rendered = output.joined()
+        self.assertIn("Recent failed or blocked requests:", rendered)
+        self.assertIn("req_recent_3 | status=failed", rendered)
+        self.assertIn("req_recent_2 | status=blocked", rendered)
+        self.assertNotIn("req_recent_1 | status=completed", rendered)
+
+    def test_resumed_requests_command_filters_resumed_runs(self):
+        import cli
+
+        output = FakeCLIOutput()
+        cli.start_cli(
+            input_func=FakeCLIInput(["/resumed_requests 5", "quit"]),
+            output_func=output,
+            agent_instance=FakeCLIAgent(),
+            llm_manager_instance=FakeCLIManager(),
+        )
+
+        rendered = output.joined()
+        self.assertIn("Recent resumed requests:", rendered)
+        self.assertIn("req_recent_3 | status=failed", rendered)
+        self.assertIn("resumed_from=req_original_resume", rendered)
+        self.assertNotIn("req_recent_2 | status=blocked", rendered)
 
     def test_load_mcp_command_passes_full_reference(self):
         import cli
@@ -242,6 +322,23 @@ class CLITestCases(unittest.TestCase):
         rendered = output.joined()
         self.assertIn("refreshed_mcp:system_mcp_server", rendered)
         self.assertEqual(fake_agent.refreshed_mcp_refs, ["system_mcp_server"])
+
+    def test_new_session_command_updates_session_for_following_message(self):
+        import cli
+
+        output = FakeCLIOutput()
+        fake_agent = FakeCLIAgent()
+        fake_agent.start_session = lambda session_id=None: session_id or "session_new_cli"
+        cli.start_cli(
+            input_func=FakeCLIInput(["/new_session", "hello agent", "quit"]),
+            output_func=output,
+            agent_instance=fake_agent,
+            llm_manager_instance=FakeCLIManager(),
+        )
+
+        rendered = output.joined()
+        self.assertIn("Started new session: session_new_cli", rendered)
+        self.assertIn("Response: echo:hello agent:session_new_cli", rendered)
 
 
 class AgentIntegrationFlowTests(unittest.TestCase):

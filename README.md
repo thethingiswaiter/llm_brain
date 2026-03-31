@@ -5,18 +5,17 @@
 ## 文档入口
 
 - 项目总览：./docs/project_overview.md
-- 结构评审：./docs/codebase_structure_review.md
 - 完备化路线图：./docs/completeness_roadmap.md
-- 架构问题清单：./docs/architecture_issues.md
-- 需求目标文档：./docs/requirements.md
 - 能力概念说明：./docs/agent.md
 
 如果你是第一次接手该仓库，建议按以下顺序阅读：
 
 1. 先看 `docs/project_overview.md`，快速建立整体认知。
-2. 再看 `agent_core.py`、`cli.py`、`llm_manager.py`，理解真实调用链。
+2. 再看 `agent_core.py`、`agent_runtime.py`、`agent_snapshots.py`、`agent_observability.py`、`agent_tools.py`、`cli.py`、`cli_commands.py`、`llm_manager.py`、`llm_logging.py`、`llm_runtime.py`、`llm_factory.py`，理解真实调用链。
 3. 然后按子系统查看 `cognitive/`、`memory/`、`skills_md/`。
-4. 最后对照 `docs/requirements.md` 与 `docs/agent.md`，理解目标态设计。
+4. 最后再看 `docs/completeness_roadmap.md` 和 `docs/agent.md`，分别理解后续方向和能力概念。
+
+说明：运行时自动加载的 Python 技能只从 `skills/` 目录读取；`examples/skills/` 和 `tests/fixtures/skills/` 中的示例/测试技能不会参与自动加载。
 
 ## 当前项目重点
 
@@ -30,7 +29,7 @@
 
 ## 当前状态
 
-项目已具备最小可运行骨架，但仍是原型阶段。已经打通 CLI 到 Agent 的执行主链，并具备基础的任务拆解、反思、记忆落盘、技能挂载以及最小 MCP 配置式接入能力。当前已经完成路径配置化、Markdown 技能自动扫描加载、记忆闭环、工具筛选、重试保护，以及基于统一 SkillManager 的 Markdown 技能与 Python/MCP 工具联合路由。
+项目仍处于原型阶段，但已经不只是最小骨架。当前已经打通 CLI 到 Agent 的完整主链，并具备任务拆解、反思推进、记忆落盘与召回、统一技能路由、请求级日志追踪、运行时快照恢复，以及配置式 MCP 工具和真实 MCP stdio server 接入能力。当前测试套件维持在 70 个 unittest 用例通过。
 
 ## 运行说明
 
@@ -38,16 +37,21 @@
 2. 安装项目依赖。
 3. 运行 `python cli.py` 启动命令行交互。
 
-CLI 中可使用 `/load_skill <skill_name.py|skill_name.md>` 动态加载本地技能文件。
-CLI 中也可使用 `/load_mcp <config_name.json|config_name.yaml|absolute_path|server.py|stdio:command ...>` 加载 MCP 工具源：既支持原有 JSON/YAML 配置，也支持真实 MCP stdio server。
-CLI 中也可使用 `/list_mcp` 查看已加载的 MCP server。
-CLI 中也可使用 `/refresh_mcp <server_name|source>` 刷新某个 MCP server 并重新枚举工具。
-CLI 中也可使用 `/unload_mcp <server_name|source>` 卸载某个 MCP server，并移除其工具。
-CLI 中也可使用 `/cancel_request <request_id>` 对活跃请求发起协作式取消。
-CLI 中也可使用 `/list_snapshots <request_id>` 查看某次请求的可用恢复点。
-CLI 中也可使用 `/resume_snapshot <request_id> [latest|index|stage|snapshot_file]` 从运行时快照恢复继续执行。
-CLI 中也可使用 `/request_summary <request_id>` 聚合查看该次请求的状态、快照、关键 checkpoint 和关联 memory。
-CLI 中也可使用 `/recent_requests [limit]` 查看最近若干次请求的状态和关键指标摘要。
+### CLI 命令
+- `/load_skill <skill_name.py|skill_name.md>` 动态加载本地技能文件。
+- `/load_mcp <config_name.json|config_name.yaml|absolute_path|server.py|stdio:command ...>` 加载 MCP 工具源：既支持原有 JSON/YAML 配置，也支持真实 MCP stdio server。
+- `/list_mcp` 查看已加载的 MCP server。
+- `/refresh_mcp <server_name|source>` 刷新某个 MCP server 并重新枚举工具。
+- `/unload_mcp <server_name|source>` 卸载某个 MCP server，并移除其工具。
+- `/cancel_request <request_id>` 对活跃请求发起协作式取消。
+- `/list_snapshots <request_id>` 查看某次请求的可用恢复点。
+- `/resume_snapshot <request_id> [latest|index|stage|snapshot_file]` 从运行时快照恢复继续执行。
+- `/request_summary <request_id>` 聚合查看该次请求的状态、快照、关键 checkpoint 和关联 memory。
+- `/recent_requests [limit]` 查看最近若干次请求的状态和关键指标摘要。
+
+### AGENT
+
+当前 `agent_core.py` 已将请求生命周期、快照、请求观测与工具运行时包装分别委托给 `agent_runtime.py`、`agent_snapshots.py`、`agent_observability.py` 和 `agent_tools.py`；`cli.py` 的命令定义已外提到 `cli_commands.py`；`llm_manager.py` 也已将日志、运行时和 provider 构造分别委托给 helper 模块，主入口文件的职责边界比之前清晰。
 
 ## Python MCP Server
 
@@ -86,4 +90,5 @@ CLI 中也可使用 `/recent_requests [limit]` 查看最近若干次请求的状
 ## 补充说明
 
 - `docs/project_overview.md` 以“当前源码事实”为主。
-- `docs/requirements.md` 和 `docs/agent.md` 主要描述目标态，不应直接视为现状功能清单。
+- `docs/completeness_roadmap.md` 只保留仍未完成的后续工程事项。
+- `docs/agent.md` 主要提供能力概念说明，不应直接视为现状功能清单。
