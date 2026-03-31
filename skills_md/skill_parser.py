@@ -3,6 +3,7 @@ import os
 import re
 from typing import Dict, List, Any, Optional
 from config import config
+from llm_manager import llm_manager
 
 class SkillManager:
     STOPWORDS = {
@@ -45,6 +46,13 @@ class SkillManager:
         if overlap < min_overlap:
             return False
         return self._match_ratio(overlap, task_terms) >= min_ratio
+
+    def _build_route_reason(self, candidate_name: str, matched_terms: list[str], overlap: int, match_ratio: float) -> str:
+        matched_text = ", ".join(matched_terms) if matched_terms else "none"
+        return (
+            f"matched {overlap} term(s) [{matched_text}] "
+            f"with ratio={match_ratio:.2f} for candidate={candidate_name}"
+        )
 
     def refresh_skills(self) -> int:
         self.loaded_skills = []
@@ -99,7 +107,10 @@ class SkillManager:
                     self.loaded_skill_files.add(filename)
                     return skill
                 except yaml.YAMLError as exc:
-                    print(f"Error parsing YAML front-matter in {filename}: {exc}")
+                    llm_manager.log_event(
+                        f"Markdown skill parse failed | file={filename} | error={exc}",
+                        level=40,
+                    )
         return None
 
     def register_tool(self, tool, source_type: str = "python", source_file: str = "") -> Optional[Dict[str, Any]]:
@@ -134,10 +145,12 @@ class SkillManager:
     def find_best_skill(self, keywords: List[str]) -> Optional[Dict[str, Any]]:
         """Match markdown prompt skill by keywords."""
         best_skill = None
-        max_overlap = 0
+        best_score = (-1, -1.0, -1)
         normalized_keywords = set(self._normalize_keywords(keywords))
         for skill in self.loaded_skills:
-            overlap = len(normalized_keywords & set(skill.get("keywords", [])))
+            skill_terms = set(skill.get("keywords", []))
+            matched_terms = sorted(normalized_keywords & skill_terms)
+            overlap = len(matched_terms)
             if not self._passes_threshold(
                 overlap,
                 normalized_keywords,
@@ -145,9 +158,17 @@ class SkillManager:
                 config.prompt_skill_min_match_ratio,
             ):
                 continue
-            if overlap > max_overlap:
-                max_overlap = overlap
-                best_skill = skill
+            match_ratio = self._match_ratio(overlap, normalized_keywords)
+            score = (overlap, match_ratio, len(skill_terms))
+            if score > best_score:
+                best_score = score
+                best_skill = {
+                    **skill,
+                    "matched_terms": matched_terms,
+                    "overlap_count": overlap,
+                    "match_ratio": match_ratio,
+                    "route_reason": self._build_route_reason(skill.get("name", "unknown_skill"), matched_terms, overlap, match_ratio),
+                }
         return best_skill
 
     def find_relevant_tools(self, task_description: str, extracted_keywords: List[str], limit: int = 3) -> List[Dict[str, Any]]:
@@ -158,7 +179,8 @@ class SkillManager:
         ranked_tools = []
         for tool_skill in self.loaded_tool_skills.values():
             tool_terms = set(tool_skill.get("keywords", []))
-            overlap = len(task_terms & tool_terms)
+            matched_terms = sorted(task_terms & tool_terms)
+            overlap = len(matched_terms)
             if not self._passes_threshold(
                 overlap,
                 task_terms,
@@ -167,7 +189,20 @@ class SkillManager:
             ):
                 continue
             match_ratio = self._match_ratio(overlap, task_terms)
-            ranked_tools.append((overlap, match_ratio, len(tool_terms), tool_skill))
+            ranked_tools.append(
+                (
+                    overlap,
+                    match_ratio,
+                    len(tool_terms),
+                    {
+                        **tool_skill,
+                        "matched_terms": matched_terms,
+                        "overlap_count": overlap,
+                        "match_ratio": match_ratio,
+                        "route_reason": self._build_route_reason(tool_skill.get("name", "unknown_tool"), matched_terms, overlap, match_ratio),
+                    },
+                )
+            )
 
         ranked_tools.sort(key=lambda item: (item[0], item[1], item[2], item[3]["name"]), reverse=True)
         return [item[3] for item in ranked_tools[:limit]]
@@ -177,8 +212,10 @@ class SkillManager:
         tool_skills = self.find_relevant_tools(task_description, extracted_keywords)
         return {
             "prompt_skill": prompt_skill,
+            "prompt_skill_reason": prompt_skill.get("route_reason", "") if prompt_skill else "",
             "tool_skills": tool_skills,
             "tools": [item["tool"] for item in tool_skills],
+            "tool_reasons": [item.get("route_reason", "") for item in tool_skills],
         }
 
     def assign_skill_to_task(self, task_description: str, extracted_keywords: List[str]):

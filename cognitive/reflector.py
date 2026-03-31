@@ -1,6 +1,6 @@
 from typing import Dict, Any, Tuple
-import json
 from llm_manager import llm_manager
+from cognitive.structured_output import parse_json_object, StructuredOutputError, StructuredOutputSchemaError
 
 class Reflector:
     def verify_and_reflect(self, subtask: str, expected_outcome: str, actual_result: str) -> Tuple[bool, str, str]:
@@ -34,16 +34,20 @@ class Reflector:
         """
         try:
             response = llm_manager.invoke(prompt, source="reflector.verify_and_reflect")
-            content = response.content.strip()
-            if content.startswith("```json"):
-                content = content.strip("`").replace("json\n", "", 1)
-            
-            data = json.loads(content)
+            data = parse_json_object(
+                response.content,
+                required_fields={"success": bool, "reflection": str, "action": str},
+            )
+            if data["action"] not in {"continue", "retry", "ask_user"}:
+                raise StructuredOutputSchemaError("Field action must be one of continue/retry/ask_user.")
             return (
                 data.get("success", False),
                 data.get("reflection", "No specific reflection generated."),
                 data.get("action", "ask_user")
             )
+        except StructuredOutputError as e:
+            llm_manager.log_event(f"Reflection structured parsing failed: {e}", level=40)
+            return False, f"Failed to parse reflection: {e}", "ask_user"
         except Exception as e:
             llm_manager.log_event(f"Reflection failed: {e}", level=40)
             return False, f"Failed to parse reflection: {e}", "ask_user"

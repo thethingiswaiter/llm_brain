@@ -57,6 +57,8 @@ class SkillRoutingTests(unittest.TestCase):
         matched = self.manager.find_relevant_tools("tell me the weather in beijing", ["weather", "beijing"])
 
         self.assertEqual([item["name"] for item in matched], ["get_mock_weather"])
+        self.assertIn("matched", matched[0]["route_reason"])
+        self.assertEqual(matched[0]["matched_terms"], ["weather"])
 
     def test_tool_match_rejects_weak_overlap(self):
         generic_tool = FakeTool("status_lookup", "Lookup system status and service metadata")
@@ -80,7 +82,29 @@ class SkillRoutingTests(unittest.TestCase):
 
         self.assertIsNotNone(matched)
         self.assertEqual(matched["name"], "travel_helper")
+        self.assertIn("itinerary", matched["route_reason"])
         self.assertIsNone(not_matched)
+
+    def test_assign_capabilities_includes_route_reasons(self):
+        self._write_skill(
+            "weather.md",
+            "weather_helper",
+            ["weather", "forecast", "city"],
+            "Weather planning helper",
+            "weather body",
+        )
+        weather_tool = FakeTool("get_mock_weather", "Get weather forecast for a city")
+        self.manager.register_tool(weather_tool)
+
+        capabilities = self.manager.assign_capabilities_to_task(
+            "tell me the weather forecast for beijing",
+            ["weather", "forecast", "beijing"],
+        )
+
+        self.assertEqual(capabilities["prompt_skill"]["name"], "weather_helper")
+        self.assertTrue(capabilities["prompt_skill_reason"])
+        self.assertEqual(capabilities["tool_skills"][0]["name"], "get_mock_weather")
+        self.assertTrue(capabilities["tool_reasons"][0])
 
 
 if __name__ == "__main__":

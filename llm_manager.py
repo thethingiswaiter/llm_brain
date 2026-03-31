@@ -1,6 +1,8 @@
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from contextlib import contextmanager
 from contextvars import ContextVar
 import logging
+import time
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +12,11 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from config import config
 
 _request_id_var: ContextVar[str | None] = ContextVar("llm_request_id", default=None)
+_request_cancel_checker_var: ContextVar[Any] = ContextVar("llm_request_cancel_checker", default=None)
+
+
+class RequestCancelledError(RuntimeError):
+    pass
 
 class LLMManager:
     def __init__(self):
@@ -86,15 +93,41 @@ class LLMManager:
             return str(content)
         return str(response)
 
+    def _run_with_timeout(self, func, timeout_seconds: int, timeout_message: str):
+        executor = ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(func)
+        start = time.monotonic()
+        cancel_checker = _request_cancel_checker_var.get()
+        try:
+            while True:
+                if cancel_checker and cancel_checker():
+                    future.cancel()
+                    raise RequestCancelledError("Request cancelled during model invocation.")
+
+                elapsed = time.monotonic() - start
+                remaining = timeout_seconds - elapsed
+                if remaining <= 0:
+                    future.cancel()
+                    raise TimeoutError(timeout_message)
+
+                try:
+                    return future.result(timeout=min(0.1, remaining))
+                except FuturesTimeoutError:
+                    continue
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
     def get_request_id(self) -> str | None:
         return _request_id_var.get()
 
     @contextmanager
-    def request_scope(self, request_id: str):
+    def request_scope(self, request_id: str, cancel_checker = None):
         token = _request_id_var.set(request_id)
+        cancel_token = _request_cancel_checker_var.set(cancel_checker)
         try:
             yield request_id
         finally:
+            _request_cancel_checker_var.reset(cancel_token)
             _request_id_var.reset(token)
 
     def _with_request_id(self, message: str, request_id: str | None = None) -> str:
@@ -154,7 +187,11 @@ class LLMManager:
             f"{self._truncate_text(self._stringify_payload(payload))}"
         )
         try:
-            response = target_llm.invoke(payload)
+            response = self._run_with_timeout(
+                lambda: target_llm.invoke(payload),
+                config.llm_timeout_seconds,
+                f"LLM invocation timed out after {config.llm_timeout_seconds} seconds.",
+            )
         except Exception as exc:
             self.log_event(
                 f"LLM error | source={source} | provider={config.llm_config.provider} | model={config.llm_config.model} | error={exc}",

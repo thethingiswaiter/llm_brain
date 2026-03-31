@@ -1,6 +1,7 @@
 import json
 from typing import List, Dict, Any
 from llm_manager import llm_manager
+from cognitive.structured_output import parse_json_array, StructuredOutputError, StructuredOutputSchemaError
 
 class TaskPlanner:
     def split_task(self, user_query: str) -> List[Dict[str, Any]]:
@@ -28,15 +29,26 @@ class TaskPlanner:
         """
         try:
             response = llm_manager.invoke(prompt, source="planner.split_task")
-            # Find JSON content
-            content = response.content.strip()
-            if content.startswith("```json"):
-                content = content.strip("`").replace("json\n", "", 1)
-            
-            subtasks = json.loads(content)
-            if isinstance(subtasks, list):
-                return subtasks
-            return []
+            subtasks = parse_json_array(response.content)
+            normalized_subtasks = []
+            for index, item in enumerate(subtasks, start=1):
+                if not isinstance(item, dict):
+                    raise StructuredOutputSchemaError(f"Subtask {index} is not an object.")
+
+                description = str(item.get("description", "")).strip()
+                if not description:
+                    raise StructuredOutputSchemaError(f"Subtask {index} missing description.")
+
+                expected_outcome = str(item.get("expected_outcome", "User request fulfilled.")).strip()
+                normalized_subtasks.append({
+                    "id": item.get("id", index),
+                    "description": description,
+                    "expected_outcome": expected_outcome or "User request fulfilled.",
+                })
+            return normalized_subtasks
+        except StructuredOutputError as e:
+            llm_manager.log_event(f"Task splitting structured parsing failed: {e}", level=40)
+            return [{"id": 1, "description": user_query, "expected_outcome": "User request fulfilled."}]
         except Exception as e:
             llm_manager.log_event(f"Task splitting failed: {e}", level=40)
             # Fallback to single task

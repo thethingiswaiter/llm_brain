@@ -5,6 +5,7 @@
 ## 文档入口
 
 - 项目总览：./docs/project_overview.md
+- 完备化路线图：./docs/completeness_roadmap.md
 - 架构问题清单：./docs/architecture_issues.md
 - 需求目标文档：./docs/requirements.md
 - 能力概念说明：./docs/agent.md
@@ -38,6 +39,9 @@
 
 CLI 中可使用 `/load_skill <skill_name.py|skill_name.md>` 动态加载本地技能文件。
 CLI 中也可使用 `/load_mcp <config_name.json|config_name.yaml|absolute_path>` 加载 MCP 配置文件，例如仓库内置的 `demo_mcp.json`。
+CLI 中也可使用 `/cancel_request <request_id>` 对活跃请求发起协作式取消。
+CLI 中也可使用 `/list_snapshots <request_id>` 查看某次请求的可用恢复点。
+CLI 中也可使用 `/resume_snapshot <request_id> [latest|index|stage|snapshot_file]` 从运行时快照恢复继续执行。
 
 ## 补充说明
 

@@ -20,6 +20,9 @@ def start_cli():
                 print("  /llm <provider> <model> [base_url] [api_key] - Switch LLM provider (ollama/openai)")
                 print("  /load_skill <skill_name> - Load a local python skill")
                 print("  /load_mcp <server_url> - Load an MCP server")
+                print("  /cancel_request <request_id> - Request cooperative cancellation for an active run")
+                print("  /list_snapshots <request_id> - List available recovery points for a request")
+                print("  /resume_snapshot <request_id> [snapshot_file] - Resume execution from a saved snapshot")
                 print("  /new_session - Start a new memory session")
                 print("  <any other text> - Send message to Agent")
             elif cmd == "/llm":
@@ -61,6 +64,38 @@ def start_cli():
                     print(message)
                 else:
                     print("Usage: /load_mcp <config_name.json|config_name.yaml|absolute_path>")
+            elif cmd == "/resume_snapshot":
+                parts = user_input.split()
+                if len(parts) >= 2:
+                    snapshot_name = parts[2] if len(parts) > 2 else None
+                    response = agent.resume_from_snapshot(parts[1], snapshot_name=snapshot_name)
+                    request_id = agent.get_last_request_id()
+                    if request_id:
+                        print(f"Request ID: {request_id}")
+                    print(f"\nResponse: {response}")
+                else:
+                    print("Usage: /resume_snapshot <request_id> [snapshot_file]")
+            elif cmd == "/list_snapshots":
+                parts = user_input.split()
+                if len(parts) >= 2:
+                    snapshots = agent.list_snapshots(parts[1])
+                    if not snapshots:
+                        print("No snapshots found.")
+                    else:
+                        print("Available snapshots:")
+                        for item in snapshots:
+                            print(
+                                f"  [{item['index']}] {item['file']} | stage={item['stage']} | "
+                                f"subtask_index={item['subtask_index']} | blocked={item['blocked']} | completed={item['completed']}"
+                            )
+                else:
+                    print("Usage: /list_snapshots <request_id>")
+            elif cmd == "/cancel_request":
+                parts = user_input.split()
+                if len(parts) >= 2:
+                    print(agent.cancel_request(parts[1]))
+                else:
+                    print("Usage: /cancel_request <request_id>")
             elif cmd == "/new_session":
                 session_id = agent.start_session()
                 print(f"Started new session: {session_id}")
@@ -72,6 +107,10 @@ def start_cli():
                 print(f"\nResponse: {response}")
                 
         except KeyboardInterrupt:
+            active_request_id = agent.get_last_request_id()
+            if active_request_id and agent.is_request_active(active_request_id):
+                print(f"\n{agent.cancel_request(active_request_id)}")
+                continue
             print("\nExiting...")
             break
         except Exception as e:

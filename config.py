@@ -24,6 +24,10 @@ class AppConfig:
         self.log_dir = "logs"
         self.llm_log_file = "llm_trace.log"
         self.llm_log_max_chars = 4000
+        self.state_snapshot_dir = os.path.join("runtime_state", "snapshots")
+        self.llm_timeout_seconds = 45
+        self.tool_timeout_seconds = 20
+        self.request_timeout_seconds = 120
         self.prompt_skill_min_overlap = 1
         self.prompt_skill_min_match_ratio = 0.34
         self.tool_skill_min_overlap = 1
@@ -51,6 +55,10 @@ class AppConfig:
             self.log_dir = data.get("log_dir", "logs")
             self.llm_log_file = data.get("llm_log_file", "llm_trace.log")
             self.llm_log_max_chars = data.get("llm_log_max_chars", 4000)
+            self.state_snapshot_dir = data.get("state_snapshot_dir", os.path.join("runtime_state", "snapshots"))
+            self.llm_timeout_seconds = data.get("llm_timeout_seconds", 45)
+            self.tool_timeout_seconds = data.get("tool_timeout_seconds", 20)
+            self.request_timeout_seconds = data.get("request_timeout_seconds", 120)
             self.prompt_skill_min_overlap = data.get("prompt_skill_min_overlap", 1)
             self.prompt_skill_min_match_ratio = data.get("prompt_skill_min_match_ratio", 0.34)
             self.tool_skill_min_overlap = data.get("tool_skill_min_overlap", 1)
