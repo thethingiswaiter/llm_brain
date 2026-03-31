@@ -64,8 +64,22 @@
 5. 运行时资源生命周期治理
 
 - 明确请求线程池、工具执行线程池和 MCP 长连接的生命周期边界。
-- 补齐悬挂线程、子进程和失活连接的回收策略。
-- 为超时、取消和底层资源释放建立更一致的治理模型。
+- 继续补齐悬挂线程、子进程和失活连接的回收策略。
+- 继续为超时、取消和底层资源释放建立更一致的治理模型。
+
+当前已启动的基线：
+
+- 工具执行已增加运行生命周期跟踪。
+- 超时或取消后会先做宽限清理；无法及时停止的工具会标记为 detached。
+- detached tool 已进入 request_summary、recent_requests、request summary 明细和专门的运行态查询命令，便于排障。
+- 后台完成后的 detached tool 运行记录会被回收。
+- 快照恢复前校验已补到语义层，开始拒绝 retry/replan/failed_tools 越界和非终态提前写入 final_response 的快照。
+- 跨子任务失败累计已开始进入 reroute：同一请求内重复失败到阈值的工具会在后续子任务中被自动降级或排除，备选工具也会按历史失败次数做优先级排序。
+- 快照恢复已新增显式 reroute 模式：可从 blocked 或中途中断的恢复点重新规划，而不必强依赖旧 plan 继续执行。
+- 历史失败已从简单计数扩展到结构化严重度：不同 error_type 会累计为 severity 分数，开始直接影响当前工具优先级与 reroute 备选排序。
+- 高严重度历史现在也进入策略层：超过 severity 阈值的工具会被直接排除，系统会在没有安全候选时主动降级到无工具路径。
+- no-tool 降级已开始区分“应 ask-user 补参”和“可 direct-answer 安全收敛”的两类提示，减少在无工具场景下的模糊决策。
+- no-tool 与 reroute fallback 信号已开始进入 request 级摘要，便于直接在 recent/request summary 里识别策略降级，而不必再翻原始日志。
 
 ### 4.3 完成标准
 
@@ -88,6 +102,11 @@
 - 引入更明确的长期经验记忆层。
 - 为失败案例建立可单独处理的记忆层或视图。
 - 区分“当前会话上下文”和“长期可复用经验”的召回路径。
+
+当前已启动的基线：
+
+- 失败步骤已开始单独写入 failure_case 记忆视图。
+- CLI 已支持 failure_memories 查询入口，可把 blocked、ask_user、retry、timeout 等经验从成功经验中分开浏览。
 
 2. 记忆治理能力
 
@@ -130,8 +149,15 @@
 2. 指标体系继续深化
 
 - 增加跨 request 的全局聚合视图。
-- 增加阶段耗时分布，而不只看整次请求的总量指标。
+- 继续增加阶段耗时分布，而不只看整次请求的总量指标。
 - 区分模型、工具、反思、恢复等不同路径的阶段性统计。
+
+当前已启动的基线：
+
+- 已增加最近请求的跨 request 聚合视图，可直接查看状态分布、attention 数和阶段耗时总览。
+- request_rollup 已支持按状态、resumed 请求和 attention 请求做筛选。
+- request_summary 已补 checkpoint 级阶段耗时分布聚合。
+- 当前阶段桶已覆盖 planning、subtask、tool、reflection、request、resume 和 other。
 
 3. 测试继续分层
 
@@ -144,6 +170,23 @@
 - 在 request_id 之上增加更容易浏览的历史视图。
 - 为最近请求、失败请求和恢复请求增加更明确的查询维度。
 - 让问题定位不只依赖读原始日志，而能通过聚合摘要快速收敛。
+
+当前已启动的基线：
+
+- request_summary 已补 detached tool 计数与明细。
+- recent_requests 已补 detached tool 聚合字段。
+- recent_requests 已支持按状态、resumed 请求和 attention 请求做筛选。
+- recent_requests 和 request_rollup 已支持 since=30m 这类时间窗口筛选。
+- recent_requests 已直接展示 attention 原因摘要，减少再跳转 request_summary 的次数。
+- recent_requests 对可解析的 latest_failure_details 已进一步提炼 tool、reason、error_type 和 action 摘要。
+- failed_requests 和 resumed_requests 已收敛为 recent 查询能力的语义别名，减少重复命令分支。
+- request_rollup 已补 top failure signals 摘要，直接暴露常见 failure stage、tool、reason、error_type 和 action。
+- request_rollup 已补 failure combination 热点，直接暴露高频 stage+tool 与 tool+reason 组合。
+- CLI 已支持 request_rollup 全局聚合入口。
+- CLI 已支持直接查看 tracked tool runs。
+- retention 基线已覆盖 logs、snapshots、audit logs 和 memory backups，并提供 retention_status 与 dry-run/apply 清理入口；当前同时支持按时间和按数量上限裁剪，并已补低频自动 prune 节流。
+- retention_status 现已同时展示最近一次自动 prune 的执行摘要，以及最近一次被跳过时的原因，便于区分 disabled 与 throttled。
+- retention 已补 max_bytes 容量上限控制，开始覆盖“按总占用体积裁剪”的场景。
 
 5. 数据保留与清理策略
 

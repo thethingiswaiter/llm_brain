@@ -7,7 +7,7 @@ from typing import Any
 from langchain_core.messages import HumanMessage
 
 from config import config
-from llm_manager import RequestCancelledError, llm_manager
+from llm_manager import LLMDependencyUnavailableError, RequestCancelledError, llm_manager
 
 
 class AgentRuntime:
@@ -72,6 +72,7 @@ class AgentRuntime:
             "reflections": [],
             "global_keywords": [],
             "failed_tools": {},
+            "failed_tool_signals": {},
             "request_id": request_id,
             "session_id": session_id,
             "session_memory_id": 0,
@@ -164,6 +165,32 @@ class AgentRuntime:
                         extra={"timeout_seconds": config.request_timeout_seconds, "query": query},
                     )
                     return timeout_message
+                except LLMDependencyUnavailableError as exc:
+                    dependency_message = (
+                        f"Request failed because the model dependency is unavailable: {exc}. "
+                        "Check the current Python environment, provider service, or installed LLM packages before retrying."
+                    )
+                    llm_manager.console_event("agent_error", request_id=request_id, level=40)
+                    llm_manager.log_structured_event(
+                        "agent_request",
+                        message="Agent request failed due to unavailable model dependency",
+                        request_id=request_id,
+                        session_id=active_session_id,
+                        stage="request_failed",
+                        source="agent.invoke",
+                        duration_ms=(time.monotonic() - request_started_at) * 1000,
+                        outcome="failed",
+                        error_type="dependency_unavailable",
+                        error=str(exc),
+                    )
+                    llm_manager.log_event(dependency_message, level=40, request_id=request_id)
+                    self.agent._persist_state_snapshot(
+                        request_id,
+                        "request_failed",
+                        inputs,
+                        extra={"error": str(exc), "error_type": "dependency_unavailable"},
+                    )
+                    return dependency_message
 
                 final_output = result["messages"][-1].content
                 self.agent._persist_state_snapshot(
@@ -240,7 +267,7 @@ class AgentRuntime:
         finally:
             self.clear_request(request_id)
 
-    def resume_from_snapshot(self, request_id: str, snapshot_name: str = None):
+    def resume_from_snapshot(self, request_id: str, snapshot_name: str = None, reroute: bool = False):
         payload = self.agent._load_snapshot_payload(request_id, snapshot_name=snapshot_name)
         if not payload:
             return (
@@ -261,7 +288,7 @@ class AgentRuntime:
             )
 
         stored_state = payload.get("state", {})
-        if stored_state.get("blocked"):
+        if stored_state.get("blocked") and not reroute:
             return stored_state.get("final_response") or "Snapshot is already in a blocked terminal state."
         if stored_state.get("final_response") and stored_state.get("current_subtask_index", 0) >= len(stored_state.get("plan", [])):
             return stored_state.get("final_response")
@@ -269,7 +296,12 @@ class AgentRuntime:
         new_request_id = self.agent._generate_request_id()
         self.agent.last_request_id = new_request_id
         self.register_request(new_request_id)
-        restored_state = self.agent._restore_state_from_snapshot(payload, request_id=new_request_id)
+        resume_mode = "reroute" if reroute else "continue"
+        restored_state = self.agent.snapshot_store.build_resume_state_from_snapshot(
+            payload,
+            request_id=new_request_id,
+            reroute=reroute,
+        )
         self.agent.session_id = restored_state.get("session_id", self.agent.session_id)
 
         try:
@@ -280,7 +312,7 @@ class AgentRuntime:
             ):
                 llm_manager.console_event("agent_resumed", request_id=new_request_id)
                 llm_manager.log_event(
-                    f"Agent resumed from snapshot | source_request_id={request_id} | snapshot_path={payload.get('snapshot_path', '')}",
+                    f"Agent resumed from snapshot | source_request_id={request_id} | snapshot_path={payload.get('snapshot_path', '')} | mode={resume_mode}",
                     request_id=new_request_id,
                 )
                 self.agent._persist_state_snapshot(
@@ -290,6 +322,7 @@ class AgentRuntime:
                     extra={
                         "source_request_id": request_id,
                         "source_snapshot_path": payload.get("snapshot_path", ""),
+                        "resume_mode": resume_mode,
                     },
                 )
                 try:
@@ -310,6 +343,7 @@ class AgentRuntime:
                         duration_ms=None,
                         outcome="cancelled",
                         source_request_id=request_id,
+                        resume_mode=resume_mode,
                     )
                     llm_manager.log_event(cancel_message, level=40, request_id=new_request_id)
                     self.agent._persist_state_snapshot(
@@ -319,6 +353,7 @@ class AgentRuntime:
                         extra={
                             "source_request_id": request_id,
                             "source_snapshot_path": payload.get("snapshot_path", ""),
+                            "resume_mode": resume_mode,
                         },
                     )
                     return cancel_message
@@ -335,6 +370,7 @@ class AgentRuntime:
                         duration_ms=None,
                         outcome="timed_out",
                         source_request_id=request_id,
+                        resume_mode=resume_mode,
                     )
                     llm_manager.log_event(timeout_message, level=40, request_id=new_request_id)
                     self.agent._persist_state_snapshot(
@@ -345,9 +381,44 @@ class AgentRuntime:
                             "source_request_id": request_id,
                             "source_snapshot_path": payload.get("snapshot_path", ""),
                             "timeout_seconds": config.request_timeout_seconds,
+                            "resume_mode": resume_mode,
                         },
                     )
                     return timeout_message
+                except LLMDependencyUnavailableError as exc:
+                    dependency_message = (
+                        f"Resumed request failed because the model dependency is unavailable: {exc}. "
+                        "Check the current Python environment, provider service, or installed LLM packages before retrying."
+                    )
+                    llm_manager.console_event("agent_error", request_id=new_request_id, level=40)
+                    llm_manager.log_structured_event(
+                        "agent_request",
+                        message="Resumed request failed due to unavailable model dependency",
+                        request_id=new_request_id,
+                        session_id=restored_state.get("session_id", self.agent.session_id),
+                        stage="request_failed",
+                        source="agent.resume",
+                        duration_ms=None,
+                        outcome="failed",
+                        source_request_id=request_id,
+                        resume_mode=resume_mode,
+                        error_type="dependency_unavailable",
+                        error=str(exc),
+                    )
+                    llm_manager.log_event(dependency_message, level=40, request_id=new_request_id)
+                    self.agent._persist_state_snapshot(
+                        new_request_id,
+                        "request_failed",
+                        restored_state,
+                        extra={
+                            "source_request_id": request_id,
+                            "source_snapshot_path": payload.get("snapshot_path", ""),
+                            "resume_mode": resume_mode,
+                            "error": str(exc),
+                            "error_type": "dependency_unavailable",
+                        },
+                    )
+                    return dependency_message
 
                 final_output = result["messages"][-1].content
                 self.agent._persist_state_snapshot(
@@ -358,6 +429,7 @@ class AgentRuntime:
                         "source_request_id": request_id,
                         "source_snapshot_path": payload.get("snapshot_path", ""),
                         "final_output": final_output,
+                        "resume_mode": resume_mode,
                     },
                 )
                 llm_manager.console_event("agent_finished", request_id=new_request_id)
@@ -371,6 +443,7 @@ class AgentRuntime:
                     duration_ms=None,
                     outcome="completed",
                     source_request_id=request_id,
+                    resume_mode=resume_mode,
                 )
                 llm_manager.log_event(
                     f"Agent resume response | source_request_id={request_id}\n{final_output}",
@@ -390,6 +463,7 @@ class AgentRuntime:
                 outcome="failed",
                 error=str(exc),
                 source_request_id=request_id,
+                resume_mode=resume_mode,
             )
             llm_manager.log_event(
                 f"Agent resume error | source_request_id={request_id} | error={exc}",
@@ -404,6 +478,7 @@ class AgentRuntime:
                     "source_request_id": request_id,
                     "source_snapshot_path": payload.get("snapshot_path", ""),
                     "error": str(exc),
+                    "resume_mode": resume_mode,
                 },
             )
             return f"Error resuming snapshot: {exc}"

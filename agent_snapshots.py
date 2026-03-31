@@ -59,6 +59,7 @@ class AgentSnapshotStore:
             "global_keywords": state.get("global_keywords", []),
             "reflections": state.get("reflections", []),
             "failed_tools": state.get("failed_tools", {}),
+            "failed_tool_signals": state.get("failed_tool_signals", {}),
             "domain_label": state.get("domain_label", ""),
             "memory_summaries": state.get("memory_summaries", []),
             "retry_counts": state.get("retry_counts", {}),
@@ -152,6 +153,7 @@ class AgentSnapshotStore:
 
         default_dicts = {
             "failed_tools": {},
+            "failed_tool_signals": {},
             "retry_counts": {},
             "replan_counts": {},
         }
@@ -214,6 +216,8 @@ class AgentSnapshotStore:
             f"State snapshot persisted | stage={stage} | path={snapshot_path}",
             request_id=request_id,
         )
+        if hasattr(self.agent, "retention"):
+            self.agent.retention.maybe_auto_prune(trigger="snapshot")
         return snapshot_path
 
     def resolve_snapshot_path(self, request_id: str, snapshot_name: str | None = None) -> str:
@@ -318,7 +322,7 @@ class AgentSnapshotStore:
         if current_subtask_index > len(state.get("plan", [])):
             return False, "Snapshot current_subtask_index exceeds plan length."
 
-        required_dict_fields = ("failed_tools", "retry_counts", "replan_counts")
+        required_dict_fields = ("failed_tools", "failed_tool_signals", "retry_counts", "replan_counts")
         for field_name in required_dict_fields:
             field_value = state.get(field_name, {})
             if not isinstance(field_value, dict):
@@ -371,6 +375,29 @@ class AgentSnapshotStore:
             if first_message_type not in {"human", "system"}:
                 return False, "Resumable snapshot must begin with a human or system message."
 
+        for field_name in ("retry_counts", "replan_counts", "failed_tools", "failed_tool_signals"):
+            for raw_key in state.get(field_name, {}).keys():
+                try:
+                    key_index = int(str(raw_key))
+                except (TypeError, ValueError):
+                    return False, f"Snapshot field {field_name} contains a non-numeric subtask key: {raw_key}."
+                if key_index < 0 or key_index >= len(plan):
+                    return False, f"Snapshot field {field_name} references out-of-range subtask index: {raw_key}."
+
+        for raw_index, tool_map in state.get("failed_tool_signals", {}).items():
+            if not isinstance(tool_map, dict):
+                return False, f"Snapshot field failed_tool_signals[{raw_index}] must be a dictionary."
+            for tool_name, signal_payload in tool_map.items():
+                if not isinstance(tool_name, str) or not tool_name.strip():
+                    return False, f"Snapshot field failed_tool_signals[{raw_index}] contains an invalid tool key."
+                if not isinstance(signal_payload, dict):
+                    return False, f"Snapshot field failed_tool_signals[{raw_index}][{tool_name}] must be a dictionary."
+
+        if current_subtask_index >= len(plan) and not blocked and not final_response:
+            return False, "Snapshot exhausted the plan but does not contain a terminal response."
+        if final_response and not blocked and current_subtask_index < len(plan):
+            return False, "Snapshot contains final_response before all planned subtasks were completed."
+
         return True, ""
 
     def restore_state_from_snapshot(self, payload: dict[str, Any], request_id: str) -> dict[str, Any]:
@@ -390,8 +417,131 @@ class AgentSnapshotStore:
             "session_memory_id": stored_state.get("session_memory_id", 0),
             "domain_label": stored_state.get("domain_label", "general"),
             "memory_summaries": stored_state.get("memory_summaries", []),
+            "failed_tool_signals": stored_state.get("failed_tool_signals", {}),
             "retry_counts": stored_state.get("retry_counts", {}),
             "replan_counts": stored_state.get("replan_counts", {}),
             "blocked": stored_state.get("blocked", False),
             "final_response": stored_state.get("final_response", ""),
+        }
+
+    def _extract_resume_query(self, payload: dict[str, Any]) -> str:
+        extra = payload.get("extra", {}) if isinstance(payload, dict) else {}
+        query = str(extra.get("query", "") or "").strip()
+        if query:
+            return query
+
+        state = payload.get("state", {}) if isinstance(payload, dict) else {}
+        for message_payload in state.get("messages", []):
+            if not isinstance(message_payload, dict):
+                continue
+            message_type = str(message_payload.get("type", "") or "").lower()
+            if message_type == "human":
+                content = str(message_payload.get("content", "") or "").strip()
+                if content:
+                    return content
+
+        for message_payload in state.get("messages", []):
+            if not isinstance(message_payload, dict):
+                continue
+            message_type = str(message_payload.get("type", "") or "").lower()
+            if message_type == "system":
+                content = str(message_payload.get("content", "") or "").strip()
+                if content:
+                    return content
+        return ""
+
+    def _build_resume_reroute_prompt(self, payload: dict[str, Any]) -> str:
+        state = payload.get("state", {}) if isinstance(payload, dict) else {}
+        plan = state.get("plan", []) if isinstance(state.get("plan", []), list) else []
+        current_subtask_index = int(state.get("current_subtask_index", 0) or 0)
+        reflections = [
+            str(item).strip() for item in state.get("reflections", [])
+            if isinstance(item, str) and str(item).strip()
+        ]
+        failed_tools = state.get("failed_tools", {}) if isinstance(state.get("failed_tools", {}), dict) else {}
+        failed_tool_signals = state.get("failed_tool_signals", {}) if isinstance(state.get("failed_tool_signals", {}), dict) else {}
+        failed_tool_counts: dict[str, int] = {}
+        for tool_names in failed_tools.values():
+            if not isinstance(tool_names, list):
+                continue
+            for tool_name in tool_names:
+                normalized_name = str(tool_name or "").strip()
+                if not normalized_name:
+                    continue
+                failed_tool_counts[normalized_name] = failed_tool_counts.get(normalized_name, 0) + 1
+
+        query = self._extract_resume_query(payload) or "Continue the original task with a safer route."
+        prompt_lines = [query, "", "Resume reroute context:"]
+        prompt_lines.append(f"- source_stage={payload.get('stage', '')}")
+        prompt_lines.append(f"- completed_subtasks={min(current_subtask_index, len(plan))}/{len(plan)}")
+        if current_subtask_index < len(plan):
+            current_subtask = plan[current_subtask_index]
+            prompt_lines.append(
+                f"- interrupted_subtask={str(current_subtask.get('description', '')).strip()}"
+            )
+        if failed_tool_counts:
+            ordered_failed_tools = sorted(
+                failed_tool_counts.items(),
+                key=lambda item: (-item[1], item[0]),
+            )
+            prompt_lines.append(
+                "- historical_failed_tools=" + ", ".join(
+                    f"{tool_name}x{count}" for tool_name, count in ordered_failed_tools[:5]
+                )
+            )
+        if failed_tool_signals:
+            severity_pairs = []
+            for tool_map in failed_tool_signals.values():
+                if not isinstance(tool_map, dict):
+                    continue
+                for tool_name, signal_payload in tool_map.items():
+                    if not isinstance(signal_payload, dict):
+                        continue
+                    severity = int(signal_payload.get("severity_score", 0) or 0)
+                    if severity > 0:
+                        severity_pairs.append((str(tool_name), severity))
+            if severity_pairs:
+                aggregated: dict[str, int] = {}
+                for tool_name, severity in severity_pairs:
+                    aggregated[tool_name] = aggregated.get(tool_name, 0) + severity
+                ordered_severity = sorted(aggregated.items(), key=lambda item: (-item[1], item[0]))
+                prompt_lines.append(
+                    "- historical_failure_severity=" + ", ".join(
+                        f"{tool_name}:{severity}" for tool_name, severity in ordered_severity[:5]
+                    )
+                )
+        if reflections:
+            prompt_lines.append("- recent_reflections=" + " | ".join(reflections[-3:]))
+        prompt_lines.append(
+            "Please replan from this recovery point, avoid repeating unstable tools or failed approaches, and choose a safer execution path."
+        )
+        return "\n".join(prompt_lines)
+
+    def build_resume_state_from_snapshot(
+        self,
+        payload: dict[str, Any],
+        request_id: str,
+        reroute: bool = False,
+    ) -> dict[str, Any]:
+        restored_state = self.restore_state_from_snapshot(payload, request_id)
+        if not reroute:
+            return restored_state
+
+        return {
+            "messages": [HumanMessage(content=self._build_resume_reroute_prompt(payload))],
+            "plan": [],
+            "current_subtask_index": 0,
+            "reflections": restored_state.get("reflections", []),
+            "global_keywords": restored_state.get("global_keywords", []),
+            "request_id": request_id,
+            "session_id": restored_state.get("session_id", self.agent.session_id),
+            "session_memory_id": restored_state.get("session_memory_id", 0),
+            "domain_label": restored_state.get("domain_label", "general"),
+            "memory_summaries": restored_state.get("memory_summaries", []),
+            "failed_tools": {},
+            "failed_tool_signals": {},
+            "retry_counts": {},
+            "replan_counts": {},
+            "blocked": False,
+            "final_response": "",
         }

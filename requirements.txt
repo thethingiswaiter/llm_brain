@@ -2,7 +2,7 @@ langchain
 langchain-core
 langchain-community
 langchain-openai
-langchain-ollama
+langchain-ollama<1.0
 langgraph>=0.1.0
 httpx
 mcp

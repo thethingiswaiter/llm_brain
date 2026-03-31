@@ -140,6 +140,37 @@ class MemoryQualityTests(unittest.TestCase):
 
         self.assertEqual(len([item for item in results if item["memory_type"] == "step"]), 2)
 
+    def test_retrieve_failure_memories_filters_failure_cases(self):
+        manager = MemoryManager()
+        manager.add_memory(
+            "session_ok",
+            "general",
+            ["weather", "beijing"],
+            "successful weather lookup",
+            "input ok",
+            "output ok",
+            request_id="req_success",
+            memory_type="step",
+            quality_tags=["success"],
+        )
+        manager.add_memory(
+            "session_fail",
+            "general",
+            ["weather", "beijing"],
+            "blocked weather lookup",
+            "input fail",
+            "output fail",
+            request_id="req_blocked",
+            memory_type="failure_case",
+            quality_tags=["blocked", "ask_user"],
+        )
+
+        results = manager.retrieve_failure_memories(match_keywords=["weather", "beijing"], limit=5)
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["request_id"], "req_blocked")
+        self.assertEqual(results[0]["memory_type"], "failure_case")
+
     def test_agent_core_writes_session_and_step_memory_tags(self):
         import agent_core
 
@@ -192,6 +223,29 @@ class MemoryQualityTests(unittest.TestCase):
         self.assertTrue(any(item["memory_type"] == "step" and item["quality_tags"] == ["success"] for item in step_results))
         self.assertEqual(session_data["memory_type"], "session_main")
         self.assertEqual(session_data["quality_tags"], ["success"])
+
+    def test_agent_core_writes_failure_steps_to_failure_case_memory(self):
+        import agent_core
+
+        agent_core_module = importlib.reload(agent_core)
+        agent = agent_core_module.AgentCore()
+        agent.cognitive.extract_features = lambda text, domain_hint="": (["booking", "missing"], "booking failure")
+
+        agent._record_step_memory(
+            "session_failure",
+            "req_failure",
+            "general",
+            "book a meeting without time",
+            "tool rejected",
+            "missing required parameter",
+            quality_tags=["blocked", "ask_user"],
+        )
+
+        results = agent.get_failure_memories(match_keywords=["booking", "missing"], limit=5)
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["memory_type"], "failure_case")
+        self.assertEqual(results[0]["quality_tags"], ["blocked", "ask_user"])
 
 
 if __name__ == "__main__":

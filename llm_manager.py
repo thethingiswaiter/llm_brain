@@ -8,14 +8,22 @@ from llm_factory import build_llm
 from llm_logging import LLMLogging
 from llm_runtime import LLMRuntime, RequestCancelledError
 
+
+class LLMDependencyUnavailableError(RuntimeError):
+    pass
+
 class LLMManager:
     def __init__(self):
         self._current_llm = None
+        self._llm_init_error = None
         self.runtime = LLMRuntime()
         self.logging = LLMLogging(self.runtime)
         self._logger = self.logging._logger
         self._console_logger = self.logging._console_logger
-        self._update_llm()
+        try:
+            self._update_llm()
+        except Exception as exc:
+            self._llm_init_error = exc
 
     def _build_file_logger(self) -> logging.Logger:
         return self.logging._build_file_logger()
@@ -134,16 +142,28 @@ class LLMManager:
         config.llm_config.model = model
         if base_url: config.llm_config.base_url = base_url
         if api_key: config.llm_config.api_key = api_key
-        self._update_llm()
+        try:
+            self._update_llm()
+        except Exception as exc:
+            raise LLMDependencyUnavailableError(
+                f"Failed to initialize provider {provider}: {exc}"
+            ) from exc
         self.log_event(f"LLM model switched | provider={provider} | model={model}")
         return f"Successfully switched to {provider}:{model}"
 
     def _update_llm(self):
         self._current_llm = build_llm(config.llm_config)
+        self._llm_init_error = None
 
     def get_llm(self) -> BaseChatModel:
         if not self._current_llm:
-            self._update_llm()
+            try:
+                self._update_llm()
+            except Exception as exc:
+                root_exc = self._llm_init_error or exc
+                raise LLMDependencyUnavailableError(
+                    f"Failed to initialize provider {config.llm_config.provider}: {root_exc}"
+                ) from root_exc
         return self._current_llm
 
     def invoke(self, payload: Any, source: str = "unknown", llm = None):
@@ -165,17 +185,39 @@ class LLMManager:
                 f"LLM invocation timed out after {config.llm_timeout_seconds} seconds.",
             )
         except Exception as exc:
+            error_type = "execution_error"
+            outcome = "failed"
+            retryable = False
+            raised_exc = exc
+            if isinstance(exc, RequestCancelledError):
+                error_type = "cancelled"
+                outcome = "cancelled"
+                retryable = True
+            elif isinstance(exc, TimeoutError):
+                error_type = "timeout"
+                outcome = "timed_out"
+                retryable = True
+            elif isinstance(exc, (ConnectionError, OSError, ImportError, ModuleNotFoundError)):
+                error_type = "dependency_unavailable"
+                retryable = True
+                raised_exc = LLMDependencyUnavailableError(
+                    f"LLM dependency unavailable: {exc}"
+                )
             self.log_structured_event(
                 "llm_error",
                 message="LLM invocation failed",
                 level=logging.ERROR,
                 source=source,
-                outcome="failed",
+                outcome=outcome,
                 provider=config.llm_config.provider,
                 model=config.llm_config.model,
                 duration_ms=(time.monotonic() - started_at) * 1000,
+                error_type=error_type,
+                retryable=retryable,
                 error=str(exc),
             )
+            if raised_exc is not exc:
+                raise raised_exc from exc
             raise
 
         self.log_structured_event(

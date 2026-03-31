@@ -19,6 +19,7 @@ from cognitive.feature_extractor import CognitiveSystem
 from cognitive.planner import TaskPlanner
 from cognitive.reflector import Reflector
 from agent_observability import AgentObservability
+from agent_retention import AgentRetentionManager
 from agent_runtime import AgentRuntime
 from agent_snapshots import AgentSnapshotStore
 from agent_tools import AgentToolRuntime
@@ -33,6 +34,7 @@ class AgentState(TypedDict):
     reflections: List[str]
     global_keywords: List[str]
     failed_tools: Dict[str, List[str]]
+    failed_tool_signals: Dict[str, Dict[str, Dict[str, Any]]]
     request_id: str
     session_id: str
     session_memory_id: int
@@ -59,7 +61,8 @@ class AgentCore:
         self.cognitive = CognitiveSystem()
         self.planner = TaskPlanner()
         self.reflector = Reflector()
-        self.memory = MemoryManager()
+        self.retention = AgentRetentionManager(self)
+        self.memory = MemoryManager(retention_callback=self.retention.maybe_auto_prune)
         self.mcp = MCPManager()
         self.skills = SkillManager()
         self.snapshot_store = AgentSnapshotStore(self)
@@ -149,11 +152,54 @@ class AgentCore:
         limit: int = 10,
         statuses: List[str] | None = None,
         resumed_only: bool = False,
+        attention_only: bool = False,
+        since_seconds: int | None = None,
     ) -> List[Dict[str, Any]]:
         return self.observability.get_recent_request_summaries(
             limit=limit,
             statuses=statuses,
             resumed_only=resumed_only,
+            attention_only=attention_only,
+            since_seconds=since_seconds,
+        )
+
+    def get_request_rollup(
+        self,
+        limit: int = 20,
+        statuses: List[str] | None = None,
+        resumed_only: bool = False,
+        attention_only: bool = False,
+        since_seconds: int | None = None,
+    ) -> Dict[str, Any]:
+        return self.observability.get_request_rollup(
+            limit=limit,
+            statuses=statuses,
+            resumed_only=resumed_only,
+            attention_only=attention_only,
+            since_seconds=since_seconds,
+        )
+
+    def list_tool_runs(self, request_id: str = "", status: str = "") -> List[Dict[str, Any]]:
+        return self.tool_runtime.list_tracked_tool_runs(request_id=request_id, status=status)
+
+    def get_retention_status(self) -> Dict[str, Any]:
+        return self.retention.get_retention_status()
+
+    def prune_runtime_data(self, apply: bool = False) -> Dict[str, Any]:
+        return self.retention.prune_runtime_data(apply=apply)
+
+    def get_failure_memories(
+        self,
+        match_keywords: List[str] | None = None,
+        limit: int = 5,
+        exclude_conv_id: str | None = None,
+        exclude_ids: List[int] | None = None,
+    ) -> List[Dict[str, Any]]:
+        return self.memory.retrieve_failure_memories(
+            match_keywords=match_keywords,
+            limit=limit,
+            exclude_conv_id=exclude_conv_id,
+            exclude_ids=exclude_ids,
         )
 
     def _load_snapshot_payload(self, request_id: str, snapshot_name: str | None = None) -> Dict[str, Any] | None:
@@ -268,20 +314,42 @@ class AgentCore:
     ) -> Dict[str, List[str]]:
         return self.tool_runtime.merge_failed_tools(failed_tools, subtask_index, recent_failures)
 
+    def _merge_failed_tool_signals(
+        self,
+        failed_tool_signals: Dict[str, Dict[str, Dict[str, Any]]],
+        subtask_index: int,
+        recent_failures: List[Dict[str, Any]],
+    ) -> Dict[str, Dict[str, Dict[str, Any]]]:
+        return self.tool_runtime.merge_failed_tool_signals(failed_tool_signals, subtask_index, recent_failures)
+
     def _filter_failed_tools_for_subtask(
         self,
         subtask_index: int,
         selected_tools: List[Any],
         tool_skills: List[Dict[str, Any]],
         failed_tools: Dict[str, List[str]],
+        historical_failed_tools: Dict[str, int] | None = None,
+        historical_failed_tool_signals: Dict[str, Dict[str, Any]] | None = None,
+        historical_failure_threshold: int = 0,
+        historical_failure_severity_threshold: int = 0,
     ) -> tuple[List[Any], List[Dict[str, Any]], List[str]]:
-        return self.tool_runtime.filter_failed_tools_for_subtask(subtask_index, selected_tools, tool_skills, failed_tools)
+        return self.tool_runtime.filter_failed_tools_for_subtask(
+            subtask_index,
+            selected_tools,
+            tool_skills,
+            failed_tools,
+            historical_failed_tools=historical_failed_tools,
+            historical_failed_tool_signals=historical_failed_tool_signals,
+            historical_failure_threshold=historical_failure_threshold,
+            historical_failure_severity_threshold=historical_failure_severity_threshold,
+        )
 
     def _expand_tool_candidates(
         self,
         task_description: str,
         extracted_keywords: List[str],
         failed_tool_names: List[str],
+        historical_failed_tool_signals: Dict[str, Dict[str, Any]] | None = None,
         excluded_tool_names: List[str] | None = None,
         limit: int = 6,
     ) -> List[Dict[str, Any]]:
@@ -289,8 +357,19 @@ class AgentCore:
             task_description,
             extracted_keywords,
             failed_tool_names,
+            historical_failed_tool_signals=historical_failed_tool_signals,
             excluded_tool_names=excluded_tool_names,
             limit=limit,
+        )
+
+    def _reprioritize_tool_skills(
+        self,
+        tool_skills: List[Dict[str, Any]],
+        historical_failed_tool_signals: Dict[str, Dict[str, Any]] | None = None,
+    ) -> List[Dict[str, Any]]:
+        return self.tool_runtime.reprioritize_tool_skills(
+            tool_skills,
+            historical_failed_tool_signals=historical_failed_tool_signals,
         )
 
     def _build_tool_reroute_plan(
@@ -301,6 +380,10 @@ class AgentCore:
         tool_skills: List[Dict[str, Any]],
         recent_failures: List[Dict[str, Any]],
         failed_tool_names: List[str],
+        historical_failed_tool_names: List[str] | None = None,
+        historical_failed_tool_counts: Dict[str, int] | None = None,
+        historical_failed_tool_signals: Dict[str, Dict[str, Any]] | None = None,
+        historical_failure_severity_threshold: int = 0,
     ) -> Dict[str, Any]:
         return self.tool_runtime.build_tool_reroute_plan(
             subtask_description,
@@ -309,6 +392,22 @@ class AgentCore:
             tool_skills,
             recent_failures,
             failed_tool_names,
+            historical_failed_tool_names=historical_failed_tool_names,
+            historical_failed_tool_counts=historical_failed_tool_counts,
+            historical_failed_tool_signals=historical_failed_tool_signals,
+            historical_failure_severity_threshold=historical_failure_severity_threshold,
+        )
+
+    def _build_no_tool_guidance(
+        self,
+        reroute_mode: str,
+        recent_failures: List[Dict[str, Any]] | None = None,
+        reroute_reason: str = "",
+    ) -> str:
+        return self.tool_runtime.build_no_tool_guidance(
+            reroute_mode,
+            recent_failures=recent_failures,
+            reroute_reason=reroute_reason,
         )
 
     def _format_memory_context(self, memories: List[Dict[str, Any]]) -> str:
@@ -349,6 +448,8 @@ class AgentCore:
         memory_output = actual.strip()
         if reflection_note:
             memory_output = f"{memory_output}\n\nReflection: {reflection_note}".strip()
+        normalized_quality_tags = self.memory._normalize_quality_tags(quality_tags or ["pending"])
+        memory_type = "failure_case" if self.memory._is_failure_memory("", normalized_quality_tags) else "step"
         self.memory.add_memory(
             session_id,
             domain,
@@ -358,8 +459,8 @@ class AgentCore:
             memory_output,
             "",
             request_id=request_id,
-            memory_type="step",
-            quality_tags=quality_tags or ["pending"],
+            memory_type=memory_type,
+            quality_tags=normalized_quality_tags,
         )
 
     def _finalize_session_memory(self, state: AgentState, final_output: str, quality_tags: List[str] | None = None):
@@ -687,6 +788,7 @@ class AgentCore:
                 "global_keywords": normalized_keywords,
                 "reflections": [],
                 "failed_tools": {},
+                "failed_tool_signals": {},
                 "session_id": session_id,
                 "request_id": request_id,
                 "session_memory_id": session_memory_id,
@@ -711,6 +813,7 @@ class AgentCore:
             request_id = state.get("request_id", "")
             self._raise_if_request_cancelled(request_id)
             failed_tools_state = dict(state.get("failed_tools", {}))
+            failed_tool_signals_state = dict(state.get("failed_tool_signals", {}))
             
             if idx >= len(plan):
                 final_response = state.get("final_response") or "All subtasks completed successfully."
@@ -720,6 +823,7 @@ class AgentCore:
             subtask_desc = current_subtask.get("description", "")
             recent_tool_failures = self._collect_recent_tool_failures(state.get("messages", []))
             merged_failed_tools = self._merge_failed_tools(failed_tools_state, idx, recent_tool_failures)
+            merged_failed_tool_signals = self._merge_failed_tool_signals(failed_tool_signals_state, idx, recent_tool_failures)
             llm_manager.log_checkpoint(
                 "subtask_started",
                 details=f"index={idx + 1} | description={subtask_desc[:120]}",
@@ -764,11 +868,26 @@ class AgentCore:
             selected_tools = capability_bundle.get("tools", [])
             if not selected_tools:
                 selected_tools = self.select_active_tools(subtask_desc)
+            historical_failed_tool_counts = self.tool_runtime.summarize_historical_failed_tools(merged_failed_tools, idx)
+            historical_failed_tool_signals = self.tool_runtime.summarize_historical_failed_tool_signals(
+                merged_failed_tool_signals,
+                idx,
+            )
+            if tool_skills:
+                tool_skills = self._reprioritize_tool_skills(
+                    tool_skills,
+                    historical_failed_tool_signals=historical_failed_tool_signals,
+                )
+                selected_tools = [item["tool"] for item in tool_skills]
             selected_tools, tool_skills, failed_tool_names = self._filter_failed_tools_for_subtask(
                 idx,
                 selected_tools,
                 tool_skills,
                 merged_failed_tools,
+                historical_failed_tools=historical_failed_tool_counts,
+                historical_failed_tool_signals=historical_failed_tool_signals,
+                historical_failure_threshold=max(0, int(getattr(config, "historical_tool_failure_reroute_threshold", 2) or 0)),
+                historical_failure_severity_threshold=max(0, int(getattr(config, "historical_tool_failure_severity_threshold", 6) or 0)),
             )
             reroute_mode = "normal"
             reroute_plan = {
@@ -786,6 +905,10 @@ class AgentCore:
                     tool_skills,
                     recent_tool_failures,
                     failed_tool_names,
+                    historical_failed_tool_names=sorted(historical_failed_tool_counts.keys()),
+                    historical_failed_tool_counts=historical_failed_tool_counts,
+                    historical_failed_tool_signals=historical_failed_tool_signals,
+                    historical_failure_severity_threshold=max(0, int(getattr(config, "historical_tool_failure_severity_threshold", 6) or 0)),
                 )
                 reroute_mode = reroute_plan["mode"]
                 selected_tools = reroute_plan["selected_tools"]
@@ -828,10 +951,14 @@ class AgentCore:
                     )
                 if reroute_plan.get("reason"):
                     prompt_sections.append(f"Reroute decision: {reroute_plan['reason']}")
-                if not selected_tools:
-                    prompt_sections.append(
-                        "Tool-assisted execution is currently unavailable for this subtask. Continue without tools, ask the user for missing parameters when necessary, or produce the best direct answer if possible."
+            if not selected_tools:
+                prompt_sections.append(
+                    self._build_no_tool_guidance(
+                        reroute_mode,
+                        recent_failures=recent_tool_failures,
+                        reroute_reason=reroute_plan.get("reason", ""),
                     )
+                )
             prompt = "\n\n".join(prompt_sections)
             messages = state["messages"] + [HumanMessage(content=prompt)]
 
@@ -848,6 +975,7 @@ class AgentCore:
                     "subtask_description": subtask_desc,
                     "selected_tools": [getattr(tool, "name", "") for tool in selected_tools],
                     "failed_tools": failed_tool_names,
+                    "failed_tool_signal_tools": sorted(merged_failed_tool_signals.get(str(idx), {}).keys()),
                 },
             )
             llm_manager.log_checkpoint(
@@ -860,7 +988,11 @@ class AgentCore:
             )
                 
             response = llm_manager.invoke(messages, source="agent.execute_subtask", llm=llm)
-            return {"messages": [response], "failed_tools": merged_failed_tools}
+            return {
+                "messages": [response],
+                "failed_tools": merged_failed_tools,
+                "failed_tool_signals": merged_failed_tool_signals,
+            }
 
         def reflect_and_advance(state: AgentState):
             messages = state["messages"]
@@ -894,6 +1026,7 @@ class AgentCore:
             reflections = list(state.get("reflections", []))
             reflections.append(f"Subtask {idx+1}: {reflection_note}")
             failed_tools_state = dict(state.get("failed_tools", {}))
+            failed_tool_signals_state = dict(state.get("failed_tool_signals", {}))
             self._record_step_memory(
                 state.get("session_id", self.session_id),
                 request_id,
@@ -932,6 +1065,7 @@ class AgentCore:
                     "reflections": reflections,
                     "blocked": True,
                     "final_response": blocked_message,
+                    "failed_tool_signals": failed_tool_signals_state,
                     "retry_counts": retry_counts,
                     "replan_counts": replan_counts,
                 }
@@ -940,6 +1074,7 @@ class AgentCore:
             if success or action == "continue":
                 next_index = idx + 1
                 failed_tools_state.pop(str(idx), None)
+                failed_tool_signals_state.pop(str(idx), None)
                 if next_index >= len(plan):
                     llm_manager.log_checkpoint(
                         "agent_completed",
@@ -970,6 +1105,7 @@ class AgentCore:
                     "current_subtask_index": next_index,
                     "reflections": reflections,
                     "failed_tools": failed_tools_state,
+                    "failed_tool_signals": failed_tool_signals_state,
                     "blocked": False,
                     "final_response": actual if next_index >= len(plan) else state.get("final_response", ""),
                     "retry_counts": retry_counts,
@@ -995,6 +1131,7 @@ class AgentCore:
                     replan_counts[replan_key] = replan_count + 1
                     retry_counts.pop(retry_key, None)
                     failed_tools_state.pop(str(idx), None)
+                    failed_tool_signals_state.pop(str(idx), None)
                     llm_manager.log_checkpoint(
                         "subtask_replanned",
                         details=f"index={idx + 1} | new_subtask_count={len(replanned_subtasks)}",
@@ -1014,6 +1151,7 @@ class AgentCore:
                             "retry_counts": retry_counts,
                             "replan_counts": replan_counts,
                             "failed_tools": failed_tools_state,
+                            "failed_tool_signals": failed_tool_signals_state,
                         },
                         extra={
                             "subtask_index": idx + 1,
@@ -1025,6 +1163,7 @@ class AgentCore:
                         "plan": updated_plan,
                         "reflections": reflections,
                         "failed_tools": failed_tools_state,
+                        "failed_tool_signals": failed_tool_signals_state,
                         "retry_counts": retry_counts,
                         "replan_counts": replan_counts,
                         "blocked": False,
@@ -1054,6 +1193,7 @@ class AgentCore:
                     "reflections": reflections,
                     "blocked": True,
                     "final_response": blocked_message,
+                    "failed_tool_signals": failed_tool_signals_state,
                     "retry_counts": retry_counts,
                     "replan_counts": replan_counts,
                 }
@@ -1061,6 +1201,7 @@ class AgentCore:
             return {
                 "reflections": reflections,
                 "failed_tools": failed_tools_state,
+                "failed_tool_signals": failed_tool_signals_state,
                 "retry_counts": retry_counts,
                 "replan_counts": replan_counts,
                 "blocked": False,
@@ -1122,8 +1263,8 @@ class AgentCore:
     def get_last_request_id(self) -> str:
         return self.last_request_id
 
-    def resume_from_snapshot(self, request_id: str, snapshot_name: str = None):
-        return self.runtime.resume_from_snapshot(request_id, snapshot_name=snapshot_name)
+    def resume_from_snapshot(self, request_id: str, snapshot_name: str = None, reroute: bool = False):
+        return self.runtime.resume_from_snapshot(request_id, snapshot_name=snapshot_name, reroute=reroute)
 
     def replay(self, memory_id: int, injected_features: list[str] = None):
         """

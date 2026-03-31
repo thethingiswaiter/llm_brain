@@ -7,6 +7,7 @@ import pathlib
 import tempfile
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 from langchain_core.tools import tool
@@ -184,6 +185,37 @@ class ToolSafetyWrapperTests(unittest.TestCase):
         finally:
             config.tool_timeout_seconds = original_timeout
 
+    def test_timed_out_tool_run_is_tracked_until_background_completion(self):
+        @tool
+        def slow_tool() -> str:
+            """Tool that keeps running after timeout."""
+            time.sleep(0.12)
+            return "done"
+
+        original_timeout = config.tool_timeout_seconds
+        original_grace = getattr(config, "tool_cancellation_grace_seconds", 0.2)
+        config.tool_timeout_seconds = 0.01
+        config.tool_cancellation_grace_seconds = 0.01
+        try:
+            safe_tool = self.agent._wrap_tool_for_runtime(slow_tool)
+            result = safe_tool.invoke({})
+            payload = json.loads(result)
+
+            self.assertFalse(payload["ok"])
+            self.assertEqual(payload["error_type"], "timeout")
+
+            stats_during_detach = self.agent.tool_runtime.get_tool_run_stats()
+            self.assertEqual(stats_during_detach["detached"], 1)
+            self.assertEqual(stats_during_detach["tracked"], 1)
+
+            time.sleep(0.2)
+            stats_after_completion = self.agent.tool_runtime.get_tool_run_stats()
+            self.assertEqual(stats_after_completion["detached"], 0)
+            self.assertEqual(stats_after_completion["tracked"], 0)
+        finally:
+            config.tool_timeout_seconds = original_timeout
+            config.tool_cancellation_grace_seconds = original_grace
+
 
 class TimeoutControlTests(unittest.TestCase):
     def test_build_structured_payload_includes_core_guardrail_fields(self):
@@ -234,6 +266,16 @@ class TimeoutControlTests(unittest.TestCase):
             with llm_manager.request_scope("req_cancelled", cancel_checker=cancel_event.is_set):
                 llm_manager.invoke("hello", source="test.cancel", llm=SlowLLM())
 
+    def test_llm_manager_dependency_failure_raises_specific_error(self):
+        from llm_manager import LLMDependencyUnavailableError, llm_manager
+
+        class BrokenLLM:
+            def invoke(self, payload):
+                raise ConnectionError("ollama connection refused")
+
+        with self.assertRaises(LLMDependencyUnavailableError):
+            llm_manager.invoke("hello", source="test.dependency", llm=BrokenLLM())
+
     def test_agent_request_timeout_returns_timeout_message(self):
         original_request_timeout = config.request_timeout_seconds
         self.tempdir = tempfile.TemporaryDirectory()
@@ -267,6 +309,315 @@ class TimeoutControlTests(unittest.TestCase):
             config.memory_backup_dir = original_memory_backup_dir
             config.state_snapshot_dir = original_state_snapshot_dir
             self.tempdir.cleanup()
+
+    def test_agent_request_dependency_failure_returns_dependency_message(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        original_memory_db_path = config.memory_db_path
+        original_memory_backup_dir = config.memory_backup_dir
+        original_state_snapshot_dir = config.state_snapshot_dir
+        config.memory_db_path = os.path.join(self.tempdir.name, "memory.db")
+        config.memory_backup_dir = os.path.join(self.tempdir.name, "backups")
+        config.state_snapshot_dir = os.path.join(self.tempdir.name, "snapshots")
+
+        import agent_core
+        from llm_manager import LLMDependencyUnavailableError
+
+        agent_core_module = importlib.reload(agent_core)
+        agent = agent_core_module.AgentCore()
+        original_graph = agent.graph
+
+        class BrokenGraph:
+            def invoke(self, inputs):
+                raise LLMDependencyUnavailableError("LLM dependency unavailable: ollama connection refused")
+
+        agent.graph = BrokenGraph()
+        try:
+            result = agent.invoke("dependency test")
+            self.assertIn("model dependency is unavailable", result)
+            self.assertIn("ollama connection refused", result)
+        finally:
+            agent.graph = original_graph
+            config.memory_db_path = original_memory_db_path
+            config.memory_backup_dir = original_memory_backup_dir
+            config.state_snapshot_dir = original_state_snapshot_dir
+            self.tempdir.cleanup()
+
+
+class RetentionManagerTests(unittest.TestCase):
+    def setUp(self):
+        self.original_memory_db_path = config.memory_db_path
+        self.original_memory_backup_dir = config.memory_backup_dir
+        self.original_state_snapshot_dir = config.state_snapshot_dir
+        self.original_log_dir = config.log_dir
+        self.original_audit_log_dir = getattr(config, "audit_log_dir", os.path.join("runtime_state", "audit"))
+        self.original_log_retention_days = getattr(config, "log_retention_days", 7)
+        self.original_snapshot_retention_days = getattr(config, "snapshot_retention_days", 7)
+        self.original_audit_log_retention_days = getattr(config, "audit_log_retention_days", 14)
+        self.original_memory_backup_retention_days = getattr(config, "memory_backup_retention_days", 14)
+        self.original_log_retention_max_files = getattr(config, "log_retention_max_files", 20)
+        self.original_snapshot_retention_max_request_dirs = getattr(config, "snapshot_retention_max_request_dirs", 200)
+        self.original_audit_log_retention_max_files = getattr(config, "audit_log_retention_max_files", 50)
+        self.original_memory_backup_retention_max_files = getattr(config, "memory_backup_retention_max_files", 20)
+        self.original_log_retention_max_bytes = getattr(config, "log_retention_max_bytes", 0)
+        self.original_snapshot_retention_max_bytes = getattr(config, "snapshot_retention_max_bytes", 0)
+        self.original_audit_log_retention_max_bytes = getattr(config, "audit_log_retention_max_bytes", 0)
+        self.original_memory_backup_retention_max_bytes = getattr(config, "memory_backup_retention_max_bytes", 0)
+        self.original_retention_auto_prune_enabled = getattr(config, "retention_auto_prune_enabled", True)
+        self.original_retention_auto_prune_min_interval_seconds = getattr(config, "retention_auto_prune_min_interval_seconds", 300)
+        self.tempdir = tempfile.TemporaryDirectory()
+
+        config.memory_db_path = os.path.join(self.tempdir.name, "memory.db")
+        config.memory_backup_dir = os.path.join(self.tempdir.name, "backups")
+        config.state_snapshot_dir = os.path.join(self.tempdir.name, "snapshots")
+        config.log_dir = os.path.join(self.tempdir.name, "logs")
+        config.audit_log_dir = os.path.join(self.tempdir.name, "audit")
+        config.log_retention_days = 7
+        config.snapshot_retention_days = 7
+        config.audit_log_retention_days = 7
+        config.memory_backup_retention_days = 7
+        config.log_retention_max_files = 20
+        config.snapshot_retention_max_request_dirs = 200
+        config.audit_log_retention_max_files = 50
+        config.memory_backup_retention_max_files = 20
+        config.log_retention_max_bytes = 0
+        config.snapshot_retention_max_bytes = 0
+        config.audit_log_retention_max_bytes = 0
+        config.memory_backup_retention_max_bytes = 0
+        config.retention_auto_prune_enabled = True
+        config.retention_auto_prune_min_interval_seconds = 300
+
+        import agent_core
+
+        self.agent_core_module = importlib.reload(agent_core)
+        self.agent = self.agent_core_module.AgentCore()
+
+    def tearDown(self):
+        config.memory_db_path = self.original_memory_db_path
+        config.memory_backup_dir = self.original_memory_backup_dir
+        config.state_snapshot_dir = self.original_state_snapshot_dir
+        config.log_dir = self.original_log_dir
+        config.audit_log_dir = self.original_audit_log_dir
+        config.log_retention_days = self.original_log_retention_days
+        config.snapshot_retention_days = self.original_snapshot_retention_days
+        config.audit_log_retention_days = self.original_audit_log_retention_days
+        config.memory_backup_retention_days = self.original_memory_backup_retention_days
+        config.log_retention_max_files = getattr(self, "original_log_retention_max_files", 20)
+        config.snapshot_retention_max_request_dirs = getattr(self, "original_snapshot_retention_max_request_dirs", 200)
+        config.audit_log_retention_max_files = getattr(self, "original_audit_log_retention_max_files", 50)
+        config.memory_backup_retention_max_files = getattr(self, "original_memory_backup_retention_max_files", 20)
+        config.log_retention_max_bytes = getattr(self, "original_log_retention_max_bytes", 0)
+        config.snapshot_retention_max_bytes = getattr(self, "original_snapshot_retention_max_bytes", 0)
+        config.audit_log_retention_max_bytes = getattr(self, "original_audit_log_retention_max_bytes", 0)
+        config.memory_backup_retention_max_bytes = getattr(self, "original_memory_backup_retention_max_bytes", 0)
+        config.retention_auto_prune_enabled = self.original_retention_auto_prune_enabled
+        config.retention_auto_prune_min_interval_seconds = self.original_retention_auto_prune_min_interval_seconds
+        self.tempdir.cleanup()
+
+    def _write_file(self, path: str, content: str, days_old: int) -> None:
+        pathlib.Path(path).parent.mkdir(parents=True, exist_ok=True)
+        pathlib.Path(path).write_text(content, encoding="utf-8")
+        timestamp = (datetime.now(timezone.utc) - timedelta(days=days_old)).timestamp()
+        os.utime(path, (timestamp, timestamp))
+
+    def _write_snapshot(self, request_id: str, filename: str, days_old: int) -> None:
+        request_dir = pathlib.Path(config.resolve_path(config.state_snapshot_dir)) / request_id
+        request_dir.mkdir(parents=True, exist_ok=True)
+        file_path = request_dir / filename
+        file_path.write_text("{}", encoding="utf-8")
+        timestamp = (datetime.now(timezone.utc) - timedelta(days=days_old)).timestamp()
+        os.utime(file_path, (timestamp, timestamp))
+
+    def test_retention_status_and_prune_runtime_data(self):
+        self._write_file(os.path.join(config.resolve_path(config.log_dir), "old.log"), "old", 10)
+        self._write_file(os.path.join(config.resolve_path(config.log_dir), "new.log"), "new", 1)
+        self._write_file(os.path.join(config.resolve_path(config.audit_log_dir), "system_mcp_audit.jsonl"), "{}\n", 10)
+        self._write_file(os.path.join(config.resolve_path(config.memory_backup_dir), "backup_old.txt"), "backup", 10)
+        self._write_snapshot("req_old", "001_request_completed.json", 10)
+        self._write_snapshot("req_new", "001_request_completed.json", 1)
+
+        status = self.agent.get_retention_status()
+
+        target_map = {item["key"]: item for item in status["targets"]}
+        self.assertEqual(target_map["logs"]["expired_count"], 1)
+        self.assertEqual(target_map["audit_logs"]["expired_count"], 1)
+        self.assertEqual(target_map["memory_backups"]["expired_count"], 1)
+        self.assertEqual(target_map["snapshots"]["expired_count"], 1)
+
+        dry_run = self.agent.prune_runtime_data(apply=False)
+        self.assertEqual(dry_run["mode"], "dry_run")
+        self.assertEqual(dry_run["totals"]["expired_count"], 4)
+        self.assertTrue(os.path.exists(os.path.join(config.resolve_path(config.log_dir), "old.log")))
+        self.assertTrue(os.path.exists(os.path.join(config.resolve_path(config.state_snapshot_dir), "req_old")))
+
+        applied = self.agent.prune_runtime_data(apply=True)
+        self.assertEqual(applied["mode"], "apply")
+        self.assertEqual(applied["totals"]["deleted_count"], 4)
+        self.assertFalse(os.path.exists(os.path.join(config.resolve_path(config.log_dir), "old.log")))
+        self.assertFalse(os.path.exists(os.path.join(config.resolve_path(config.audit_log_dir), "system_mcp_audit.jsonl")))
+        self.assertFalse(os.path.exists(os.path.join(config.resolve_path(config.memory_backup_dir), "backup_old.txt")))
+        self.assertFalse(os.path.exists(os.path.join(config.resolve_path(config.state_snapshot_dir), "req_old")))
+        self.assertTrue(os.path.exists(os.path.join(config.resolve_path(config.log_dir), "new.log")))
+        self.assertTrue(os.path.exists(os.path.join(config.resolve_path(config.state_snapshot_dir), "req_new")))
+
+    def test_retention_marks_excess_recent_files_when_over_max_items(self):
+        config.log_retention_days = 30
+        config.log_retention_max_files = 2
+
+        self._write_file(os.path.join(config.resolve_path(config.log_dir), "log_a.log"), "a", 1)
+        self._write_file(os.path.join(config.resolve_path(config.log_dir), "log_b.log"), "b", 2)
+        self._write_file(os.path.join(config.resolve_path(config.log_dir), "log_c.log"), "c", 3)
+
+        status = self.agent.get_retention_status()
+        target_map = {item["key"]: item for item in status["targets"]}
+
+        self.assertEqual(target_map["logs"]["item_count"], 3)
+        self.assertEqual(target_map["logs"]["expired_count"], 1)
+        self.assertEqual(target_map["logs"]["max_items"], 2)
+
+        applied = self.agent.prune_runtime_data(apply=True)
+        log_target = {item["key"]: item for item in applied["targets"]}["logs"]
+        self.assertEqual(log_target["deleted_count"], 1)
+        self.assertTrue(os.path.exists(os.path.join(config.resolve_path(config.log_dir), "log_a.log")))
+        self.assertTrue(os.path.exists(os.path.join(config.resolve_path(config.log_dir), "log_b.log")))
+        self.assertFalse(os.path.exists(os.path.join(config.resolve_path(config.log_dir), "log_c.log")))
+
+    def test_retention_marks_excess_files_when_over_max_total_bytes(self):
+        config.log_retention_days = 30
+        config.log_retention_max_files = 10
+        config.log_retention_max_bytes = 6
+
+        self._write_file(os.path.join(config.resolve_path(config.log_dir), "log_new.log"), "1234", 1)
+        self._write_file(os.path.join(config.resolve_path(config.log_dir), "log_mid.log"), "12", 2)
+        self._write_file(os.path.join(config.resolve_path(config.log_dir), "log_old.log"), "123", 3)
+
+        status = self.agent.get_retention_status()
+        log_target = {item["key"]: item for item in status["targets"]}["logs"]
+
+        self.assertEqual(log_target["item_count"], 3)
+        self.assertEqual(log_target["max_total_bytes"], 6)
+        self.assertEqual(log_target["expired_count"], 1)
+        self.assertEqual(log_target["reclaimable_bytes"], 3)
+
+        applied = self.agent.prune_runtime_data(apply=True)
+        log_target = {item["key"]: item for item in applied["targets"]}["logs"]
+        self.assertEqual(log_target["deleted_count"], 1)
+        self.assertEqual(log_target["deleted_bytes"], 3)
+        self.assertTrue(os.path.exists(os.path.join(config.resolve_path(config.log_dir), "log_new.log")))
+        self.assertTrue(os.path.exists(os.path.join(config.resolve_path(config.log_dir), "log_mid.log")))
+        self.assertFalse(os.path.exists(os.path.join(config.resolve_path(config.log_dir), "log_old.log")))
+
+    def test_snapshot_retention_tracks_deleted_bytes_for_request_dirs(self):
+        config.snapshot_retention_days = 30
+        config.snapshot_retention_max_request_dirs = 10
+        config.snapshot_retention_max_bytes = 3
+
+        self._write_snapshot("req_new", "001.json", 1)
+        self._write_snapshot("req_old", "001.json", 3)
+        req_new_path = pathlib.Path(config.resolve_path(config.state_snapshot_dir), "req_new", "001.json")
+        req_old_path = pathlib.Path(config.resolve_path(config.state_snapshot_dir), "req_old", "001.json")
+        req_new_path.write_text("123", encoding="utf-8")
+        req_old_path.write_text("1234", encoding="utf-8")
+        new_timestamp = (datetime.now(timezone.utc) - timedelta(days=1)).timestamp()
+        old_timestamp = (datetime.now(timezone.utc) - timedelta(days=3)).timestamp()
+        os.utime(req_new_path, (new_timestamp, new_timestamp))
+        os.utime(req_old_path, (old_timestamp, old_timestamp))
+
+        applied = self.agent.prune_runtime_data(apply=True)
+        snapshot_target = {item["key"]: item for item in applied["targets"]}["snapshots"]
+        self.assertEqual(snapshot_target["deleted_count"], 1)
+        self.assertEqual(snapshot_target["deleted_bytes"], 4)
+        self.assertTrue(os.path.exists(os.path.join(config.resolve_path(config.state_snapshot_dir), "req_new")))
+        self.assertFalse(os.path.exists(os.path.join(config.resolve_path(config.state_snapshot_dir), "req_old")))
+
+    def test_snapshot_persist_triggers_auto_prune_with_interval_guard(self):
+        config.retention_auto_prune_enabled = True
+        config.retention_auto_prune_min_interval_seconds = 3600
+        config.log_retention_days = 1
+
+        old_log_path = os.path.join(config.resolve_path(config.log_dir), "old.log")
+        self._write_file(old_log_path, "old", 10)
+
+        state = {
+            "messages": [HumanMessage(content="hello")],
+            "plan": [],
+            "current_subtask_index": 0,
+            "reflections": [],
+            "global_keywords": [],
+            "failed_tools": {},
+            "request_id": "req_auto_prune",
+            "session_id": "session_auto_prune",
+            "session_memory_id": 1,
+            "domain_label": "general",
+            "memory_summaries": [],
+            "retry_counts": {},
+            "replan_counts": {},
+            "blocked": False,
+            "final_response": "",
+        }
+
+        self.agent._persist_state_snapshot("req_auto_prune", "planning_completed", state, extra={})
+        self.assertFalse(os.path.exists(old_log_path))
+        retention_status = self.agent.get_retention_status()
+        self.assertEqual(retention_status["last_auto_prune"]["trigger"], "snapshot")
+        self.assertEqual(retention_status["last_auto_prune"]["deleted_count"], 1)
+        self.assertEqual(retention_status["last_auto_prune_check"]["status"], "executed")
+
+        next_old_log_path = os.path.join(config.resolve_path(config.log_dir), "next_old.log")
+        self._write_file(next_old_log_path, "old again", 10)
+        self.agent._persist_state_snapshot("req_auto_prune", "subtask_started", state, extra={})
+        self.assertTrue(os.path.exists(next_old_log_path))
+        retention_status = self.agent.get_retention_status()
+        self.assertEqual(retention_status["last_auto_prune_check"]["status"], "skipped_throttled")
+        self.assertEqual(retention_status["last_auto_prune_check"]["reason"], "throttled")
+
+    def test_memory_backup_write_can_trigger_auto_prune(self):
+        config.retention_auto_prune_enabled = True
+        config.retention_auto_prune_min_interval_seconds = 0
+        config.memory_backup_retention_days = 1
+
+        old_backup_path = os.path.join(config.resolve_path(config.memory_backup_dir), "old_backup.txt")
+        self._write_file(old_backup_path, "stale backup", 10)
+
+        memory_id = self.agent.memory.add_memory(
+            conv_id="session_auto_backup",
+            domain_label="general",
+            keywords=["large"],
+            summary="large input",
+            raw_input="x" * 6001,
+            raw_output="done",
+            request_id="req_large_backup",
+        )
+
+        self.assertGreater(memory_id, 0)
+        self.assertFalse(os.path.exists(old_backup_path))
+        retention_status = self.agent.get_retention_status()
+        self.assertEqual(retention_status["last_auto_prune"]["trigger"], "memory_backup")
+
+    def test_auto_prune_check_reports_disabled_state(self):
+        config.retention_auto_prune_enabled = False
+
+        state = {
+            "messages": [HumanMessage(content="hello")],
+            "plan": [],
+            "current_subtask_index": 0,
+            "reflections": [],
+            "global_keywords": [],
+            "failed_tools": {},
+            "request_id": "req_auto_prune_disabled",
+            "session_id": "session_auto_prune_disabled",
+            "session_memory_id": 1,
+            "domain_label": "general",
+            "memory_summaries": [],
+            "retry_counts": {},
+            "replan_counts": {},
+            "blocked": False,
+            "final_response": "",
+        }
+
+        self.agent._persist_state_snapshot("req_auto_prune_disabled", "planning_completed", state, extra={})
+        retention_status = self.agent.get_retention_status()
+        self.assertEqual(retention_status["last_auto_prune_check"]["status"], "skipped_disabled")
+        self.assertEqual(retention_status["last_auto_prune_check"]["reason"], "disabled")
 
 
 class SnapshotResumeTests(unittest.TestCase):
@@ -456,6 +807,55 @@ class SnapshotResumeTests(unittest.TestCase):
         self.assertEqual(result, "resumed from numeric selector")
         self.assertEqual(captured_inputs["current_subtask_index"], 0)
 
+    def test_resume_from_snapshot_can_reroute_from_blocked_state(self):
+        state = {
+            "messages": [HumanMessage(content="book a meeting for tomorrow")],
+            "plan": [{"id": 1, "description": "schedule meeting", "expected_outcome": "meeting booked"}],
+            "current_subtask_index": 0,
+            "reflections": ["Original path was blocked by missing time details."],
+            "global_keywords": ["meeting", "schedule"],
+            "failed_tools": {"0": ["calendar_tool", "calendar_tool"]},
+            "request_id": "req_blocked_resume",
+            "session_id": "session_blocked_resume",
+            "session_memory_id": 1,
+            "domain_label": "Other",
+            "memory_summaries": [],
+            "retry_counts": {"0": 1},
+            "replan_counts": {"0": 1},
+            "blocked": True,
+            "final_response": "Need user intervention.",
+        }
+        self.agent._persist_state_snapshot(
+            "req_blocked_resume",
+            "agent_blocked",
+            state,
+            extra={"query": "book a meeting for tomorrow"},
+        )
+
+        captured_inputs = {}
+
+        class FakeGraph:
+            def invoke(self, inputs):
+                captured_inputs.update(copy.deepcopy(inputs))
+                return {"messages": [AIMessage(content="rerouted ok")]}
+
+        original_graph = self.agent.graph
+        self.agent.graph = FakeGraph()
+        try:
+            result = self.agent.resume_from_snapshot("req_blocked_resume", reroute=True)
+        finally:
+            self.agent.graph = original_graph
+
+        self.assertEqual(result, "rerouted ok")
+        self.assertEqual(captured_inputs["plan"], [])
+        self.assertEqual(captured_inputs["current_subtask_index"], 0)
+        self.assertEqual(captured_inputs["failed_tools"], {})
+        self.assertEqual(captured_inputs["retry_counts"], {})
+        self.assertEqual(captured_inputs["replan_counts"], {})
+        self.assertFalse(captured_inputs["blocked"])
+        self.assertIn("Resume reroute context:", captured_inputs["messages"][0].content)
+        self.assertIn("historical_failed_tools=calendar_toolx2", captured_inputs["messages"][0].content)
+
     def test_resume_from_snapshot_rejects_invalid_state_shape(self):
         request_dir = self.agent.snapshot_store.snapshot_request_dir("req_invalid_snapshot")
         snapshot_path = os.path.join(request_dir, "001_planning_completed.json")
@@ -597,6 +997,76 @@ class SnapshotResumeTests(unittest.TestCase):
         self.assertIn("Snapshot validation failed", result)
         self.assertIn("does not contain resumable message history", result)
 
+    def test_resume_from_snapshot_rejects_out_of_range_retry_state(self):
+        request_dir = self.agent.snapshot_store.snapshot_request_dir("req_bad_retry_state")
+        snapshot_path = os.path.join(request_dir, "001_planning_completed.json")
+        invalid_payload = {
+            "schema_version": 1,
+            "created_at": "2026-03-31T00:00:00+00:00",
+            "stage": "planning_completed",
+            "request_id": "req_bad_retry_state",
+            "state": {
+                "messages": [{"type": "human", "content": "resume me"}],
+                "plan": [{"id": 1, "description": "step one", "expected_outcome": "done"}],
+                "current_subtask_index": 0,
+                "reflections": [],
+                "global_keywords": [],
+                "failed_tools": {},
+                "request_id": "req_bad_retry_state",
+                "session_id": "session_bad_retry_state",
+                "session_memory_id": 0,
+                "domain_label": "general",
+                "memory_summaries": [],
+                "retry_counts": {"3": 1},
+                "replan_counts": {},
+                "blocked": False,
+                "final_response": "",
+            },
+            "extra": {},
+        }
+        with open(snapshot_path, "w", encoding="utf-8") as file_handle:
+            json.dump(invalid_payload, file_handle, ensure_ascii=False, indent=2)
+
+        result = self.agent.resume_from_snapshot("req_bad_retry_state")
+
+        self.assertIn("Snapshot validation failed", result)
+        self.assertIn("retry_counts references out-of-range subtask index", result)
+
+    def test_resume_from_snapshot_rejects_premature_final_response(self):
+        request_dir = self.agent.snapshot_store.snapshot_request_dir("req_premature_final")
+        snapshot_path = os.path.join(request_dir, "001_planning_completed.json")
+        invalid_payload = {
+            "schema_version": 1,
+            "created_at": "2026-03-31T00:00:00+00:00",
+            "stage": "planning_completed",
+            "request_id": "req_premature_final",
+            "state": {
+                "messages": [{"type": "human", "content": "resume me"}],
+                "plan": [{"id": 1, "description": "step one", "expected_outcome": "done"}],
+                "current_subtask_index": 0,
+                "reflections": [],
+                "global_keywords": [],
+                "failed_tools": {},
+                "request_id": "req_premature_final",
+                "session_id": "session_premature_final",
+                "session_memory_id": 0,
+                "domain_label": "general",
+                "memory_summaries": [],
+                "retry_counts": {},
+                "replan_counts": {},
+                "blocked": False,
+                "final_response": "already finished",
+            },
+            "extra": {},
+        }
+        with open(snapshot_path, "w", encoding="utf-8") as file_handle:
+            json.dump(invalid_payload, file_handle, ensure_ascii=False, indent=2)
+
+        result = self.agent.resume_from_snapshot("req_premature_final")
+
+        self.assertIn("Snapshot validation failed", result)
+        self.assertIn("contains final_response before all planned subtasks were completed", result)
+
 
 class RecentRequestFilterTests(unittest.TestCase):
     def setUp(self):
@@ -730,6 +1200,123 @@ class ToolRerouteTests(unittest.TestCase):
         self.assertEqual([item["name"] for item in filtered_skills], [tools[1].name])
         self.assertEqual(failed_names, [tools[0].name])
 
+    def test_summarize_historical_failed_tools_counts_prior_subtasks(self):
+        counts = self.agent.tool_runtime.summarize_historical_failed_tools(
+            {
+                "0": ["tool_a", "tool_b"],
+                "1": ["tool_a"],
+                "2": ["tool_c"],
+            },
+            current_subtask_index=2,
+        )
+
+        self.assertEqual(counts, {"tool_a": 2, "tool_b": 1})
+
+    def test_summarize_historical_failed_tool_signals_aggregates_severity(self):
+        signals = self.agent.tool_runtime.summarize_historical_failed_tool_signals(
+            {
+                "0": {
+                    "tool_a": {
+                        "count": 1,
+                        "retryable_count": 1,
+                        "non_retryable_count": 0,
+                        "error_type_counts": {"timeout": 1},
+                        "severity_score": 3,
+                    },
+                    "tool_b": {
+                        "count": 1,
+                        "retryable_count": 0,
+                        "non_retryable_count": 1,
+                        "error_type_counts": {"invalid_arguments": 1},
+                        "severity_score": 5,
+                    },
+                },
+                "1": {
+                    "tool_a": {
+                        "count": 1,
+                        "retryable_count": 0,
+                        "non_retryable_count": 1,
+                        "error_type_counts": {"execution_error": 1},
+                        "severity_score": 3,
+                    }
+                },
+            },
+            current_subtask_index=2,
+        )
+
+        self.assertEqual(signals["tool_a"]["count"], 2)
+        self.assertEqual(signals["tool_a"]["severity_score"], 6)
+        self.assertEqual(signals["tool_a"]["error_type_counts"], {"timeout": 1, "execution_error": 1})
+        self.assertEqual(signals["tool_b"]["severity_score"], 5)
+
+    def test_filter_failed_tools_for_subtask_excludes_historically_unstable_tools(self):
+        @tool
+        def first_tool() -> str:
+            """First tool."""
+            return "first"
+
+        @tool
+        def second_tool() -> str:
+            """Second tool."""
+            return "second"
+
+        tools = [self.agent._wrap_tool_for_runtime(first_tool), self.agent._wrap_tool_for_runtime(second_tool)]
+        tool_skills = [
+            {"name": tools[0].name, "tool": tools[0], "description": "first"},
+            {"name": tools[1].name, "tool": tools[1], "description": "second"},
+        ]
+
+        filtered_tools, filtered_skills, failed_names = self.agent._filter_failed_tools_for_subtask(
+            2,
+            tools,
+            tool_skills,
+            {"0": [tools[0].name], "1": [tools[0].name]},
+            historical_failed_tools={tools[0].name: 2},
+            historical_failure_threshold=2,
+        )
+
+        self.assertEqual([tool.name for tool in filtered_tools], [tools[1].name])
+        self.assertEqual([item["name"] for item in filtered_skills], [tools[1].name])
+        self.assertEqual(failed_names, [tools[0].name])
+
+    def test_filter_failed_tools_for_subtask_excludes_historically_severe_tools(self):
+        @tool
+        def severe_tool() -> str:
+            """Severe tool."""
+            return "severe"
+
+        @tool
+        def safer_tool() -> str:
+            """Safer tool."""
+            return "safe"
+
+        tools = [self.agent._wrap_tool_for_runtime(severe_tool), self.agent._wrap_tool_for_runtime(safer_tool)]
+        tool_skills = [
+            {"name": tools[0].name, "tool": tools[0], "description": "severe"},
+            {"name": tools[1].name, "tool": tools[1], "description": "safe"},
+        ]
+
+        filtered_tools, filtered_skills, failed_names = self.agent._filter_failed_tools_for_subtask(
+            2,
+            tools,
+            tool_skills,
+            {},
+            historical_failed_tool_signals={
+                tools[0].name: {
+                    "count": 2,
+                    "retryable_count": 1,
+                    "non_retryable_count": 1,
+                    "error_type_counts": {"timeout": 1, "invalid_arguments": 1},
+                    "severity_score": 8,
+                }
+            },
+            historical_failure_severity_threshold=6,
+        )
+
+        self.assertEqual([tool.name for tool in filtered_tools], [tools[1].name])
+        self.assertEqual([item["name"] for item in filtered_skills], [tools[1].name])
+        self.assertEqual(failed_names, [tools[0].name])
+
     def test_build_tool_reroute_plan_uses_alternative_tool_for_retryable_failure(self):
         @tool
         def primary_weather_tool() -> str:
@@ -778,6 +1365,218 @@ class ToolRerouteTests(unittest.TestCase):
         self.assertEqual(reroute_plan["mode"], "fallback_invalid_arguments")
         self.assertEqual(reroute_plan["selected_tools"], [])
         self.assertIn("invalid arguments", reroute_plan["reason"])
+
+    def test_build_tool_reroute_plan_excludes_historically_failed_alternatives(self):
+        @tool
+        def primary_weather_tool() -> str:
+            """Get weather for a city."""
+            return "primary"
+
+        @tool
+        def unstable_backup_tool() -> str:
+            """Backup weather forecast lookup for a city with unstable execution history."""
+            return "unstable"
+
+        @tool
+        def stable_backup_tool() -> str:
+            """Stable backup weather forecast lookup for a city."""
+            return "stable"
+
+        primary = self.agent._wrap_tool_for_runtime(primary_weather_tool)
+        unstable_backup = self.agent._wrap_tool_for_runtime(unstable_backup_tool)
+        stable_backup = self.agent._wrap_tool_for_runtime(stable_backup_tool)
+        self.agent.skills.register_tools([primary, unstable_backup, stable_backup], source_type="test")
+
+        reroute_plan = self.agent._build_tool_reroute_plan(
+            "check weather forecast for beijing",
+            ["weather", "forecast", "beijing"],
+            [primary],
+            [{"name": primary.name, "tool": primary, "description": "primary weather"}],
+            [{"tool": primary.name, "error_type": "timeout", "retryable": True, "message": "timeout"}],
+            [primary.name],
+            historical_failed_tool_names=[unstable_backup.name],
+        )
+
+        self.assertEqual(reroute_plan["mode"], "alternative_tools")
+        self.assertEqual([tool.name for tool in reroute_plan["selected_tools"]], [stable_backup.name])
+        self.assertEqual(reroute_plan["alternatives"], [stable_backup.name])
+
+    def test_reprioritize_tool_skills_deprioritizes_more_severe_history(self):
+        @tool
+        def timeout_prone_tool() -> str:
+            """Backup weather lookup for a city forecast."""
+            return "timeout"
+
+        @tool
+        def cleaner_tool() -> str:
+            """Backup weather lookup for a city forecast."""
+            return "clean"
+
+        timeout_prone = self.agent._wrap_tool_for_runtime(timeout_prone_tool)
+        cleaner = self.agent._wrap_tool_for_runtime(cleaner_tool)
+        tool_skills = [
+            {"name": timeout_prone.name, "tool": timeout_prone, "description": "forecast", "overlap_count": 3, "match_ratio": 0.8, "route_reason": "matched"},
+            {"name": cleaner.name, "tool": cleaner, "description": "forecast", "overlap_count": 3, "match_ratio": 0.8, "route_reason": "matched"},
+        ]
+
+        prioritized = self.agent._reprioritize_tool_skills(
+            tool_skills,
+            historical_failed_tool_signals={
+                timeout_prone.name: {
+                    "count": 1,
+                    "retryable_count": 1,
+                    "non_retryable_count": 0,
+                    "error_type_counts": {"timeout": 1},
+                    "severity_score": 3,
+                },
+                cleaner.name: {
+                    "count": 1,
+                    "retryable_count": 1,
+                    "non_retryable_count": 0,
+                    "error_type_counts": {"cancelled": 1},
+                    "severity_score": 1,
+                },
+            },
+        )
+
+        self.assertEqual([item["name"] for item in prioritized], [cleaner.name, timeout_prone.name])
+        self.assertEqual(prioritized[0]["historical_failure_severity"], 1)
+        self.assertEqual(prioritized[1]["historical_failure_severity"], 3)
+
+    def test_expand_tool_candidates_deprioritizes_historically_failed_tools(self):
+        @tool
+        def lightly_failed_tool() -> str:
+            """Backup weather forecast lookup for a city."""
+            return "light"
+
+        @tool
+        def clean_tool() -> str:
+            """Backup weather forecast lookup for a city."""
+            return "clean"
+
+        light = self.agent._wrap_tool_for_runtime(lightly_failed_tool)
+        clean = self.agent._wrap_tool_for_runtime(clean_tool)
+        self.agent.skills.register_tools([light, clean], source_type="test")
+
+        alternatives = self.agent.tool_runtime.expand_tool_candidates(
+            "check weather forecast for beijing",
+            ["weather", "forecast", "beijing"],
+            failed_tool_names=[],
+            historical_failed_tool_counts={light.name: 1, clean.name: 0},
+            limit=2,
+        )
+
+        self.assertEqual([item["name"] for item in alternatives], [clean.name, light.name])
+        self.assertEqual(alternatives[0]["historical_failure_count"], 0)
+        self.assertEqual(alternatives[1]["historical_failure_count"], 1)
+
+    def test_expand_tool_candidates_prioritizes_lower_severity_before_lower_count(self):
+        @tool
+        def invalid_args_tool() -> str:
+            """Backup weather forecast lookup for a city."""
+            return "invalid"
+
+        @tool
+        def timeout_tool() -> str:
+            """Backup weather forecast lookup for a city."""
+            return "timeout"
+
+        invalid_args = self.agent._wrap_tool_for_runtime(invalid_args_tool)
+        timeout = self.agent._wrap_tool_for_runtime(timeout_tool)
+        self.agent.skills.register_tools([invalid_args, timeout], source_type="test")
+
+        alternatives = self.agent.tool_runtime.expand_tool_candidates(
+            "check weather forecast for beijing",
+            ["weather", "forecast", "beijing"],
+            failed_tool_names=[],
+            historical_failed_tool_counts={invalid_args.name: 1, timeout.name: 2},
+            historical_failed_tool_signals={
+                invalid_args.name: {
+                    "count": 1,
+                    "retryable_count": 0,
+                    "non_retryable_count": 1,
+                    "error_type_counts": {"invalid_arguments": 1},
+                    "severity_score": 5,
+                },
+                timeout.name: {
+                    "count": 2,
+                    "retryable_count": 2,
+                    "non_retryable_count": 0,
+                    "error_type_counts": {"timeout": 2},
+                    "severity_score": 6,
+                },
+            },
+            limit=2,
+        )
+
+        self.assertEqual([item["name"] for item in alternatives], [invalid_args.name, timeout.name])
+        self.assertEqual(alternatives[0]["historical_failure_severity"], 5)
+        self.assertEqual(alternatives[1]["historical_failure_severity"], 6)
+
+    def test_build_tool_reroute_plan_falls_back_when_only_high_risk_alternatives_remain(self):
+        @tool
+        def primary_weather_tool() -> str:
+            """Get weather for a city."""
+            return "primary"
+
+        @tool
+        def risky_backup_tool() -> str:
+            """Backup weather forecast lookup for a city."""
+            return "risky"
+
+        primary = self.agent._wrap_tool_for_runtime(primary_weather_tool)
+        risky_backup = self.agent._wrap_tool_for_runtime(risky_backup_tool)
+        self.agent.skills.register_tools([primary, risky_backup], source_type="test")
+
+        reroute_plan = self.agent._build_tool_reroute_plan(
+            "check weather forecast for beijing",
+            ["weather", "forecast", "beijing"],
+            [primary],
+            [{"name": primary.name, "tool": primary, "description": "primary weather"}],
+            [{"tool": primary.name, "error_type": "timeout", "retryable": True, "message": "timeout"}],
+            [primary.name],
+            historical_failed_tool_names=[risky_backup.name],
+            historical_failed_tool_counts={risky_backup.name: 2},
+            historical_failed_tool_signals={
+                risky_backup.name: {
+                    "count": 2,
+                    "retryable_count": 1,
+                    "non_retryable_count": 1,
+                    "error_type_counts": {"timeout": 1, "invalid_arguments": 1},
+                    "severity_score": 8,
+                }
+            },
+            historical_failure_severity_threshold=6,
+        )
+
+        self.assertEqual(reroute_plan["mode"], "fallback_high_risk_history")
+        self.assertEqual(reroute_plan["selected_tools"], [])
+        self.assertIn(risky_backup.name, reroute_plan["reason"])
+
+    def test_build_no_tool_guidance_prefers_ask_user_for_invalid_arguments(self):
+        guidance = self.agent._build_no_tool_guidance(
+            "fallback_invalid_arguments",
+            recent_failures=[{"error_type": "invalid_arguments", "retryable": False, "message": "missing city"}],
+        )
+
+        self.assertIn("Do not guess missing tool arguments", guidance)
+        self.assertIn("Ask the user explicitly", guidance)
+
+    def test_build_no_tool_guidance_prefers_safe_direct_answer_for_high_risk_history(self):
+        guidance = self.agent._build_no_tool_guidance(
+            "fallback_high_risk_history",
+            recent_failures=[{"error_type": "timeout", "retryable": True, "message": "timeout"}],
+            reroute_reason="historical failure severity marked the available tool route as unsafe",
+        )
+
+        self.assertIn("Do not call tools", guidance)
+        self.assertIn("Provide a direct answer only if it can be produced safely", guidance)
+
+    def test_build_no_tool_guidance_is_available_without_recent_failures(self):
+        guidance = self.agent._build_no_tool_guidance("normal", recent_failures=[])
+
+        self.assertIn("provide the best direct answer without tools", guidance.lower())
+        self.assertIn("ask the user", guidance.lower())
 
 
 class RequestCancellationTests(unittest.TestCase):
@@ -933,6 +1732,19 @@ class ObservabilityTests(unittest.TestCase):
             "planning_completed",
             details="subtask_count=1",
             request_id=request_id,
+            duration_ms=12.5,
+        )
+        self.llm_manager_module.llm_manager.log_checkpoint(
+            "subtask_started",
+            details="index=1",
+            request_id=request_id,
+            duration_ms=7.25,
+        )
+        self.llm_manager_module.llm_manager.log_checkpoint(
+            "reflection_completed",
+            details="success=True",
+            request_id=request_id,
+            duration_ms=3.0,
         )
 
         summary = self.agent.get_request_summary(request_id)
@@ -943,10 +1755,18 @@ class ObservabilityTests(unittest.TestCase):
         self.assertEqual(summary["final_response"], "all done")
         self.assertEqual(summary["snapshot_count"], 2)
         self.assertEqual(summary["memory_count"], 2)
-        self.assertEqual(summary["checkpoint_count"], 1)
-        self.assertEqual(summary["checkpoints"][0]["stage"], "planning_completed")
+        self.assertEqual(summary["checkpoint_count"], 3)
+        self.assertEqual(
+            [item["stage"] for item in summary["checkpoints"]],
+            ["planning_completed", "subtask_started", "reflection_completed"],
+        )
         self.assertFalse(summary["triage"]["needs_attention"])
         self.assertFalse(summary["triage"]["is_resumed"])
+        self.assertEqual(summary["metrics"]["tool_detached_count"], 0)
+        self.assertFalse(summary["triage"]["has_detached_tools"])
+        self.assertEqual(summary["metrics"]["stage_duration_ms"]["planning"], 12.5)
+        self.assertEqual(summary["metrics"]["stage_duration_ms"]["subtask"], 7.25)
+        self.assertEqual(summary["metrics"]["stage_duration_ms"]["reflection"], 3.0)
 
     def test_structured_logs_are_written_as_json_events(self):
         request_id = "req_json_log"
@@ -1014,6 +1834,338 @@ class ObservabilityTests(unittest.TestCase):
         self.assertEqual(summary["triage"]["latest_failure_stage"], "agent_blocked")
         self.assertIn("retry_limit", summary["triage"]["latest_failure_details"])
         self.assertEqual(summary["triage"]["tool_attention_count"], 1)
+
+    def test_request_summary_triage_surfaces_reroute_fallback_mode(self):
+        request_id = "req_triage_reroute"
+        state = {
+            "messages": [HumanMessage(content="hello")],
+            "plan": [{"id": 1, "description": "step one", "expected_outcome": "done"}],
+            "current_subtask_index": 0,
+            "reflections": [],
+            "global_keywords": ["hello"],
+            "failed_tools": {"0": ["weather_tool"]},
+            "request_id": request_id,
+            "session_id": "session_triage_reroute",
+            "session_memory_id": 1,
+            "domain_label": "general",
+            "memory_summaries": [],
+            "retry_counts": {"0": 1},
+            "replan_counts": {},
+            "blocked": False,
+            "final_response": "",
+        }
+
+        self.agent._persist_state_snapshot(request_id, "subtask_prepared", state, extra={})
+        self.llm_manager_module.llm_manager.log_checkpoint(
+            "tool_reroute_applied",
+            details="index=1 | mode=fallback_high_risk_history | failed_tools=weather_tool",
+            request_id=request_id,
+            level=logging.ERROR,
+            mode="fallback_high_risk_history",
+        )
+
+        summary = self.agent.get_request_summary(request_id)
+
+        self.assertEqual(summary["triage"]["latest_reroute_mode"], "fallback_high_risk_history")
+        self.assertTrue(summary["triage"]["used_no_tool_fallback"])
+        self.assertIn("mode=fallback_high_risk_history", summary["triage"]["latest_reroute_details"])
+
+    def test_request_summary_surfaces_detached_tool_attention(self):
+        request_id = "req_detached_tool_attention"
+        state = {
+            "messages": [HumanMessage(content="hello")],
+            "plan": [{"id": 1, "description": "step one", "expected_outcome": "done"}],
+            "current_subtask_index": 1,
+            "reflections": ["complete"],
+            "global_keywords": ["hello"],
+            "failed_tools": {},
+            "request_id": request_id,
+            "session_id": "session_detached",
+            "session_memory_id": 1,
+            "domain_label": "general",
+            "memory_summaries": [],
+            "retry_counts": {},
+            "replan_counts": {},
+            "blocked": False,
+            "final_response": "completed with detached tool cleanup pending",
+        }
+
+        self.agent._persist_state_snapshot(request_id, "request_completed", state, extra={"final_output": state["final_response"]})
+        self.llm_manager_module.llm_manager.log_checkpoint(
+            "tool_detached",
+            details="tool=slow_tool | reason=timeout | tool_run_id=toolrun_000001",
+            request_id=request_id,
+            level=logging.ERROR,
+        )
+
+        summary = self.agent.get_request_summary(request_id)
+
+        self.assertEqual(summary["status"], "completed")
+        self.assertEqual(summary["metrics"]["tool_detached_count"], 1)
+        self.assertTrue(summary["triage"]["needs_attention"])
+        self.assertTrue(summary["triage"]["has_detached_tools"])
+        self.assertEqual(summary["triage"]["detached_tool_count"], 1)
+        self.assertEqual(summary["triage"]["latest_failure_stage"], "tool_detached")
+        self.assertEqual(len(summary["detached_tools"]), 1)
+        self.assertEqual(summary["detached_tools"][0]["tool_name"], "slow_tool")
+        self.assertEqual(summary["detached_tools"][0]["reason"], "timeout")
+        self.assertEqual(summary["detached_tools"][0]["tool_run_id"], "toolrun_000001")
+
+    def test_request_summary_merges_runtime_detached_tool_details(self):
+        request_id = "req_runtime_detached"
+        state = {
+            "messages": [HumanMessage(content="hello")],
+            "plan": [{"id": 1, "description": "step one", "expected_outcome": "done"}],
+            "current_subtask_index": 0,
+            "reflections": [],
+            "global_keywords": ["hello"],
+            "failed_tools": {},
+            "request_id": request_id,
+            "session_id": "session_runtime_detached",
+            "session_memory_id": 1,
+            "domain_label": "general",
+            "memory_summaries": [],
+            "retry_counts": {},
+            "replan_counts": {},
+            "blocked": False,
+            "final_response": "",
+        }
+
+        self.agent._persist_state_snapshot(request_id, "subtask_started", state, extra={})
+        self.agent.tool_runtime._tracked_tool_runs["toolrun_runtime_1"] = {
+            "tool_name": "slow_tool",
+            "request_id": request_id,
+            "executor": None,
+            "future": None,
+            "started_at": time.monotonic() - 0.2,
+            "status": "detached",
+            "detached_reason": "cancelled",
+            "detached_at": time.monotonic() - 0.1,
+        }
+
+        summary = self.agent.get_request_summary(request_id)
+
+        self.assertEqual(len(summary["detached_tools"]), 1)
+        self.assertEqual(summary["detached_tools"][0]["tool_run_id"], "toolrun_runtime_1")
+        self.assertEqual(summary["detached_tools"][0]["source"], "runtime")
+        self.assertEqual(summary["detached_tools"][0]["reason"], "cancelled")
+        self.assertEqual(summary["triage"]["detached_tool_count"], 0)
+
+    def test_request_rollup_aggregates_recent_request_metrics(self):
+        base_state = {
+            "messages": [HumanMessage(content="hello")],
+            "plan": [{"id": 1, "description": "step one", "expected_outcome": "done"}],
+            "current_subtask_index": 1,
+            "reflections": ["complete"],
+            "global_keywords": ["hello"],
+            "failed_tools": {},
+            "session_memory_id": 1,
+            "domain_label": "general",
+            "memory_summaries": [],
+            "retry_counts": {},
+            "replan_counts": {},
+            "blocked": False,
+            "final_response": "done",
+        }
+
+        state_completed = dict(base_state, request_id="req_rollup_completed", session_id="session_rollup_a")
+        state_failed = dict(base_state, request_id="req_rollup_failed", session_id="session_rollup_b", blocked=True, retry_counts={"0": 2})
+
+        self.agent._persist_state_snapshot("req_rollup_completed", "request_completed", state_completed, extra={"final_output": "done"})
+        self.agent._persist_state_snapshot(
+            "req_rollup_failed",
+            "agent_blocked",
+            state_failed,
+            extra={"source_request_id": "req_original_rollup"},
+        )
+
+        self.llm_manager_module.llm_manager.log_checkpoint(
+            "planning_completed",
+            details="subtask_count=1",
+            request_id="req_rollup_completed",
+            duration_ms=10.0,
+        )
+        self.llm_manager_module.llm_manager.log_checkpoint(
+            "reflection_completed",
+            details="success=True",
+            request_id="req_rollup_completed",
+            duration_ms=5.0,
+        )
+        self.llm_manager_module.llm_manager.log_checkpoint(
+            "tool_detached",
+            details="tool=slow_tool | reason=timeout | tool_run_id=toolrun_rollup_1",
+            request_id="req_rollup_failed",
+            duration_ms=20.0,
+            level=logging.ERROR,
+        )
+        self.llm_manager_module.llm_manager.log_checkpoint(
+            "tool_reroute_applied",
+            details="index=1 | mode=fallback_high_risk_history | failed_tools=slow_tool",
+            request_id="req_rollup_failed",
+            level=logging.ERROR,
+            mode="fallback_high_risk_history",
+        )
+        self.llm_manager_module.llm_manager.log_checkpoint(
+            "reflection_completed",
+            details="success=False",
+            request_id="req_rollup_failed",
+            duration_ms=4.0,
+        )
+
+        rollup = self.agent.get_request_rollup(limit=10)
+
+        self.assertEqual(rollup["request_count"], 2)
+        self.assertEqual(rollup["status_counts"]["completed"], 1)
+        self.assertEqual(rollup["status_counts"]["blocked"], 1)
+        self.assertEqual(rollup["resumed_count"], 1)
+        self.assertEqual(rollup["needs_attention_count"], 1)
+        self.assertEqual(rollup["totals"]["tool_detached_count"], 1)
+        self.assertEqual(rollup["totals"]["retry_count"], 2)
+        self.assertEqual(rollup["totals"]["reflection_failure_count"], 1)
+        self.assertEqual(rollup["stage_duration_ms_total"]["planning"], 10.0)
+        self.assertEqual(rollup["stage_duration_ms_total"]["reflection"], 9.0)
+        self.assertEqual(rollup["stage_duration_ms_total"]["tool"], 20.0)
+        self.assertEqual(rollup["top_failure_signals"]["stages"][0], ("tool_detached", 1))
+        self.assertEqual(rollup["top_failure_signals"]["tools"][0], ("slow_tool", 1))
+        self.assertEqual(rollup["top_failure_signals"]["reasons"][0], ("timeout", 1))
+        self.assertEqual(rollup["top_failure_signals"]["reroute_modes"][0], ("fallback_high_risk_history", 1))
+        self.assertEqual(rollup["top_failure_signals"]["no_tool_fallbacks"][0], ("used", 1))
+        self.assertEqual(rollup["top_failure_combinations"]["stage_tool"][0], ("tool_detached+slow_tool", 1))
+        self.assertEqual(rollup["top_failure_combinations"]["tool_reason"][0], ("slow_tool+timeout", 1))
+        self.assertEqual(rollup["top_failure_combinations"]["stage_reroute"][0], ("tool_detached+fallback_high_risk_history", 1))
+
+    def test_request_rollup_supports_status_and_attention_filters(self):
+        base_state = {
+            "messages": [HumanMessage(content="hello")],
+            "plan": [{"id": 1, "description": "step one", "expected_outcome": "done"}],
+            "current_subtask_index": 1,
+            "reflections": ["complete"],
+            "global_keywords": ["hello"],
+            "failed_tools": {},
+            "session_memory_id": 1,
+            "domain_label": "general",
+            "memory_summaries": [],
+            "retry_counts": {},
+            "replan_counts": {},
+            "blocked": False,
+            "final_response": "done",
+        }
+
+        self.agent._persist_state_snapshot(
+            "req_rollup_completed_filter",
+            "request_completed",
+            dict(base_state, request_id="req_rollup_completed_filter", session_id="session_filter_a"),
+            extra={"final_output": "done"},
+        )
+        self.agent._persist_state_snapshot(
+            "req_rollup_failed_filter",
+            "agent_blocked",
+            dict(base_state, request_id="req_rollup_failed_filter", session_id="session_filter_b", blocked=True),
+            extra={"source_request_id": "req_original_filter"},
+        )
+
+        self.llm_manager_module.llm_manager.log_checkpoint(
+            "tool_detached",
+            details="tool=slow_tool | reason=timeout | tool_run_id=toolrun_rollup_filter_1",
+            request_id="req_rollup_failed_filter",
+            level=logging.ERROR,
+            duration_ms=11.0,
+        )
+
+        rollup = self.agent.get_request_rollup(
+            limit=10,
+            statuses=["blocked"],
+            resumed_only=True,
+            attention_only=True,
+        )
+
+        self.assertEqual(rollup["request_count"], 1)
+        self.assertEqual(rollup["status_counts"], {"blocked": 1})
+        self.assertEqual(rollup["resumed_count"], 1)
+        self.assertEqual(rollup["needs_attention_count"], 1)
+        self.assertEqual(rollup["filters"]["statuses"], ["blocked"])
+        self.assertTrue(rollup["filters"]["resumed_only"])
+        self.assertTrue(rollup["filters"]["attention_only"])
+        self.assertEqual(rollup["top_failure_signals"]["stages"][0], ("tool_detached", 1))
+        self.assertEqual(rollup["top_failure_combinations"]["stage_tool"][0], ("tool_detached+slow_tool", 1))
+
+    def test_request_rollup_aggregates_repeated_failure_combinations(self):
+        base_state = {
+            "messages": [HumanMessage(content="hello")],
+            "plan": [{"id": 1, "description": "step one", "expected_outcome": "done"}],
+            "current_subtask_index": 1,
+            "reflections": ["complete"],
+            "global_keywords": ["hello"],
+            "failed_tools": {},
+            "session_memory_id": 1,
+            "domain_label": "general",
+            "memory_summaries": [],
+            "retry_counts": {},
+            "replan_counts": {},
+            "blocked": True,
+            "final_response": "",
+        }
+
+        for request_id in ("req_combo_1", "req_combo_2"):
+            self.agent._persist_state_snapshot(
+                request_id,
+                "agent_blocked",
+                dict(base_state, request_id=request_id, session_id=request_id),
+                extra={},
+            )
+            self.llm_manager_module.llm_manager.log_checkpoint(
+                "tool_detached",
+                details="tool=slow_tool | reason=timeout | tool_run_id=" + request_id,
+                request_id=request_id,
+                level=logging.ERROR,
+            )
+
+        rollup = self.agent.get_request_rollup(limit=10, attention_only=True)
+
+        self.assertEqual(rollup["request_count"], 2)
+        self.assertEqual(rollup["top_failure_combinations"]["stage_tool"][0], ("tool_detached+slow_tool", 2))
+        self.assertEqual(rollup["top_failure_combinations"]["tool_reason"][0], ("slow_tool+timeout", 2))
+
+    def test_recent_request_summaries_support_since_seconds_filter(self):
+        base_state = {
+            "messages": [HumanMessage(content="hello")],
+            "plan": [{"id": 1, "description": "step one", "expected_outcome": "done"}],
+            "current_subtask_index": 1,
+            "reflections": ["complete"],
+            "global_keywords": ["hello"],
+            "failed_tools": {},
+            "session_memory_id": 1,
+            "domain_label": "general",
+            "memory_summaries": [],
+            "retry_counts": {},
+            "replan_counts": {},
+            "blocked": False,
+            "final_response": "done",
+        }
+
+        self.agent._persist_state_snapshot(
+            "req_recent_old",
+            "request_completed",
+            dict(base_state, request_id="req_recent_old", session_id="session_old"),
+            extra={"final_output": "done"},
+        )
+        self.agent._persist_state_snapshot(
+            "req_recent_new",
+            "request_completed",
+            dict(base_state, request_id="req_recent_new", session_id="session_new"),
+            extra={"final_output": "done"},
+        )
+
+        old_snapshot_path = pathlib.Path(self.agent._resolve_snapshot_path("req_recent_old"))
+        old_payload = json.loads(old_snapshot_path.read_text(encoding="utf-8"))
+        old_payload["created_at"] = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+        old_snapshot_path.write_text(json.dumps(old_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        summaries = self.agent.get_recent_request_summaries(limit=10, since_seconds=1800)
+
+        summary_ids = [item["request_id"] for item in summaries]
+        self.assertIn("req_recent_new", summary_ids)
+        self.assertNotIn("req_recent_old", summary_ids)
 
 
 if __name__ == "__main__":

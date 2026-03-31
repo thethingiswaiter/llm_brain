@@ -29,13 +29,19 @@
 
 ## 当前状态
 
-项目仍处于原型阶段，但已经不只是最小骨架。当前已经打通 CLI 到 Agent 的完整主链，并具备任务拆解、反思推进、记忆落盘与召回、统一技能路由、请求级日志追踪、运行时快照恢复，以及配置式 MCP 工具和真实 MCP stdio server 接入能力。当前测试套件维持在 70 个 unittest 用例通过。
+项目仍处于原型阶段，但已经不只是最小骨架。当前已经打通 CLI 到 Agent 的完整主链，并具备任务拆解、反思推进、记忆落盘与召回、统一技能路由、请求级日志追踪、运行时快照恢复，以及配置式 MCP 工具和真实 MCP stdio server 接入能力。当前测试套件维持在 125 个 unittest 用例通过。
 
 ## 运行说明
 
 1. 根据 `config.json` 准备模型配置，默认走本地 Ollama。
 2. 安装项目依赖。
 3. 运行 `python cli.py` 启动命令行交互。
+
+补充说明：
+
+- 当前依赖需要 Python 3.10+。
+- 如果本机当前 Python 环境里已有旧版 LangChain 相关依赖，建议执行一次 `python -m pip install -U -r requirements.txt`，避免 `langchain-core`、`langchain-ollama` 等包版本漂移导致导入错误。
+- 当前仓库已完成一次验证，结果为 `Ran 125 tests ... OK`。
 
 ### CLI 命令
 - `/load_skill <skill_name.py|skill_name.md>` 动态加载本地技能文件。
@@ -45,9 +51,34 @@
 - `/unload_mcp <server_name|source>` 卸载某个 MCP server，并移除其工具。
 - `/cancel_request <request_id>` 对活跃请求发起协作式取消。
 - `/list_snapshots <request_id>` 查看某次请求的可用恢复点。
-- `/resume_snapshot <request_id> [latest|index|stage|snapshot_file]` 从运行时快照恢复继续执行。
+- `/resume_snapshot <request_id> [latest|index|stage|snapshot_file] [reroute]` 从运行时快照恢复；带 `reroute` 时会丢弃旧 plan，基于恢复点上下文重新规划更安全的路径。
 - `/request_summary <request_id>` 聚合查看该次请求的状态、快照、关键 checkpoint 和关联 memory。
-- `/recent_requests [limit]` 查看最近若干次请求的状态和关键指标摘要。
+- `/recent_requests [limit] [status=failed,blocked,...] [resumed] [attention] [since=30m]` 查看最近若干次请求的状态、关键指标和 attention 原因摘要；当 failure details 可解析时会直接显示 tool、reason、error_type 或 action。
+- `/failed_requests [limit] [status=failed,blocked,timed_out,cancelled,...] [resumed] [attention] [since=30m]` 作为失败导向的 recent 查询别名，默认聚焦失败、阻断、超时和取消请求。
+- `/resumed_requests [limit] [status=failed,blocked,...] [attention] [since=30m]` 作为恢复请求的 recent 查询别名，默认聚焦 resumed 请求。
+- `/request_rollup [limit] [status=failed,blocked,...] [resumed] [attention] [since=30m]` 查看最近若干次请求的全局聚合统计，并支持筛选。
+- `/failure_memories [limit] [keywords...]` 单独查看失败案例记忆，优先返回 blocked、retry、timeout、ask_user 等 failure_case 记录。
+- `/retention_status` 查看 logs、snapshots、audit logs 和 memory backups 的 retention 覆盖范围、可回收体积、最近一次自动 prune 摘要，以及最近一次自动 prune 跳过原因。
+- `/prune_runtime_data [apply]` 先 dry-run 预览、再按 retention 配置清理过期 logs、snapshots、audit logs 和 memory backups。
+
+当前 request_rollup 还会补两类排障摘要：Top failures 会优先显示最常见的 failure stage、tool、reason、error_type 和 action；Failure combos 会补最常见的 stage+tool 与 tool+reason 组合热点。
+
+当前记忆层已开始把失败步骤单独沉淀为 failure_case 视图，便于把 blocked、ask_user、retry 和 timeout 经验与成功经验分开检索。
+
+当前 reroute 也已开始使用同一请求内的跨子任务失败历史：当某个工具在前序步骤里重复失败到阈值后，后续子任务会优先避开它；在多个备选工具都可用时，也会优先选择历史失败更少的候选。
+
+当前恢复执行还新增了显式 reroute 模式：对 blocked 或中途中断的快照，可以不沿用旧 plan，而是把恢复点上下文、失败工具摘要和近期反思重新交给 planner，改走新的更安全路径。
+
+当前这层历史失败信号又进一步细化为结构化严重度：timeout、dependency_unavailable、invalid_arguments 等类型会累计成 severity 分数，既会影响 reroute 备选工具排序，也会直接影响当前子任务建议工具的优先级。
+
+当某个工具的历史 failure severity 超过阈值时，系统现在会直接把它从当前候选和 reroute 备选里排除；如果剩余工具都不安全，则会明确降级到无工具路径，而不是继续在高风险工具之间反复切换。
+
+当前 no-tool 降级提示也更明确了：对 invalid_arguments 这类缺参型失败，会明确引导 ask-user；对高风险历史或无安全工具可用的场景，则优先引导在现有上下文内给出安全的 direct answer，只有在确实缺外部信息或副作用执行能力时才追问用户。
+
+这些策略信号现在也进入了 request_summary 和 recent_requests：除了 failure stage 外，还会直接暴露最近一次 reroute mode，便于快速识别 fallback_high_risk_history 这类 no-tool 降级是否发生。
+
+当前 runtime retention 基线已覆盖 logs、state snapshots、system MCP audit logs 和 memory backups，默认同时支持 retention_days、max_files 或 max_request_dirs，以及 max_bytes 三类上限控制，并提供 dry-run 清理入口。
+另外已补一层低频自动 prune：快照落盘和大输入备份写入后会按 retention_auto_prune_min_interval_seconds 做节流清理，避免每次写入都重复扫描。
 
 ### AGENT
 

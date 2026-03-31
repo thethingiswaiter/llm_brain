@@ -10,6 +10,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
+if str(WORKSPACE_ROOT) not in sys.path:
+    sys.path.insert(0, str(WORKSPACE_ROOT))
+
+from config import config
+
 try:
     from mcp.server.fastmcp import FastMCP
 except ImportError:
@@ -17,8 +23,7 @@ except ImportError:
 
 
 SERVER_NAME = "llm-brain-system-tools"
-WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
-AUDIT_LOG_PATH = WORKSPACE_ROOT / "runtime_state" / "audit" / "system_mcp_audit.jsonl"
+AUDIT_LOG_PATH = Path(config.resolve_path(config.audit_log_dir)) / "system_mcp_audit.jsonl"
 DEFAULT_TIMEOUT_SECONDS = 20
 MAX_OUTPUT_CHARS = 12000
 MAX_DIRECTORY_ENTRIES = 200

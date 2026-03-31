@@ -16,10 +16,12 @@ class MemoryManager:
         "timeout": -2,
         "pending": 0,
     }
+    FAILURE_TAGS = {"retry", "ask_user", "blocked", "cancelled", "timeout"}
 
-    def __init__(self, db_path: str = None, backup_dir: str = None):
+    def __init__(self, db_path: str = None, backup_dir: str = None, retention_callback=None):
         self.db_path = config.resolve_path(db_path or config.memory_db_path)
         self.backup_dir = config.resolve_path(backup_dir or config.memory_backup_dir)
+        self.retention_callback = retention_callback
         self._init_db()
 
     def _normalize_text_for_dedup(self, value: str) -> str:
@@ -91,6 +93,11 @@ class MemoryManager:
     def _quality_score(self, quality_tags: list[str]) -> int:
         return sum(self.QUALITY_PRIORITY.get(tag, 0) for tag in self._normalize_quality_tags(quality_tags))
 
+    def _is_failure_memory(self, memory_type: str, quality_tags: list[str]) -> bool:
+        normalized_type = str(memory_type or "").strip().lower()
+        normalized_tags = set(self._normalize_quality_tags(quality_tags))
+        return normalized_type == "failure_case" or bool(normalized_tags & self.FAILURE_TAGS)
+
     def _ensure_column(self, cursor, table_name: str, column_name: str, column_definition: str):
         cursor.execute(f"PRAGMA table_info({table_name})")
         columns = {row[1] for row in cursor.fetchall()}
@@ -138,6 +145,8 @@ class MemoryManager:
             with open(large_file_path, "w", encoding="utf-8") as f:
                 f.write(raw_input)
             raw_input = "[Saved to external file]"
+            if callable(self.retention_callback):
+                self.retention_callback(trigger="memory_backup")
 
         conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
@@ -290,6 +299,29 @@ class MemoryManager:
                 reverse=True,
             )
         return ranked_results[:limit]
+
+    def retrieve_failure_memories(
+        self,
+        match_keywords=None,
+        limit: int = 5,
+        exclude_conv_id: Optional[str] = None,
+        exclude_ids: Optional[list] = None,
+    ):
+        results = self.retrieve_memory(
+            match_keywords=match_keywords,
+            limit=max(limit * 3, limit),
+            exclude_conv_id=exclude_conv_id,
+            exclude_ids=exclude_ids,
+        )
+        failure_results = [
+            item for item in results
+            if self._is_failure_memory(item.get("memory_type", ""), item.get("quality_tags", []))
+        ]
+        failure_results.sort(
+            key=lambda item: (item.get("overlap_count", 0), -item.get("quality_score", 0), item.get("weight", 0), item.get("id", 0)),
+            reverse=True,
+        )
+        return failure_results[:limit]
 
     def load_full_memory(self, memory_id: int):
         """Second-stage: Load full details if summary is not enough."""
