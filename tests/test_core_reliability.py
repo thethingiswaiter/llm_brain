@@ -1870,6 +1870,43 @@ class ObservabilityTests(unittest.TestCase):
         self.assertTrue(summary["triage"]["used_no_tool_fallback"])
         self.assertIn("mode=fallback_high_risk_history", summary["triage"]["latest_reroute_details"])
 
+    def test_request_summary_triage_backfills_failure_details_from_snapshot_extra(self):
+        request_id = "req_triage_dependency_extra"
+        state = {
+            "messages": [HumanMessage(content="hello")],
+            "plan": [{"id": 1, "description": "step one", "expected_outcome": "done"}],
+            "current_subtask_index": 0,
+            "reflections": [],
+            "global_keywords": ["hello"],
+            "failed_tools": {},
+            "request_id": request_id,
+            "session_id": "session_triage_dependency",
+            "session_memory_id": 1,
+            "domain_label": "general",
+            "memory_summaries": [],
+            "retry_counts": {},
+            "replan_counts": {},
+            "blocked": False,
+            "final_response": "",
+        }
+
+        self.agent._persist_state_snapshot(
+            request_id,
+            "request_failed",
+            state,
+            extra={
+                "error_type": "dependency_unavailable",
+                "error": "LLM dependency unavailable: ollama connection refused",
+            },
+        )
+
+        summary = self.agent.get_request_summary(request_id)
+
+        self.assertEqual(summary["status"], "failed")
+        self.assertEqual(summary["triage"]["latest_failure_stage"], "request_failed")
+        self.assertIn("error_type=dependency_unavailable", summary["triage"]["latest_failure_details"])
+        self.assertIn("ollama connection refused", summary["triage"]["latest_failure_details"])
+
     def test_request_summary_surfaces_detached_tool_attention(self):
         request_id = "req_detached_tool_attention"
         state = {
@@ -2028,11 +2065,200 @@ class ObservabilityTests(unittest.TestCase):
         self.assertEqual(rollup["top_failure_signals"]["stages"][0], ("tool_detached", 1))
         self.assertEqual(rollup["top_failure_signals"]["tools"][0], ("slow_tool", 1))
         self.assertEqual(rollup["top_failure_signals"]["reasons"][0], ("timeout", 1))
+        self.assertEqual(rollup["top_failure_signals"]["sources"][0], ("tool_runtime", 1))
         self.assertEqual(rollup["top_failure_signals"]["reroute_modes"][0], ("fallback_high_risk_history", 1))
         self.assertEqual(rollup["top_failure_signals"]["no_tool_fallbacks"][0], ("used", 1))
+        self.assertEqual(rollup["source_bucket_breakdown"][0]["source"], "tool_runtime")
+        self.assertEqual(rollup["source_bucket_breakdown"][0]["count"], 1)
+        self.assertEqual(rollup["source_bucket_breakdown"][0]["share"], 1.0)
         self.assertEqual(rollup["top_failure_combinations"]["stage_tool"][0], ("tool_detached+slow_tool", 1))
         self.assertEqual(rollup["top_failure_combinations"]["tool_reason"][0], ("slow_tool+timeout", 1))
+        self.assertEqual(rollup["top_failure_combinations"]["stage_source"][0], ("tool_detached+tool_runtime", 1))
         self.assertEqual(rollup["top_failure_combinations"]["stage_reroute"][0], ("tool_detached+fallback_high_risk_history", 1))
+
+    def test_request_rollup_aggregates_dependency_failure_from_snapshot_extra(self):
+        completed_state = {
+            "messages": [HumanMessage(content="hello")],
+            "plan": [{"id": 1, "description": "step one", "expected_outcome": "done"}],
+            "current_subtask_index": 1,
+            "reflections": ["complete"],
+            "global_keywords": ["hello"],
+            "failed_tools": {},
+            "session_memory_id": 1,
+            "domain_label": "general",
+            "memory_summaries": [],
+            "retry_counts": {},
+            "replan_counts": {},
+            "blocked": False,
+            "final_response": "done",
+            "request_id": "req_rollup_dep_completed",
+            "session_id": "session_rollup_dep_a",
+        }
+        failed_state = dict(
+            completed_state,
+            request_id="req_rollup_dep_failed",
+            session_id="session_rollup_dep_b",
+            current_subtask_index=0,
+            reflections=[],
+            final_response="",
+        )
+
+        self.agent._persist_state_snapshot(
+            "req_rollup_dep_completed",
+            "request_completed",
+            completed_state,
+            extra={"final_output": "done"},
+        )
+        self.agent._persist_state_snapshot(
+            "req_rollup_dep_failed",
+            "request_failed",
+            failed_state,
+            extra={
+                "error_type": "dependency_unavailable",
+                "error": "LLM dependency unavailable: ollama connection refused",
+            },
+        )
+        self.llm_manager_module.llm_manager.log_structured_event(
+            "agent_request",
+            message="Agent request failed due to unavailable model dependency",
+            request_id="req_rollup_dep_failed",
+            session_id="session_rollup_dep_b",
+            stage="request_failed",
+            source="agent.invoke",
+            outcome="failed",
+            error_type="dependency_unavailable",
+            error="LLM dependency unavailable: ollama connection refused",
+        )
+
+        rollup = self.agent.get_request_rollup(limit=10, attention_only=True)
+
+        self.assertEqual(rollup["request_count"], 1)
+        self.assertEqual(rollup["top_failure_signals"]["stages"][0], ("request_failed", 1))
+        self.assertEqual(rollup["top_failure_signals"]["error_types"][0], ("dependency_unavailable", 1))
+        self.assertEqual(rollup["top_failure_signals"]["sources"][0], ("agent_invoke", 1))
+        self.assertEqual(rollup["source_bucket_breakdown"][0]["source"], "agent_invoke")
+        self.assertEqual(rollup["source_bucket_breakdown"][0]["share"], 1.0)
+        self.assertEqual(rollup["top_failure_combinations"]["stage_source"][0], ("request_failed+agent_invoke", 1))
+
+    def test_request_rollup_builds_source_bucket_distribution(self):
+        base_state = {
+            "messages": [HumanMessage(content="hello")],
+            "plan": [{"id": 1, "description": "step one", "expected_outcome": "done"}],
+            "current_subtask_index": 1,
+            "reflections": ["complete"],
+            "global_keywords": ["hello"],
+            "failed_tools": {},
+            "session_memory_id": 1,
+            "domain_label": "general",
+            "memory_summaries": [],
+            "retry_counts": {},
+            "replan_counts": {},
+            "blocked": True,
+            "final_response": "",
+        }
+
+        self.agent._persist_state_snapshot(
+            "req_source_bucket_a",
+            "agent_blocked",
+            dict(base_state, request_id="req_source_bucket_a", session_id="session_source_bucket_a"),
+            extra={},
+        )
+        self.agent._persist_state_snapshot(
+            "req_source_bucket_b",
+            "request_failed",
+            dict(base_state, request_id="req_source_bucket_b", session_id="session_source_bucket_b", blocked=False),
+            extra={"error_type": "dependency_unavailable", "error": "missing provider"},
+        )
+        self.llm_manager_module.llm_manager.log_checkpoint(
+            "tool_detached",
+            details="tool=slow_tool | reason=timeout | tool_run_id=toolrun_source_bucket_a",
+            request_id="req_source_bucket_a",
+            level=logging.ERROR,
+        )
+        self.llm_manager_module.llm_manager.log_structured_event(
+            "agent_request",
+            message="Agent request failed due to unavailable model dependency",
+            request_id="req_source_bucket_b",
+            session_id="session_source_bucket_b",
+            stage="request_failed",
+            source="agent.invoke",
+            outcome="failed",
+            error_type="dependency_unavailable",
+            error="missing provider",
+        )
+
+        rollup = self.agent.get_request_rollup(limit=10, attention_only=True)
+
+        self.assertEqual(rollup["request_count"], 2)
+        self.assertEqual(rollup["source_bucket_breakdown"][0], {"source": "agent_invoke", "count": 1, "share": 0.5})
+        self.assertEqual(rollup["source_bucket_breakdown"][1], {"source": "tool_runtime", "count": 1, "share": 0.5})
+        self.assertEqual(rollup["source_bucket_trends"][0]["source"], "agent_invoke")
+        self.assertEqual(rollup["source_bucket_trends"][0]["direction"], "up")
+        self.assertEqual(rollup["source_bucket_trends"][0]["delta_share"], 1.0)
+        self.assertEqual(rollup["source_bucket_trends"][1]["source"], "tool_runtime")
+        self.assertEqual(rollup["source_bucket_trends"][1]["direction"], "down")
+        self.assertEqual(rollup["source_bucket_trends"][1]["delta_share"], -1.0)
+
+    def test_request_rollup_builds_source_bucket_trends(self):
+        base_state = {
+            "messages": [HumanMessage(content="hello")],
+            "plan": [{"id": 1, "description": "step one", "expected_outcome": "done"}],
+            "current_subtask_index": 1,
+            "reflections": ["complete"],
+            "global_keywords": ["hello"],
+            "failed_tools": {},
+            "session_memory_id": 1,
+            "domain_label": "general",
+            "memory_summaries": [],
+            "retry_counts": {},
+            "replan_counts": {},
+            "blocked": True,
+            "final_response": "",
+        }
+
+        request_specs = [
+            ("req_source_trend_earlier_1", "request_failed", "session_source_trend_earlier_1", None, None, "agent.invoke", {"error_type": "dependency_unavailable", "error": "missing provider b"}),
+            ("req_source_trend_earlier_2", "request_failed", "session_source_trend_earlier_2", None, None, "agent.invoke", {"error_type": "dependency_unavailable", "error": "missing provider c"}),
+            ("req_source_trend_recent_1", "agent_blocked", "session_source_trend_recent_1", "tool_detached", "tool=slow_tool | reason=timeout | tool_run_id=trend_recent_1", "checkpoint", None),
+            ("req_source_trend_recent_2", "request_failed", "session_source_trend_recent_2", None, None, "agent.invoke", {"error_type": "dependency_unavailable", "error": "missing provider a"}),
+        ]
+
+        for request_id, stage, session_id, checkpoint_stage, checkpoint_details, source, extra in request_specs:
+            self.agent._persist_state_snapshot(
+                request_id,
+                stage,
+                dict(base_state, request_id=request_id, session_id=session_id, blocked=(stage == "agent_blocked"), final_response=""),
+                extra=extra or {},
+            )
+            if checkpoint_stage:
+                self.llm_manager_module.llm_manager.log_checkpoint(
+                    checkpoint_stage,
+                    details=checkpoint_details,
+                    request_id=request_id,
+                    level=logging.ERROR,
+                )
+            else:
+                self.llm_manager_module.llm_manager.log_structured_event(
+                    "agent_request",
+                    message="Agent request failed due to unavailable model dependency",
+                    request_id=request_id,
+                    session_id=session_id,
+                    stage=stage,
+                    source=source,
+                    outcome="failed",
+                    error_type="dependency_unavailable",
+                    error=(extra or {}).get("error", "missing provider"),
+                )
+
+        rollup = self.agent.get_request_rollup(limit=10, attention_only=True)
+
+        self.assertEqual(rollup["request_count"], 4)
+        self.assertEqual(rollup["source_bucket_trends"][0]["source"], "tool_runtime")
+        self.assertEqual(rollup["source_bucket_trends"][0]["direction"], "up")
+        self.assertEqual(rollup["source_bucket_trends"][0]["delta_share"], 0.5)
+        self.assertEqual(rollup["source_bucket_trends"][1]["source"], "agent_invoke")
+        self.assertEqual(rollup["source_bucket_trends"][1]["direction"], "down")
+        self.assertEqual(rollup["source_bucket_trends"][1]["delta_share"], -0.5)
 
     def test_request_rollup_supports_status_and_attention_filters(self):
         base_state = {

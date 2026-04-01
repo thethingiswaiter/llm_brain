@@ -73,6 +73,7 @@ class FakeCLIAgent:
                 "is_resumed": False,
                 "latest_failure_stage": "tool_detached",
                 "latest_failure_details": "tool=slow_tool | reason=timeout | tool_run_id=toolrun_000001",
+                "latest_failure_source": "tool_runtime",
                 "latest_reroute_mode": "fallback_high_risk_history",
                 "latest_reroute_details": "index=1 | mode=fallback_high_risk_history | failed_tools=slow_tool",
                 "used_no_tool_fallback": True,
@@ -107,6 +108,7 @@ class FakeCLIAgent:
                     "needs_attention": True,
                     "latest_failure_stage": "tool_detached",
                     "latest_failure_details": "tool=slow_tool | reason=timeout | tool_run_id=toolrun_000001",
+                    "latest_failure_source": "tool_runtime",
                     "latest_reroute_mode": "fallback_high_risk_history",
                     "latest_reroute_details": "index=1 | mode=fallback_high_risk_history | failed_tools=slow_tool",
                     "used_no_tool_fallback": True,
@@ -126,6 +128,7 @@ class FakeCLIAgent:
                     "needs_attention": True,
                     "latest_failure_stage": "agent_blocked",
                     "latest_failure_details": "index=1 | action=retry_limit | tool=weather_tool | error_type=timeout",
+                    "latest_failure_source": "reflection",
                     "latest_reroute_mode": "",
                     "latest_reroute_details": "",
                     "used_no_tool_fallback": False,
@@ -182,18 +185,28 @@ class FakeCLIAgent:
             "active_count": 0,
             "average_total_duration_ms": 223.33,
             "stage_duration_ms_total": {"planning": 20.0, "tool": 30.0, "reflection": 12.0},
+            "source_bucket_breakdown": [
+                {"source": "tool_runtime", "count": 1, "share": 0.5},
+                {"source": "reflection", "count": 1, "share": 0.5},
+            ],
+            "source_bucket_trends": [
+                {"source": "tool_runtime", "recent_count": 1, "earlier_count": 0, "recent_share": 1.0, "earlier_share": 0.0, "delta_share": 1.0, "direction": "up"},
+                {"source": "reflection", "recent_count": 0, "earlier_count": 1, "recent_share": 0.0, "earlier_share": 1.0, "delta_share": -1.0, "direction": "down"},
+            ],
             "top_failure_signals": {
                 "stages": [("tool_detached", 1)],
                 "tools": [("slow_tool", 1)],
                 "reasons": [("timeout", 1)],
                 "error_types": [("timeout", 1)],
                 "actions": [("retry_limit", 1)],
+                "sources": [("tool_runtime", 1)],
                 "reroute_modes": [("fallback_high_risk_history", 1)],
                 "no_tool_fallbacks": [("used", 1)],
             },
             "top_failure_combinations": {
                 "stage_tool": [("tool_detached+slow_tool", 1)],
                 "tool_reason": [("slow_tool+timeout", 1)],
+                "stage_source": [("tool_detached+tool_runtime", 1)],
                 "stage_reroute": [("tool_detached+fallback_high_risk_history", 1)],
             },
             "totals": {
@@ -384,7 +397,7 @@ class CLITestCases(unittest.TestCase):
         self.assertIn("Status: completed", rendered)
         self.assertIn("Metrics: total_ms=123.0 | llm_calls=1 | tool_calls=0 | tool_detached=1 | retries=0 | reflection_failures=0", rendered)
         self.assertIn("Stage durations: planning=12.5 | subtask=7.25 | reflection=3.0", rendered)
-        self.assertIn("Triage: needs_attention=True | resumed=False | failure_stage=tool_detached | reroute=fallback_high_risk_history | tool_attention=0 | detached_tools=1", rendered)
+        self.assertIn("Triage: needs_attention=True | resumed=False | failure_stage=tool_detached | failure_source=tool_runtime | reroute=fallback_high_risk_history | tool_attention=0 | detached_tools=1", rendered)
         self.assertIn("Reroute details: index=1 | mode=fallback_high_risk_history | failed_tools=slow_tool", rendered)
         self.assertIn("Recent checkpoints:", rendered)
         self.assertIn("Related memories:", rendered)
@@ -422,7 +435,7 @@ class CLITestCases(unittest.TestCase):
         self.assertIn("req_recent_3 | status=failed", rendered)
         self.assertIn("detached_tools=1", rendered)
         self.assertIn("resumed_from=req_original_resume", rendered)
-        self.assertIn("attention=stage=tool_detached,detached=1,tool=slow_tool,reason=timeout,reroute=fallback_high_risk_history", rendered)
+        self.assertIn("attention=stage=tool_detached,detached=1,tool=slow_tool,reason=timeout,reroute=fallback_high_risk_history,source=tool_runtime", rendered)
         self.assertIn("req_recent_2 | status=blocked", rendered)
         self.assertIn("attention=stage=agent_blocked,tool_attention=1,tool=weather_tool,error_type=timeout,action=retry_limit", rendered)
 
@@ -487,8 +500,10 @@ class CLITestCases(unittest.TestCase):
         self.assertIn("Request rollup: count=3 | attention=2 | resumed=1 | active=0 | avg_total_ms=223.33", rendered)
         self.assertIn("Statuses: failed=1 | blocked=1 | completed=1", rendered)
         self.assertIn("Totals: llm_calls=6 | tool_calls=2 | tool_detached=1 | retries=2 | reflection_failures=1", rendered)
-        self.assertIn("Top failures: stage=tool_detached(1) | tool=slow_tool(1) | reason=timeout(1) | error_type=timeout(1) | action=retry_limit(1) | reroute=fallback_high_risk_history(1) | no_tool_fallback=used(1)", rendered)
-        self.assertIn("Failure combos: stage+tool=tool_detached+slow_tool(1) | tool+reason=slow_tool+timeout(1) | stage+reroute=tool_detached+fallback_high_risk_history(1)", rendered)
+        self.assertIn("Top failures: stage=tool_detached(1) | tool=slow_tool(1) | reason=timeout(1) | error_type=timeout(1) | action=retry_limit(1) | source=tool_runtime(1) | reroute=fallback_high_risk_history(1) | no_tool_fallback=used(1)", rendered)
+        self.assertIn("Failure combos: stage+tool=tool_detached+slow_tool(1) | tool+reason=slow_tool+timeout(1) | stage+source=tool_detached+tool_runtime(1) | stage+reroute=tool_detached+fallback_high_risk_history(1)", rendered)
+        self.assertIn("Source buckets: tool_runtime=1(50.0%) | reflection=1(50.0%)", rendered)
+        self.assertIn("Source trends: tool_runtime=up(+100.0pp,recent=1,earlier=0) | reflection=down(-100.0pp,recent=0,earlier=1)", rendered)
         self.assertIn("Stage totals: planning=20.0 | tool=30.0 | reflection=12.0", rendered)
 
     def test_request_rollup_command_accepts_filters(self):

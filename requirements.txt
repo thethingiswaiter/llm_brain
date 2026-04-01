@@ -9,3 +9,4 @@ mcp
 pydantic
 python-dotenv
 PyYAML
+rich

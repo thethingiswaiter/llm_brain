@@ -93,6 +93,12 @@ class AgentRuntime:
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
 
+    def _is_dependency_unavailable_error(self, exc: Exception) -> bool:
+        return (
+            isinstance(exc, LLMDependencyUnavailableError)
+            or exc.__class__.__name__ == "LLMDependencyUnavailableError"
+        )
+
     def invoke(self, query: str, session_id: str = None):
         if not self.agent.graph:
             return "Graph is not initialized."
@@ -238,7 +244,67 @@ class AgentRuntime:
                     extra={"query": query, "source": "keyboard_interrupt"},
                 )
             return cancel_message
+        except LLMDependencyUnavailableError as exc:
+            dependency_message = (
+                f"Request failed because the model dependency is unavailable: {exc}. "
+                "Check the current Python environment, provider service, or installed LLM packages before retrying."
+            )
+            llm_manager.console_event("agent_error", request_id=request_id, level=40)
+            llm_manager.log_structured_event(
+                "agent_request",
+                message="Agent request failed due to unavailable model dependency",
+                request_id=request_id,
+                session_id=session_id or self.agent.session_id,
+                stage="request_failed",
+                source="agent.invoke",
+                duration_ms=(time.monotonic() - request_started_at) * 1000,
+                outcome="failed",
+                error_type="dependency_unavailable",
+                error=str(exc),
+            )
+            llm_manager.log_event(
+                dependency_message,
+                level=40,
+                request_id=request_id,
+            )
+            self.agent._persist_state_snapshot(
+                request_id,
+                "request_failed",
+                inputs or {},
+                extra={"query": query, "error": str(exc), "error_type": "dependency_unavailable"},
+            )
+            return dependency_message
         except Exception as exc:
+            if self._is_dependency_unavailable_error(exc):
+                dependency_message = (
+                    f"Request failed because the model dependency is unavailable: {exc}. "
+                    "Check the current Python environment, provider service, or installed LLM packages before retrying."
+                )
+                llm_manager.console_event("agent_error", request_id=request_id, level=40)
+                llm_manager.log_structured_event(
+                    "agent_request",
+                    message="Agent request failed due to unavailable model dependency",
+                    request_id=request_id,
+                    session_id=session_id or self.agent.session_id,
+                    stage="request_failed",
+                    source="agent.invoke",
+                    duration_ms=(time.monotonic() - request_started_at) * 1000,
+                    outcome="failed",
+                    error_type="dependency_unavailable",
+                    error=str(exc),
+                )
+                llm_manager.log_event(
+                    dependency_message,
+                    level=40,
+                    request_id=request_id,
+                )
+                self.agent._persist_state_snapshot(
+                    request_id,
+                    "request_failed",
+                    inputs or {},
+                    extra={"query": query, "error": str(exc), "error_type": "dependency_unavailable"},
+                )
+                return dependency_message
             traceback.print_exc()
             llm_manager.console_event("agent_error", request_id=request_id, level=40)
             llm_manager.log_structured_event(
@@ -450,7 +516,83 @@ class AgentRuntime:
                     request_id=new_request_id,
                 )
                 return final_output
+        except LLMDependencyUnavailableError as exc:
+            dependency_message = (
+                f"Resumed request failed because the model dependency is unavailable: {exc}. "
+                "Check the current Python environment, provider service, or installed LLM packages before retrying."
+            )
+            llm_manager.console_event("agent_error", request_id=new_request_id, level=40)
+            llm_manager.log_structured_event(
+                "agent_request",
+                message="Resumed request failed due to unavailable model dependency",
+                request_id=new_request_id,
+                session_id=restored_state.get("session_id", self.agent.session_id),
+                stage="request_failed",
+                source="agent.resume",
+                duration_ms=None,
+                outcome="failed",
+                error_type="dependency_unavailable",
+                error=str(exc),
+                source_request_id=request_id,
+                resume_mode=resume_mode,
+            )
+            llm_manager.log_event(
+                dependency_message,
+                level=40,
+                request_id=new_request_id,
+            )
+            self.agent._persist_state_snapshot(
+                new_request_id,
+                "request_failed",
+                restored_state,
+                extra={
+                    "source_request_id": request_id,
+                    "source_snapshot_path": payload.get("snapshot_path", ""),
+                    "resume_mode": resume_mode,
+                    "error": str(exc),
+                    "error_type": "dependency_unavailable",
+                },
+            )
+            return dependency_message
         except Exception as exc:
+            if self._is_dependency_unavailable_error(exc):
+                dependency_message = (
+                    f"Resumed request failed because the model dependency is unavailable: {exc}. "
+                    "Check the current Python environment, provider service, or installed LLM packages before retrying."
+                )
+                llm_manager.console_event("agent_error", request_id=new_request_id, level=40)
+                llm_manager.log_structured_event(
+                    "agent_request",
+                    message="Resumed request failed due to unavailable model dependency",
+                    request_id=new_request_id,
+                    session_id=restored_state.get("session_id", self.agent.session_id),
+                    stage="request_failed",
+                    source="agent.resume",
+                    duration_ms=None,
+                    outcome="failed",
+                    error_type="dependency_unavailable",
+                    error=str(exc),
+                    source_request_id=request_id,
+                    resume_mode=resume_mode,
+                )
+                llm_manager.log_event(
+                    dependency_message,
+                    level=40,
+                    request_id=new_request_id,
+                )
+                self.agent._persist_state_snapshot(
+                    new_request_id,
+                    "request_failed",
+                    restored_state,
+                    extra={
+                        "source_request_id": request_id,
+                        "source_snapshot_path": payload.get("snapshot_path", ""),
+                        "resume_mode": resume_mode,
+                        "error": str(exc),
+                        "error_type": "dependency_unavailable",
+                    },
+                )
+                return dependency_message
             llm_manager.console_event("agent_error", request_id=new_request_id, level=40)
             llm_manager.log_structured_event(
                 "agent_request",

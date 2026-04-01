@@ -29,7 +29,7 @@
 
 ## 当前状态
 
-项目仍处于原型阶段，但已经不只是最小骨架。当前已经打通 CLI 到 Agent 的完整主链，并具备任务拆解、反思推进、记忆落盘与召回、统一技能路由、请求级日志追踪、运行时快照恢复，以及配置式 MCP 工具和真实 MCP stdio server 接入能力。当前测试套件维持在 125 个 unittest 用例通过。
+项目仍处于原型阶段，但已经不只是最小骨架。当前已经打通 CLI 到 Agent 的完整主链，并具备任务拆解、反思推进、记忆落盘与召回、统一技能路由、请求级日志追踪、运行时快照恢复，以及配置式 MCP 工具和真实 MCP stdio server 接入能力。当前测试套件维持在 131 个 unittest 用例通过。
 
 ## 运行说明
 
@@ -41,7 +41,7 @@
 
 - 当前依赖需要 Python 3.10+。
 - 如果本机当前 Python 环境里已有旧版 LangChain 相关依赖，建议执行一次 `python -m pip install -U -r requirements.txt`，避免 `langchain-core`、`langchain-ollama` 等包版本漂移导致导入错误。
-- 当前仓库已完成一次验证，结果为 `Ran 125 tests ... OK`。
+- 当前仓库已完成一次验证，结果为 `Ran 131 tests ... OK`。
 
 ### CLI 命令
 - `/load_skill <skill_name.py|skill_name.md>` 动态加载本地技能文件。
@@ -63,6 +63,8 @@
 
 当前 request_rollup 还会补两类排障摘要：Top failures 会优先显示最常见的 failure stage、tool、reason、error_type 和 action；Failure combos 会补最常见的 stage+tool 与 tool+reason 组合热点。
 
+当前这些失败聚合还新增了稳定的 source bucket：request_summary、recent_requests 和 request_rollup 现在不仅能看见 failure stage，还会把失败来源归一化成 agent_invoke、agent_resume、model、tool_runtime、reflection 等稳定分类；rollup 里也会汇总 stage+source 组合热点，并额外输出 source bucket 分布、占比摘要和 recent-vs-earlier 趋势，便于区分入口失败、模型失败和工具链路失败。
+
 当前记忆层已开始把失败步骤单独沉淀为 failure_case 视图，便于把 blocked、ask_user、retry 和 timeout 经验与成功经验分开检索。
 
 当前 reroute 也已开始使用同一请求内的跨子任务失败历史：当某个工具在前序步骤里重复失败到阈值后，后续子任务会优先避开它；在多个备选工具都可用时，也会优先选择历史失败更少的候选。
@@ -76,6 +78,10 @@
 当前 no-tool 降级提示也更明确了：对 invalid_arguments 这类缺参型失败，会明确引导 ask-user；对高风险历史或无安全工具可用的场景，则优先引导在现有上下文内给出安全的 direct answer，只有在确实缺外部信息或副作用执行能力时才追问用户。
 
 这些策略信号现在也进入了 request_summary 和 recent_requests：除了 failure stage 外，还会直接暴露最近一次 reroute mode，便于快速识别 fallback_high_risk_history 这类 no-tool 降级是否发生。
+
+观测层现在还会把 request_failed 快照 extra 里的 error_type / error 回填进 triage 和 request_rollup；像 dependency-unavailable 这类入口级失败，即使没有单独的 tool checkpoint details，也能出现在 recent_requests 的 attention 摘要和 rollup 的 failure signals 里。
+
+当前运行时对模型依赖异常也补了更稳的入口分流：即使测试或运行过程中发生模块 reload，`LLMDependencyUnavailableError` 的类身份发生漂移，invoke 和 resume 入口仍会把这类错误稳定识别为 dependency-unavailable，并返回明确的环境/依赖检查提示，而不是退化成通用的 `Error invoking agent`。
 
 当前 runtime retention 基线已覆盖 logs、state snapshots、system MCP audit logs 和 memory backups，默认同时支持 retention_days、max_files 或 max_request_dirs，以及 max_bytes 三类上限控制，并提供 dry-run 清理入口。
 另外已补一层低频自动 prune：快照落盘和大输入备份写入后会按 retention_auto_prune_min_interval_seconds 做节流清理，避免每次写入都重复扫描。

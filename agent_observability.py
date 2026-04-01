@@ -62,11 +62,29 @@ class AgentObservability:
     def parse_failure_detail_fields(self, details: str) -> dict[str, str]:
         parsed: dict[str, str] = {}
         raw_details = str(details or "")
-        for key in ("tool", "reason", "error_type", "action", "mode"):
+        for key in ("tool", "reason", "error_type", "action", "mode", "error"):
             match = re.search(rf"(?:^|\|)\s*{re.escape(key)}=([^|]+)", raw_details)
             if match:
                 parsed[key] = match.group(1).strip()
         return parsed
+
+    def enrich_failure_detail_fields(self, details: str, latest_extra: dict[str, Any]) -> str:
+        parsed = self.parse_failure_detail_fields(details)
+        merged = dict(parsed)
+        for key in ("tool", "reason", "error_type", "action", "error"):
+            if merged.get(key):
+                continue
+            value = str(latest_extra.get(key, "") or "").strip()
+            if value:
+                merged[key] = value
+        if not merged:
+            return str(details or "")
+        ordered_parts = []
+        for key in ("tool", "reason", "error_type", "action", "mode", "error"):
+            value = merged.get(key, "")
+            if value:
+                ordered_parts.append(f"{key}={value}")
+        return " | ".join(ordered_parts)
 
     def build_failure_combination_key(self, left: str, right: str) -> str:
         left_value = str(left or "").strip()
@@ -123,25 +141,73 @@ class AgentObservability:
                 return event
         return None
 
+    def normalize_failure_source(self, source: str, stage: str = "") -> str:
+        normalized_source = str(source or "").strip().lower()
+        if normalized_source in {"", "-", "log_event"}:
+            return ""
+        if normalized_source.startswith("agent.invoke"):
+            return "agent_invoke"
+        if normalized_source.startswith("agent.resume"):
+            return "agent_resume"
+        if normalized_source.startswith("agent.execute_subtask"):
+            return "model"
+        if normalized_source.startswith("agent.reflect"):
+            return "reflection"
+        if normalized_source.startswith("test."):
+            return "test"
+        if normalized_source.startswith("retention"):
+            return "retention"
+        if normalized_source == "checkpoint":
+            stage_bucket = self.stage_bucket_for_stage(stage)
+            if stage_bucket == "tool":
+                return "tool_runtime"
+            if stage_bucket == "reflection":
+                return "reflection"
+            if stage in {"agent_blocked"}:
+                return "reflection"
+            return "checkpoint"
+        if normalized_source.startswith("agent."):
+            return "agent_runtime"
+        return normalized_source.replace(".", "_")
+
+    def _find_last_failure_source(self, events: list[dict[str, Any]]) -> str:
+        for event in reversed(events):
+            outcome = str(event.get("outcome", "")).lower()
+            level = str(event.get("level", "")).upper()
+            stage = str(event.get("stage", ""))
+            source = self.normalize_failure_source(str(event.get("source", "") or ""), stage)
+            if not source:
+                continue
+            if outcome in {"failed", "cancelled", "timed_out", "blocked", "error"}:
+                return source
+            if level == "ERROR":
+                return source
+            if stage in {"agent_blocked", "request_failed", "request_cancelled", "request_timed_out", "tool_failed", "tool_rejected", "tool_cancelled", "tool_detached"}:
+                return source
+        return ""
+
     def build_request_triage(
         self,
         events: list[dict[str, Any]],
         checkpoints: list[dict[str, Any]],
         latest_state: dict[str, Any],
         latest_extra: dict[str, Any],
+        latest_stage: str,
         status: str,
         metrics: dict[str, Any],
     ) -> dict[str, Any]:
         attention_event = self._find_last_attention_event(events)
         latest_failure_stage = ""
         latest_failure_details = ""
+        latest_failure_source = ""
         latest_reroute_mode = ""
         latest_reroute_details = ""
         for item in reversed(checkpoints):
             stage = str(item.get("stage", ""))
             if stage in {"agent_blocked", "request_failed", "request_cancelled", "request_timed_out", "tool_failed", "tool_rejected", "tool_cancelled", "tool_detached"}:
                 latest_failure_stage = stage
-                latest_failure_details = str(item.get("details", ""))
+                latest_failure_details = self.enrich_failure_detail_fields(str(item.get("details", "")), latest_extra)
+                latest_failure_source = self.normalize_failure_source(str(item.get("source", "") or ""), stage)
                 break
 
         for item in reversed(checkpoints):
@@ -155,7 +221,14 @@ class AgentObservability:
             break
 
         if not latest_failure_stage and status in {"blocked", "failed", "cancelled", "timed_out"}:
-            latest_failure_stage = str(latest_extra.get("stage", "") or "")
+            latest_failure_stage = str(latest_stage or latest_extra.get("stage", "") or "")
+        if not latest_failure_details:
+            latest_failure_details = self.enrich_failure_detail_fields("", latest_extra)
+        if not latest_failure_source:
+            latest_failure_source = self._find_last_failure_source(events) or self.normalize_failure_source(
+                str(latest_extra.get("source", "") or ""),
+                latest_failure_stage,
+            )
 
         source_request_id = str(latest_extra.get("source_request_id", "") or "")
         detached_tool_count = int(metrics.get("tool_detached_count", 0) or 0)
@@ -171,6 +244,7 @@ class AgentObservability:
             "source_request_id": source_request_id,
             "latest_failure_stage": latest_failure_stage,
             "latest_failure_details": latest_failure_details,
+            "latest_failure_source": latest_failure_source,
             "latest_reroute_mode": latest_reroute_mode,
             "latest_reroute_details": latest_reroute_details,
             "used_no_tool_fallback": latest_reroute_mode.startswith("fallback_"),
@@ -309,6 +383,7 @@ class AgentObservability:
                 {
                     "logged_at": event.get("logged_at", ""),
                     "level": event.get("level", ""),
+                    "source": event.get("source", ""),
                     "stage": stage or "",
                     "message": event.get("message", ""),
                     "details": event.get("details", ""),
@@ -326,7 +401,7 @@ class AgentObservability:
         status = self.derive_request_status(latest_stage, latest_state, active)
         session_id = latest_state.get("session_id", "") or (memories[-1].get("conv_id", "") if memories else "")
         metrics = self.build_request_metrics(events, latest_state, status)
-        triage = self.build_request_triage(events, checkpoints, latest_state, latest_extra, status, metrics)
+        triage = self.build_request_triage(events, checkpoints, latest_state, latest_extra, latest_stage, status, metrics)
         detached_tools = self.build_detached_tool_details(request_id, checkpoints)
 
         return {
@@ -421,10 +496,12 @@ class AgentObservability:
         failure_reason_counts: Counter[str] = Counter()
         failure_error_type_counts: Counter[str] = Counter()
         failure_action_counts: Counter[str] = Counter()
+        failure_source_counts: Counter[str] = Counter()
         failure_reroute_mode_counts: Counter[str] = Counter()
         failure_no_tool_fallback_counts: Counter[str] = Counter()
         failure_stage_tool_counts: Counter[str] = Counter()
         failure_tool_reason_counts: Counter[str] = Counter()
+        failure_stage_source_counts: Counter[str] = Counter()
         failure_stage_reroute_counts: Counter[str] = Counter()
         totals = {
             "llm_call_count": 0,
@@ -438,6 +515,7 @@ class AgentObservability:
         active_count = 0
         total_duration_sum = 0.0
         total_duration_samples = 0
+        attention_failure_sources: list[str] = []
 
         for summary in summaries:
             status = str(summary.get("status", "") or "unknown")
@@ -463,6 +541,10 @@ class AgentObservability:
                     failure_error_type_counts[parsed_details["error_type"]] += 1
                 if parsed_details.get("action"):
                     failure_action_counts[parsed_details["action"]] += 1
+                failure_source = str(triage.get("latest_failure_source", "") or "")
+                if failure_source:
+                    failure_source_counts[failure_source] += 1
+                    attention_failure_sources.append(failure_source)
                 reroute_mode = str(triage.get("latest_reroute_mode", "") or "")
                 if reroute_mode:
                     failure_reroute_mode_counts[reroute_mode] += 1
@@ -474,6 +556,9 @@ class AgentObservability:
                 tool_reason_key = self.build_failure_combination_key(tool_name, reason)
                 if tool_reason_key:
                     failure_tool_reason_counts[tool_reason_key] += 1
+                stage_source_key = self.build_failure_combination_key(latest_failure_stage, failure_source)
+                if stage_source_key:
+                    failure_stage_source_counts[stage_source_key] += 1
                 stage_reroute_key = self.build_failure_combination_key(latest_failure_stage, reroute_mode)
                 if stage_reroute_key:
                     failure_stage_reroute_counts[stage_reroute_key] += 1
@@ -496,6 +581,57 @@ class AgentObservability:
             average_total_duration_ms = round(total_duration_sum / total_duration_samples, 2)
 
         latest_updated_at = summaries[0].get("updated_at", "") if summaries else ""
+        source_bucket_breakdown = []
+        denominator = max(0, needs_attention_count)
+        if denominator:
+            for source, count in sorted(
+                failure_source_counts.items(),
+                key=lambda item: (-item[1], item[0]),
+            )[:5]:
+                source_bucket_breakdown.append(
+                    {
+                        "source": source,
+                        "count": count,
+                        "share": round(count / denominator, 4),
+                    }
+                )
+        source_bucket_trends = []
+        if len(attention_failure_sources) >= 2:
+            recent_window_size = (len(attention_failure_sources) + 1) // 2
+            recent_sources = attention_failure_sources[:recent_window_size]
+            earlier_sources = attention_failure_sources[recent_window_size:]
+            if earlier_sources:
+                recent_counts = Counter(recent_sources)
+                earlier_counts = Counter(earlier_sources)
+                recent_total = len(recent_sources)
+                earlier_total = len(earlier_sources)
+                trend_items = []
+                for source in set(recent_counts) | set(earlier_counts):
+                    recent_count = recent_counts.get(source, 0)
+                    earlier_count = earlier_counts.get(source, 0)
+                    recent_share = recent_count / recent_total if recent_total else 0.0
+                    earlier_share = earlier_count / earlier_total if earlier_total else 0.0
+                    delta_share = recent_share - earlier_share
+                    direction = "flat"
+                    if delta_share > 0:
+                        direction = "up"
+                    elif delta_share < 0:
+                        direction = "down"
+                    trend_items.append(
+                        {
+                            "source": source,
+                            "recent_count": recent_count,
+                            "earlier_count": earlier_count,
+                            "recent_share": round(recent_share, 4),
+                            "earlier_share": round(earlier_share, 4),
+                            "delta_share": round(delta_share, 4),
+                            "direction": direction,
+                        }
+                    )
+                source_bucket_trends = sorted(
+                    trend_items,
+                    key=lambda item: (-abs(float(item["delta_share"])), -float(item["delta_share"]), item["source"]),
+                )[:5]
 
         return {
             "request_count": len(summaries),
@@ -512,18 +648,22 @@ class AgentObservability:
             "active_count": active_count,
             "average_total_duration_ms": average_total_duration_ms,
             "stage_duration_ms_total": stage_duration_ms_total,
+            "source_bucket_breakdown": source_bucket_breakdown,
+            "source_bucket_trends": source_bucket_trends,
             "top_failure_signals": {
                 "stages": failure_stage_counts.most_common(3),
                 "tools": failure_tool_counts.most_common(3),
                 "reasons": failure_reason_counts.most_common(3),
                 "error_types": failure_error_type_counts.most_common(3),
                 "actions": failure_action_counts.most_common(3),
+                "sources": failure_source_counts.most_common(3),
                 "reroute_modes": failure_reroute_mode_counts.most_common(3),
                 "no_tool_fallbacks": failure_no_tool_fallback_counts.most_common(3),
             },
             "top_failure_combinations": {
                 "stage_tool": failure_stage_tool_counts.most_common(3),
                 "tool_reason": failure_tool_reason_counts.most_common(3),
+                "stage_source": failure_stage_source_counts.most_common(3),
                 "stage_reroute": failure_stage_reroute_counts.most_common(3),
             },
             "totals": totals,

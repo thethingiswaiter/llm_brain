@@ -16,6 +16,14 @@ def emit_response(output_func, response: str, request_id: str) -> None:
     output_func(f"\nResponse: {response}")
 
 
+def emit_agent_response(context: dict[str, Any], response: str, request_id: str) -> None:
+    ui = context.get("ui")
+    if ui:
+        ui.render_response(request_id, response)
+        return
+    emit_response(context["output_func"], response, request_id)
+
+
 def build_attention_detail_summary(triage: dict[str, Any]) -> str:
     details = str(triage.get("latest_failure_details", "") or "")
     extracted: list[str] = []
@@ -27,6 +35,9 @@ def build_attention_detail_summary(triage: dict[str, Any]) -> str:
     reroute_mode = str(triage.get("latest_reroute_mode", "") or "")
     if reroute_mode:
         extracted.append(f"reroute={reroute_mode}")
+    failure_source = str(triage.get("latest_failure_source", "") or "")
+    if failure_source:
+        extracted.append(f"source={failure_source}")
     return ",".join(extracted)
 
 
@@ -51,10 +62,14 @@ def format_since_window(seconds: int | None) -> str:
 
 def handle_help(_user_input: str, context: dict[str, Any]) -> bool:
     output_func = context["output_func"]
+    ui = context.get("ui")
+    command_texts = [context["commands"][item].help_text for item in context["command_order"] if item.startswith("/")]
+    if ui:
+        ui.render_help(command_texts)
+        return True
     output_func("Available commands:")
-    for item in context["command_order"]:
-        if item.startswith("/"):
-            output_func(f"  {context['commands'][item].help_text}")
+    for item in command_texts:
+        output_func(f"  {item}")
     output_func("  <any other text> - Send message to Agent")
     return True
 
@@ -89,7 +104,7 @@ def handle_replay(user_input: str, context: dict[str, Any]) -> bool:
     parts = user_input.split()
     if len(parts) >= 2:
         response = agent_instance.replay(int(parts[1]), parts[2:])
-        emit_response(output_func, response, agent_instance.get_last_request_id())
+        emit_agent_response(context, response, agent_instance.get_last_request_id())
     else:
         output_func("Usage: /replay <memory_id> [injected features...]")
     return True
@@ -118,7 +133,11 @@ def handle_load_mcp(user_input: str, context: dict[str, Any]) -> bool:
 
 def handle_list_mcp(_user_input: str, context: dict[str, Any]) -> bool:
     output_func = context["output_func"]
+    ui = context.get("ui")
     servers = context["agent_instance"].list_mcp_servers()
+    if ui and ui.rich_enabled:
+        ui.render_mcp_servers(servers)
+        return True
     if not servers:
         output_func("No MCP servers loaded.")
     else:
@@ -171,7 +190,7 @@ def handle_resume_snapshot(user_input: str, context: dict[str, Any]) -> bool:
             return True
 
         response = agent_instance.resume_from_snapshot(parts[1], snapshot_name=snapshot_name, reroute=reroute)
-        emit_response(output_func, response, agent_instance.get_last_request_id())
+        emit_agent_response(context, response, agent_instance.get_last_request_id())
     else:
         output_func("Usage: /resume_snapshot <request_id> [latest|index|stage|snapshot_file] [reroute]")
     return True
@@ -179,9 +198,13 @@ def handle_resume_snapshot(user_input: str, context: dict[str, Any]) -> bool:
 
 def handle_list_snapshots(user_input: str, context: dict[str, Any]) -> bool:
     output_func = context["output_func"]
+    ui = context.get("ui")
     parts = user_input.split()
     if len(parts) >= 2:
         snapshots = context["agent_instance"].list_snapshots(parts[1])
+        if ui and ui.rich_enabled:
+            ui.render_snapshots(snapshots)
+            return True
         if not snapshots:
             output_func("No snapshots found.")
         else:
@@ -206,8 +229,41 @@ def handle_cancel_request(user_input: str, context: dict[str, Any]) -> bool:
     return True
 
 
+def build_request_summary_lines(summary: dict[str, Any], observability) -> tuple[str, str, str]:
+    triage = summary.get("triage", {}) or {}
+    metrics = summary.get("metrics", {}) or {}
+    metrics_line = ""
+    if metrics:
+        metrics_line = (
+            f"total_ms={metrics.get('total_duration_ms', '-')} | "
+            f"llm_calls={metrics.get('llm_call_count', 0)} | "
+            f"tool_calls={metrics.get('tool_call_count', 0)} | "
+            f"tool_detached={metrics.get('tool_detached_count', 0)} | "
+            f"retries={metrics.get('retry_count', 0)} | "
+            f"reflection_failures={metrics.get('reflection_failure_count', 0)}"
+        )
+    stage_duration_line = ""
+    stage_duration_ms = metrics.get("stage_duration_ms", {}) or {}
+    if stage_duration_ms:
+        duration_parts = [f"{key}={value}" for key, value in observability.ordered_stage_duration_items(stage_duration_ms)]
+        stage_duration_line = " | ".join(duration_parts)
+    triage_line = ""
+    if triage:
+        triage_line = (
+            f"needs_attention={triage.get('needs_attention', False)} | "
+            f"resumed={triage.get('is_resumed', False)} | "
+            f"failure_stage={triage.get('latest_failure_stage') or '-'} | "
+            f"failure_source={triage.get('latest_failure_source') or '-'} | "
+            f"reroute={triage.get('latest_reroute_mode') or '-'} | "
+            f"tool_attention={triage.get('tool_attention_count', 0)} | "
+            f"detached_tools={triage.get('detached_tool_count', 0)}"
+        )
+    return metrics_line, stage_duration_line, triage_line
+
+
 def handle_request_summary(user_input: str, context: dict[str, Any]) -> bool:
     output_func = context["output_func"]
+    ui = context.get("ui")
     parts = user_input.split()
     if len(parts) < 2:
         output_func("Usage: /request_summary <request_id>")
@@ -218,6 +274,21 @@ def handle_request_summary(user_input: str, context: dict[str, Any]) -> bool:
         output_func("Request not found.")
         return True
 
+    triage = summary.get("triage", {}) or {}
+    metrics_line, stage_duration_line, triage_line = build_request_summary_lines(summary, context["agent_instance"].observability)
+
+    if ui and ui.rich_enabled:
+        ui.render_request_summary(summary, metrics_line, stage_duration_line, triage_line)
+        if triage.get("last_error_message"):
+            ui.emit(f"Last error: {triage['last_error_message']}")
+        if triage.get("latest_failure_details"):
+            ui.emit(f"Failure details: {triage['latest_failure_details']}")
+        if triage.get("latest_reroute_details"):
+            ui.emit(f"Reroute details: {triage['latest_reroute_details']}")
+        if summary.get("source_request_id"):
+            ui.emit(f"Source request: {summary['source_request_id']}")
+        return True
+
     output_func(f"Request ID: {summary['request_id']}")
     output_func(f"Status: {summary['status']}")
     output_func(f"Session ID: {summary['session_id'] or '-'}")
@@ -226,38 +297,18 @@ def handle_request_summary(user_input: str, context: dict[str, Any]) -> bool:
     output_func(f"Snapshots: {summary['snapshot_count']}")
     output_func(f"Memories: {summary['memory_count']}")
     output_func(f"Checkpoints: {summary['checkpoint_count']}")
-    triage = summary.get("triage", {})
-    metrics = summary.get("metrics", {})
-    if metrics:
-        output_func(
-            "Metrics: "
-            f"total_ms={metrics.get('total_duration_ms', '-')} | "
-            f"llm_calls={metrics.get('llm_call_count', 0)} | "
-            f"tool_calls={metrics.get('tool_call_count', 0)} | "
-            f"tool_detached={metrics.get('tool_detached_count', 0)} | "
-            f"retries={metrics.get('retry_count', 0)} | "
-            f"reflection_failures={metrics.get('reflection_failure_count', 0)}"
-        )
-        stage_duration_ms = metrics.get("stage_duration_ms", {}) or {}
-        if stage_duration_ms:
-            duration_parts = [f"{key}={value}" for key, value in context["agent_instance"].observability.ordered_stage_duration_items(stage_duration_ms)]
-            output_func("Stage durations: " + " | ".join(duration_parts))
-    if triage:
-        output_func(
-            "Triage: "
-            f"needs_attention={triage.get('needs_attention', False)} | "
-            f"resumed={triage.get('is_resumed', False)} | "
-            f"failure_stage={triage.get('latest_failure_stage') or '-'} | "
-            f"reroute={triage.get('latest_reroute_mode') or '-'} | "
-            f"tool_attention={triage.get('tool_attention_count', 0)} | "
-            f"detached_tools={triage.get('detached_tool_count', 0)}"
-        )
-        if triage.get("last_error_message"):
-            output_func(f"Last error: {triage['last_error_message']}")
-        if triage.get("latest_failure_details"):
-            output_func(f"Failure details: {triage['latest_failure_details']}")
-        if triage.get("latest_reroute_details"):
-            output_func(f"Reroute details: {triage['latest_reroute_details']}")
+    if metrics_line:
+        output_func("Metrics: " + metrics_line)
+    if stage_duration_line:
+        output_func("Stage durations: " + stage_duration_line)
+    if triage_line:
+        output_func("Triage: " + triage_line)
+    if triage.get("last_error_message"):
+        output_func(f"Last error: {triage['last_error_message']}")
+    if triage.get("latest_failure_details"):
+        output_func(f"Failure details: {triage['latest_failure_details']}")
+    if triage.get("latest_reroute_details"):
+        output_func(f"Reroute details: {triage['latest_reroute_details']}")
     if summary.get("source_request_id"):
         output_func(f"Source request: {summary['source_request_id']}")
     if summary.get("final_response"):
@@ -319,6 +370,22 @@ def render_recent_request_rows(output_func, summaries: list[dict[str, Any]], hea
         )
 
 
+def build_recent_request_row(item: dict[str, Any]) -> list[Any]:
+    metrics = item.get("metrics", {})
+    triage = item.get("triage", {}) or {}
+    return [
+        item["request_id"],
+        item.get("status") or "-",
+        item.get("latest_stage") or "-",
+        item.get("session_id") or "-",
+        item.get("updated_at") or "-",
+        metrics.get("total_duration_ms", "-"),
+        metrics.get("tool_detached_count", 0),
+        item.get("source_request_id") or "-",
+        build_attention_detail_summary(triage) or "-",
+    ]
+
+
 def parse_request_filter_args(parts: list[str], usage_text: str) -> tuple[int, list[str], bool, bool, int | None] | None:
     limit = 10
     statuses: list[str] = []
@@ -364,14 +431,16 @@ def parse_request_filter_args(parts: list[str], usage_text: str) -> tuple[int, l
 
 
 def handle_recent_request_query(
-    output_func,
-    agent_instance,
+    context: dict[str, Any],
     parts: list[str],
     usage_text: str,
     heading: str,
     default_statuses: list[str] | None = None,
     default_resumed_only: bool = False,
 ) -> bool:
+    output_func = context["output_func"]
+    agent_instance = context["agent_instance"]
+    ui = context.get("ui")
     parsed = parse_request_filter_args(parts, usage_text)
     if parsed is None:
         output_func(f"Usage: {usage_text}")
@@ -398,17 +467,21 @@ def handle_recent_request_query(
         filter_parts.append("since=" + format_since_window(since_seconds))
     if filter_parts:
         output_func("Filters: " + " | ".join(filter_parts))
+    if ui and ui.rich_enabled:
+        if not summaries:
+            ui.emit("No matching requests found.")
+        else:
+            ui.render_recent_requests(heading, [build_recent_request_row(item) for item in summaries])
+        return True
     render_recent_request_rows(output_func, summaries, heading)
     return True
 
 
 def handle_recent_requests(user_input: str, context: dict[str, Any]) -> bool:
-    output_func = context["output_func"]
     parts = user_input.split()
     usage_text = "/recent_requests [limit] [status=failed,blocked,...] [resumed] [attention] [since=30m]"
     return handle_recent_request_query(
-        output_func,
-        context["agent_instance"],
+        context,
         parts,
         usage_text,
         "Recent requests:",
@@ -417,6 +490,7 @@ def handle_recent_requests(user_input: str, context: dict[str, Any]) -> bool:
 
 def handle_request_rollup(user_input: str, context: dict[str, Any]) -> bool:
     output_func = context["output_func"]
+    ui = context.get("ui")
     parts = user_input.split()
     usage_text = "/request_rollup [limit] [status=failed,blocked,...] [resumed] [attention] [since=30m]"
     parsed = parse_request_filter_args(parts, usage_text)
@@ -439,13 +513,13 @@ def handle_request_rollup(user_input: str, context: dict[str, Any]) -> bool:
 
     status_counts = rollup.get("status_counts", {}) or {}
     status_parts = [f"{key}={value}" for key, value in status_counts.items()]
-    output_func(
+    overview_line = (
         "Request rollup: "
         f"count={rollup.get('request_count', 0)} | "
         f"attention={rollup.get('needs_attention_count', 0)} | "
         f"resumed={rollup.get('resumed_count', 0)} | "
         f"active={rollup.get('active_count', 0)} | "
-        f"avg_total_ms={rollup.get('average_total_duration_ms', '-') }"
+        f"avg_total_ms={rollup.get('average_total_duration_ms', '-')}"
     )
     filters = rollup.get("filters", {}) or {}
     filter_parts = []
@@ -457,12 +531,10 @@ def handle_request_rollup(user_input: str, context: dict[str, Any]) -> bool:
         filter_parts.append("attention_only=True")
     if filters.get("since_seconds"):
         filter_parts.append("since=" + format_since_window(filters["since_seconds"]))
-    if filter_parts:
-        output_func("Filters: " + " | ".join(filter_parts))
-    if status_parts:
-        output_func("Statuses: " + " | ".join(status_parts))
+    filters_line = "Filters: " + " | ".join(filter_parts) if filter_parts else ""
+    status_line = "Statuses: " + " | ".join(status_parts) if status_parts else ""
     totals = rollup.get("totals", {}) or {}
-    output_func(
+    totals_line = (
         "Totals: "
         f"llm_calls={totals.get('llm_call_count', 0)} | "
         f"tool_calls={totals.get('tool_call_count', 0)} | "
@@ -472,41 +544,104 @@ def handle_request_rollup(user_input: str, context: dict[str, Any]) -> bool:
     )
     top_failure_signals = rollup.get("top_failure_signals", {}) or {}
     signal_parts = []
-    for label, key in (("stage", "stages"), ("tool", "tools"), ("reason", "reasons"), ("error_type", "error_types"), ("action", "actions"), ("reroute", "reroute_modes"), ("no_tool_fallback", "no_tool_fallbacks")):
+    for label, key in (("stage", "stages"), ("tool", "tools"), ("reason", "reasons"), ("error_type", "error_types"), ("action", "actions"), ("source", "sources"), ("reroute", "reroute_modes"), ("no_tool_fallback", "no_tool_fallbacks")):
         items = top_failure_signals.get(key, []) or []
         if items:
             value, count = items[0]
             signal_parts.append(f"{label}={value}({count})")
-    if signal_parts:
-        output_func("Top failures: " + " | ".join(signal_parts))
+    top_failures_line = "Top failures: " + " | ".join(signal_parts) if signal_parts else ""
     top_failure_combinations = rollup.get("top_failure_combinations", {}) or {}
     combination_parts = []
-    for label, key in (("stage+tool", "stage_tool"), ("tool+reason", "tool_reason"), ("stage+reroute", "stage_reroute")):
+    for label, key in (("stage+tool", "stage_tool"), ("tool+reason", "tool_reason"), ("stage+source", "stage_source"), ("stage+reroute", "stage_reroute")):
         items = top_failure_combinations.get(key, []) or []
         if items:
             value, count = items[0]
             combination_parts.append(f"{label}={value}({count})")
-    if combination_parts:
-        output_func("Failure combos: " + " | ".join(combination_parts))
+    combos_line = "Failure combos: " + " | ".join(combination_parts) if combination_parts else ""
+    source_bucket_breakdown = rollup.get("source_bucket_breakdown", []) or []
+    source_parts = []
+    for item in source_bucket_breakdown:
+        source = item.get("source", "")
+        count = item.get("count", 0)
+        share = item.get("share")
+        if not source:
+            continue
+        if isinstance(share, (int, float)):
+            source_parts.append(f"{source}={count}({share * 100:.1f}%)")
+        else:
+            source_parts.append(f"{source}={count}")
+    source_buckets_line = "Source buckets: " + " | ".join(source_parts) if source_parts else ""
+    source_bucket_trends = rollup.get("source_bucket_trends", []) or []
+    trend_parts = []
+    for item in source_bucket_trends:
+        source = item.get("source", "")
+        direction = item.get("direction", "flat")
+        delta_share = item.get("delta_share")
+        recent_count = item.get("recent_count", 0)
+        earlier_count = item.get("earlier_count", 0)
+        if not source:
+            continue
+        if isinstance(delta_share, (int, float)):
+            trend_parts.append(f"{source}={direction}({delta_share * 100:+.1f}pp,recent={recent_count},earlier={earlier_count})")
+        else:
+            trend_parts.append(f"{source}={direction}(recent={recent_count},earlier={earlier_count})")
+    source_trends_line = "Source trends: " + " | ".join(trend_parts) if trend_parts else ""
     stage_duration_ms_total = rollup.get("stage_duration_ms_total", {}) or {}
+    stage_totals_line = ""
     if stage_duration_ms_total:
         duration_parts = [
             f"{key}={value}"
             for key, value in context["agent_instance"].observability.ordered_stage_duration_items(stage_duration_ms_total)
         ]
-        output_func("Stage totals: " + " | ".join(duration_parts))
+        stage_totals_line = "Stage totals: " + " | ".join(duration_parts)
+
+    if ui and ui.rich_enabled:
+        ui.render_request_rollup(
+            [
+                ("Count", rollup.get("request_count", 0)),
+                ("Attention", rollup.get("needs_attention_count", 0)),
+                ("Resumed", rollup.get("resumed_count", 0)),
+                ("Active", rollup.get("active_count", 0)),
+                ("Avg total ms", rollup.get("average_total_duration_ms", "-")),
+            ],
+            filters_line,
+            status_line,
+            totals_line,
+            top_failures_line,
+            combos_line,
+            source_buckets_line,
+            source_trends_line,
+            stage_totals_line,
+            rollup.get("latest_updated_at", ""),
+        )
+        return True
+
+    output_func(overview_line)
+    if filters_line:
+        output_func(filters_line)
+    if status_line:
+        output_func(status_line)
+    output_func(totals_line)
+    if top_failures_line:
+        output_func(top_failures_line)
+    if combos_line:
+        output_func(combos_line)
+    if source_buckets_line:
+        output_func(source_buckets_line)
+    if source_trends_line:
+        output_func(source_trends_line)
+    if stage_totals_line:
+        output_func(stage_totals_line)
     if rollup.get("latest_updated_at"):
         output_func(f"Latest updated_at: {rollup['latest_updated_at']}")
     return True
 
 
 def handle_failed_requests(user_input: str, context: dict[str, Any]) -> bool:
-    output_func = context["output_func"]
     parts = user_input.split()
     usage_text = "/failed_requests [limit] [status=failed,blocked,timed_out,cancelled,...] [resumed] [attention] [since=30m]"
     return handle_recent_request_query(
-        output_func,
-        context["agent_instance"],
+        context,
         parts,
         usage_text,
         "Recent failed or blocked requests:",
@@ -515,12 +650,10 @@ def handle_failed_requests(user_input: str, context: dict[str, Any]) -> bool:
 
 
 def handle_resumed_requests(user_input: str, context: dict[str, Any]) -> bool:
-    output_func = context["output_func"]
     parts = user_input.split()
     usage_text = "/resumed_requests [limit] [status=failed,blocked,...] [attention] [since=30m]"
     return handle_recent_request_query(
-        output_func,
-        context["agent_instance"],
+        context,
         parts,
         usage_text,
         "Recent resumed requests:",
@@ -530,6 +663,7 @@ def handle_resumed_requests(user_input: str, context: dict[str, Any]) -> bool:
 
 def handle_list_tool_runs(user_input: str, context: dict[str, Any]) -> bool:
     output_func = context["output_func"]
+    ui = context.get("ui")
     parts = user_input.split()
     request_id = parts[1] if len(parts) >= 2 else ""
     status = parts[2] if len(parts) >= 3 else ""
@@ -540,6 +674,10 @@ def handle_list_tool_runs(user_input: str, context: dict[str, Any]) -> bool:
     items = context["agent_instance"].list_tool_runs(request_id=request_id, status=status)
     if not items:
         output_func("No tracked tool runs found.")
+        return True
+
+    if ui and ui.rich_enabled:
+        ui.render_tool_runs(items)
         return True
 
     output_func("Tracked tool runs:")
@@ -571,8 +709,54 @@ def _format_bytes(value: Any) -> str:
 
 def handle_retention_status(_user_input: str, context: dict[str, Any]) -> bool:
     output_func = context["output_func"]
+    ui = context.get("ui")
     payload = context["agent_instance"].get_retention_status()
     totals = payload.get("totals", {}) or {}
+    last_auto_prune = payload.get("last_auto_prune", {}) or {}
+    last_auto_prune_check = payload.get("last_auto_prune_check", {}) or {}
+    target_rows = []
+    for item in payload.get("targets", []) or []:
+        target_rows.append(
+            [
+                item.get("key"),
+                item.get("retention_days"),
+                item.get("max_items", 0),
+                _format_bytes(item.get("max_total_bytes", 0)),
+                item.get("item_count", 0),
+                item.get("expired_count", 0),
+                _format_bytes(item.get("total_bytes", 0)),
+                _format_bytes(item.get("reclaimable_bytes", 0)),
+            ]
+        )
+    if ui and ui.rich_enabled:
+        ui.render_key_value_block(
+            "Retention Status",
+            [
+                ("Items", totals.get("item_count", 0)),
+                ("Expired", totals.get("expired_count", 0)),
+                ("Total", _format_bytes(totals.get("total_bytes", 0))),
+                ("Reclaimable", _format_bytes(totals.get("reclaimable_bytes", 0))),
+            ],
+        )
+        if last_auto_prune.get("executed_at"):
+            ui.emit(
+                "Last auto prune: "
+                f"trigger={last_auto_prune.get('trigger', '-')} | "
+                f"deleted={last_auto_prune.get('deleted_count', 0)} | "
+                f"expired={last_auto_prune.get('expired_count', 0)} | "
+                f"reclaimable={_format_bytes(last_auto_prune.get('reclaimable_bytes', 0))} | "
+                f"at={last_auto_prune.get('executed_at')}"
+            )
+        if last_auto_prune_check.get("checked_at") and last_auto_prune_check.get("status") != "executed":
+            ui.emit(
+                "Last auto prune check: "
+                f"status={last_auto_prune_check.get('status', '-')} | "
+                f"reason={last_auto_prune_check.get('reason', '-')} | "
+                f"trigger={last_auto_prune_check.get('trigger', '-')} | "
+                f"checked_at={last_auto_prune_check.get('checked_at')}"
+            )
+        ui.render_retention_targets(target_rows)
+        return True
     output_func(
         "Retention status: "
         f"items={totals.get('item_count', 0)} | "
@@ -580,7 +764,6 @@ def handle_retention_status(_user_input: str, context: dict[str, Any]) -> bool:
         f"total={_format_bytes(totals.get('total_bytes', 0))} | "
         f"reclaimable={_format_bytes(totals.get('reclaimable_bytes', 0))}"
     )
-    last_auto_prune = payload.get("last_auto_prune", {}) or {}
     if last_auto_prune.get("executed_at"):
         output_func(
             "Last auto prune: "
@@ -590,7 +773,6 @@ def handle_retention_status(_user_input: str, context: dict[str, Any]) -> bool:
             f"reclaimable={_format_bytes(last_auto_prune.get('reclaimable_bytes', 0))} | "
             f"at={last_auto_prune.get('executed_at')}"
         )
-    last_auto_prune_check = payload.get("last_auto_prune_check", {}) or {}
     if last_auto_prune_check.get("checked_at") and last_auto_prune_check.get("status") != "executed":
         output_func(
             "Last auto prune check: "
@@ -638,6 +820,7 @@ def handle_prune_runtime_data(user_input: str, context: dict[str, Any]) -> bool:
 
 def handle_failure_memories(user_input: str, context: dict[str, Any]) -> bool:
     output_func = context["output_func"]
+    ui = context.get("ui")
     parts = user_input.split()
     limit = 5
     keyword_start = 1
@@ -658,6 +841,21 @@ def handle_failure_memories(user_input: str, context: dict[str, Any]) -> bool:
         output_func("No failure memories found.")
         return True
 
+    memory_rows = []
+    for item in items:
+        tags = ",".join(item.get("quality_tags", [])) or "-"
+        keywords_text = ",".join(item.get("keywords", [])[:5]) or "-"
+        memory_rows.append([
+            f"#{item.get('id')}",
+            item.get("request_id") or "-",
+            item.get("memory_type") or "-",
+            tags,
+            keywords_text,
+            item.get("summary") or "-",
+        ])
+    if ui and ui.rich_enabled:
+        ui.render_failure_memories(memory_rows, keywords)
+        return True
     if keywords:
         output_func("Failure memories: keywords=" + ",".join(keywords))
     else:
@@ -681,9 +879,8 @@ def handle_new_session(_user_input: str, context: dict[str, Any]) -> bool:
 
 def handle_plain_message(user_input: str, context: dict[str, Any]) -> bool:
     agent_instance = context["agent_instance"]
-    output_func = context["output_func"]
     response = agent_instance.invoke(user_input, session_id=context["session_state"]["session_id"])
-    emit_response(output_func, response, agent_instance.get_last_request_id())
+    emit_agent_response(context, response, agent_instance.get_last_request_id())
     return True
 
 

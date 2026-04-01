@@ -80,6 +80,9 @@
 - 高严重度历史现在也进入策略层：超过 severity 阈值的工具会被直接排除，系统会在没有安全候选时主动降级到无工具路径。
 - no-tool 降级已开始区分“应 ask-user 补参”和“可 direct-answer 安全收敛”的两类提示，减少在无工具场景下的模糊决策。
 - no-tool 与 reroute fallback 信号已开始进入 request 级摘要，便于直接在 recent/request summary 里识别策略降级，而不必再翻原始日志。
+- 模型依赖异常在 invoke / resume 入口已补稳定识别逻辑，开始覆盖模块 reload 后异常类身份漂移的场景，避免依赖故障退化成通用错误提示。
+- request_failed 快照 extra 里的 error_type / error 已开始回填到 triage 与 request_rollup，入口级依赖故障也能进入跨请求 failure signals 聚合。
+- request 级失败聚合已开始区分稳定 source bucket：可把失败来源归一化为 agent_invoke、agent_resume、model、tool_runtime、reflection 等分类，并输出 stage+source 热点、source 分布占比摘要，以及 recent-vs-earlier 趋势，后续可继续沿此方向细化全局指标。
 
 ### 4.3 完成标准
 
