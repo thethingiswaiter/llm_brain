@@ -11,6 +11,7 @@ class SkillManager:
         "in", "on", "at", "to", "of", "is", "are", "me", "my", "our", "please", "current",
         "will", "would", "could", "should", "about", "there", "their", "then", "than",
         "when", "where", "which", "what", "tell", "give", "show", "user", "name", "tool",
+        "请", "请问", "帮我", "一下", "看看", "看下", "查下", "查询一下", "告诉我", "我想", "我要", "有没有", "怎么", "如何",
     }
 
     def __init__(self, skills_md_dir: str = None):
@@ -34,8 +35,27 @@ class SkillManager:
 
     def _tokenize_text(self, text: str) -> List[str]:
         prepared_text = text.replace("_", " ").replace("-", " ").lower()
-        tokens = re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]{2,}", prepared_text)
-        return [token for token in tokens if len(token) > 1 and token not in self.STOPWORDS]
+        raw_tokens = re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]{2,}", prepared_text)
+        expanded_tokens: list[str] = []
+        for token in raw_tokens:
+            if re.fullmatch(r"[\u4e00-\u9fff]{2,}", token):
+                expanded_tokens.append(token)
+                for size in (2, 3):
+                    if len(token) <= size:
+                        continue
+                    for index in range(len(token) - size + 1):
+                        expanded_tokens.append(token[index:index + size])
+            else:
+                expanded_tokens.append(token)
+
+        seen = set()
+        normalized_tokens = []
+        for token in expanded_tokens:
+            if len(token) <= 1 or token in self.STOPWORDS or token in seen:
+                continue
+            seen.add(token)
+            normalized_tokens.append(token)
+        return normalized_tokens
 
     def _match_ratio(self, overlap: int, task_terms: set[str]) -> float:
         if not task_terms:
@@ -53,6 +73,32 @@ class SkillManager:
             f"matched {overlap} term(s) [{matched_text}] "
             f"with ratio={match_ratio:.2f} for candidate={candidate_name}"
         )
+
+    def _best_term_match(
+        self,
+        candidate_term_sets: List[set[str]],
+        tool_terms: set[str],
+    ) -> tuple[list[str], int, float, set[str]]:
+        best_matched_terms: list[str] = []
+        best_overlap = 0
+        best_ratio = 0.0
+        best_task_terms: set[str] = set()
+
+        for task_terms in candidate_term_sets:
+            if not task_terms:
+                continue
+            matched_terms = sorted(task_terms & tool_terms)
+            overlap = len(matched_terms)
+            match_ratio = self._match_ratio(overlap, task_terms)
+            score = (match_ratio, overlap, -len(task_terms))
+            best_score = (best_ratio, best_overlap, -len(best_task_terms))
+            if score > best_score:
+                best_matched_terms = matched_terms
+                best_overlap = overlap
+                best_ratio = match_ratio
+                best_task_terms = task_terms
+
+        return best_matched_terms, best_overlap, best_ratio, best_task_terms
 
     def refresh_skills(self) -> int:
         self.loaded_skills = []
@@ -180,15 +226,21 @@ class SkillManager:
         return best_skill
 
     def find_relevant_tools(self, task_description: str, extracted_keywords: List[str], limit: int = 3) -> List[Dict[str, Any]]:
-        task_terms = set(self._normalize_keywords(extracted_keywords) + self._tokenize_text(task_description))
-        if not task_terms:
+        keyword_terms = set(self._normalize_keywords(extracted_keywords))
+        description_terms = set(self._tokenize_text(task_description))
+        candidate_term_sets = []
+        if keyword_terms:
+            candidate_term_sets.append(keyword_terms)
+        if description_terms and description_terms not in candidate_term_sets:
+            candidate_term_sets.append(description_terms)
+
+        if not candidate_term_sets:
             return []
 
         ranked_tools = []
         for tool_skill in self.loaded_tool_skills.values():
             tool_terms = set(tool_skill.get("keywords", []))
-            matched_terms = sorted(task_terms & tool_terms)
-            overlap = len(matched_terms)
+            matched_terms, overlap, match_ratio, task_terms = self._best_term_match(candidate_term_sets, tool_terms)
             if not self._passes_threshold(
                 overlap,
                 task_terms,
@@ -196,7 +248,6 @@ class SkillManager:
                 config.tool_skill_min_match_ratio,
             ):
                 continue
-            match_ratio = self._match_ratio(overlap, task_terms)
             ranked_tools.append(
                 (
                     overlap,

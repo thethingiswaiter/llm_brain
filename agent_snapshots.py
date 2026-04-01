@@ -7,6 +7,7 @@ from typing import Any
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 
 from config import config
+from cognitive.feature_extractor import DEFAULT_DOMAIN_LABEL
 from llm_manager import llm_manager
 
 
@@ -177,7 +178,7 @@ class AgentSnapshotStore:
 
         state["request_id"] = str(state.get("request_id", migrated.get("request_id", "")) or "")
         state["session_id"] = str(state.get("session_id", self.agent.session_id or "") or "")
-        state["domain_label"] = str(state.get("domain_label", "general") or "general")
+        state["domain_label"] = str(state.get("domain_label", DEFAULT_DOMAIN_LABEL) or DEFAULT_DOMAIN_LABEL)
         state["final_response"] = str(state.get("final_response", "") or "")
         state["blocked"] = bool(state.get("blocked", False))
 
@@ -415,7 +416,7 @@ class AgentSnapshotStore:
             "request_id": request_id,
             "session_id": stored_state.get("session_id", self.agent.session_id),
             "session_memory_id": stored_state.get("session_memory_id", 0),
-            "domain_label": stored_state.get("domain_label", "general"),
+            "domain_label": stored_state.get("domain_label", DEFAULT_DOMAIN_LABEL),
             "memory_summaries": stored_state.get("memory_summaries", []),
             "failed_tool_signals": stored_state.get("failed_tool_signals", {}),
             "retry_counts": stored_state.get("retry_counts", {}),

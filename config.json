@@ -1,5 +1,5 @@
 {
-    "default_model": "local_ollama",
+    "default_model": "remote_openai",
     "models": {
         "local_ollama": {
             "provider": "ollama",
@@ -8,9 +8,9 @@
         },
         "remote_openai": {
             "provider": "openai",
-            "model": "gpt-4o",
-            "base_url": "https://api.openai.com/v1",
-            "api_key": "YOUR_API_KEY_HERE"
+            "model": "deepseek-ai/DeepSeek-V3",
+            "base_url": "https://api.siliconflow.cn/v1",
+            "api_key": "sk-jbcbtxhxhezudufxfwedubhxniaqbuoyvsqjkjmecanisqoq"
         }
     },
     "mcp_dir": "mcp_servers",
@@ -20,7 +20,7 @@
     "memory_backup_dir": "memory/backups",
     "log_dir": "logs",
     "llm_log_file": "llm_trace.log",
-    "llm_log_max_chars": 4000,
+    "llm_log_max_chars": 10000,
     "state_snapshot_dir": "runtime_state/snapshots",
     "audit_log_dir": "runtime_state/audit",
     "llm_timeout_seconds": 45,

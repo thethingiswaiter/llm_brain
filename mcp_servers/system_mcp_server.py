@@ -159,6 +159,7 @@ def execute_terminal_command(
     allow_outside_workspace: bool = False,
     allow_destructive: bool = False,
 ) -> dict[str, Any]:
+    """Run an allowlisted terminal command in the workspace for safe system inspection tasks."""
     if not isinstance(command, str) or not command.strip():
         result = {"ok": False, "error": "Command must be a non-empty string."}
         _write_audit_event("execute_terminal_command", result)
@@ -249,6 +250,7 @@ def execute_terminal_command(
 
 
 def collect_system_info() -> dict[str, Any]:
+    """Return local system info including hostname, user, platform, and workspace details."""
     disk_root = Path(WORKSPACE_ROOT.anchor or WORKSPACE_ROOT.drive or "/")
     disk_usage = shutil.disk_usage(disk_root)
     result = {
@@ -347,6 +349,7 @@ if FastMCP is not None:
         allow_outside_workspace: bool = False,
         allow_destructive: bool = False,
     ) -> dict[str, Any]:
+        """Execute a safe allowlisted terminal command such as hostname or dir for local system inspection."""
         return execute_terminal_command(
             command=command,
             cwd=cwd,
@@ -357,10 +360,12 @@ if FastMCP is not None:
 
     @mcp.tool(name="get_system_info")
     def get_system_info_tool() -> dict[str, Any]:
+        """Get local system information such as hostname or host name, user, platform, and workspace root. 中文关键词: 主机名 主机 名称 系统 信息 电脑 名字。"""
         return collect_system_info()
 
     @mcp.tool(name="get_mcp_security_policy")
     def get_mcp_security_policy_tool() -> dict[str, Any]:
+        """Return MCP security policy, allowed roots, and allowed command prefixes."""
         return get_mcp_security_policy()
 
     @mcp.tool(name="inspect_file_system_path")
@@ -370,6 +375,7 @@ if FastMCP is not None:
         preview_lines: int = 20,
         allow_outside_workspace: bool = False,
     ) -> dict[str, Any]:
+        """Inspect a file system path and optionally preview file contents or directory entries."""
         return inspect_file_system_path(
             path=path,
             include_preview=include_preview,

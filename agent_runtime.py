@@ -7,6 +7,7 @@ from typing import Any
 from langchain_core.messages import HumanMessage
 
 from config import config
+from cognitive.feature_extractor import DEFAULT_DOMAIN_LABEL
 from llm_manager import LLMDependencyUnavailableError, RequestCancelledError, llm_manager
 
 
@@ -76,7 +77,7 @@ class AgentRuntime:
             "request_id": request_id,
             "session_id": session_id,
             "session_memory_id": 0,
-            "domain_label": "general",
+            "domain_label": DEFAULT_DOMAIN_LABEL,
             "memory_summaries": [],
             "retry_counts": {},
             "replan_counts": {},

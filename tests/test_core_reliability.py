@@ -52,6 +52,93 @@ class StructuredOutputParserTests(unittest.TestCase):
             parse_json_array("not a json payload")
 
 
+class TaskPlannerTests(unittest.TestCase):
+    def test_split_task_collapses_over_decomposed_direct_lookup_request(self):
+        import cognitive.planner as planner_module
+        from cognitive.planner import TaskPlanner
+
+        class FakeResponse:
+            def __init__(self, content):
+                self.content = content
+
+        planner = TaskPlanner()
+        original_invoke = planner_module.llm_manager.invoke
+        planner_module.llm_manager.invoke = lambda prompt, source="": FakeResponse(
+            """```json
+            [
+              {"id": 1, "description": "Identify the system or environment where the hostname is to be queried.", "expected_outcome": "Target system identified."},
+              {"id": 2, "description": "Use the appropriate command-line tool based on the OS.", "expected_outcome": "Command output collected."},
+              {"id": 3, "description": "Parse the command output to extract the hostname.", "expected_outcome": "Hostname extracted."},
+              {"id": 4, "description": "Verify the hostname matches expected patterns.", "expected_outcome": "Hostname validated."},
+              {"id": 5, "description": "Return or display the hostname to the user.", "expected_outcome": "Hostname returned."}
+            ]
+            ```"""
+        )
+        try:
+            result = planner.split_task("查询一下主机名称")
+        finally:
+            planner_module.llm_manager.invoke = original_invoke
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["description"], "查询一下主机名称")
+
+
+class DomainClassificationTests(unittest.TestCase):
+    def test_normalize_domain_label_uses_chinese_tree_only(self):
+        from cognitive.feature_extractor import CognitiveSystem, DEFAULT_DOMAIN_LABEL
+
+        system = CognitiveSystem()
+
+        self.assertEqual(system.normalize_domain_label("计算机"), "计算机")
+        self.assertEqual(system.normalize_domain_label("其他"), DEFAULT_DOMAIN_LABEL)
+        self.assertEqual(system.normalize_domain_label("Technology/Hardware"), DEFAULT_DOMAIN_LABEL)
+
+
+class ObservabilityMetricsTests(unittest.TestCase):
+    def setUp(self):
+        self.original_memory_db_path = config.memory_db_path
+        self.original_memory_backup_dir = config.memory_backup_dir
+        self.original_state_snapshot_dir = config.state_snapshot_dir
+        self.tempdir = tempfile.TemporaryDirectory()
+
+        config.memory_db_path = os.path.join(self.tempdir.name, "memory.db")
+        config.memory_backup_dir = os.path.join(self.tempdir.name, "backups")
+        config.state_snapshot_dir = os.path.join(self.tempdir.name, "snapshots")
+
+        import agent_core
+
+        self.agent_core_module = importlib.reload(agent_core)
+        self.agent = self.agent_core_module.AgentCore()
+
+    def tearDown(self):
+        try:
+            self.agent.mcp.close_all()
+        except Exception:
+            pass
+        config.memory_db_path = self.original_memory_db_path
+        config.memory_backup_dir = self.original_memory_backup_dir
+        config.state_snapshot_dir = self.original_state_snapshot_dir
+        self.tempdir.cleanup()
+
+    def test_build_request_metrics_deduplicates_reentered_subtask_started_events(self):
+        events = [
+            {"event_type": "checkpoint", "stage": "subtask_started", "details": "index=1 | description=查询主机名称", "logged_at": "2026-04-01 14:00:00,000"},
+            {"event_type": "checkpoint", "stage": "tool_started", "details": "tool=get_system_info", "logged_at": "2026-04-01 14:00:01,000"},
+            {"event_type": "checkpoint", "stage": "tool_succeeded", "details": "tool=get_system_info", "logged_at": "2026-04-01 14:00:02,000"},
+            {"event_type": "checkpoint", "stage": "subtask_started", "details": "index=1 | description=查询主机名称", "logged_at": "2026-04-01 14:00:03,000"},
+            {"event_type": "checkpoint", "stage": "reflection_completed", "details": "index=1 | success=True | action=continue", "logged_at": "2026-04-01 14:00:04,000"},
+        ]
+
+        metrics = self.agent.observability.build_request_metrics(
+            events,
+            latest_state={"plan": [{"id": 1, "description": "查询主机名称"}], "retry_counts": {}},
+            status="completed",
+        )
+
+        self.assertEqual(metrics["subtask_count"], 1)
+        self.assertEqual(metrics["tool_call_count"], 1)
+
+
 class AgentStateSnapshotTests(unittest.TestCase):
     def setUp(self):
         self.original_memory_db_path = config.memory_db_path
@@ -1559,8 +1646,8 @@ class ToolRerouteTests(unittest.TestCase):
             recent_failures=[{"error_type": "invalid_arguments", "retryable": False, "message": "missing city"}],
         )
 
-        self.assertIn("Do not guess missing tool arguments", guidance)
-        self.assertIn("Ask the user explicitly", guidance)
+        self.assertIn("不要猜测缺失的工具参数", guidance)
+        self.assertIn("请明确向用户询问", guidance)
 
     def test_build_no_tool_guidance_prefers_safe_direct_answer_for_high_risk_history(self):
         guidance = self.agent._build_no_tool_guidance(
@@ -1569,14 +1656,14 @@ class ToolRerouteTests(unittest.TestCase):
             reroute_reason="historical failure severity marked the available tool route as unsafe",
         )
 
-        self.assertIn("Do not call tools", guidance)
-        self.assertIn("Provide a direct answer only if it can be produced safely", guidance)
+        self.assertIn("不要调用工具", guidance)
+        self.assertIn("只有在现有上下文足以安全完成任务时", guidance)
 
     def test_build_no_tool_guidance_is_available_without_recent_failures(self):
         guidance = self.agent._build_no_tool_guidance("normal", recent_failures=[])
 
-        self.assertIn("provide the best direct answer without tools", guidance.lower())
-        self.assertIn("ask the user", guidance.lower())
+        self.assertIn("请直接给出最佳答案", guidance)
+        self.assertIn("请向用户询问", guidance)
 
 
 class RequestCancellationTests(unittest.TestCase):

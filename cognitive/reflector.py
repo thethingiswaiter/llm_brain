@@ -13,22 +13,23 @@ class Reflector:
             - action: 'continue', 'retry', 'ask_user'
         """
         prompt = f"""
-        You are a reflection AI analyzing a subtask execution.
-        Subtask: {subtask}
-        Expected Outcome (Prediction): {expected_outcome}
-        Actual Result: {actual_result}
+        你是一个中文优先的反思与校验代理，负责分析当前子任务是否完成。
+        子任务: {subtask}
+        预期结果: {expected_outcome}
+        实际结果: {actual_result}
 
-        Determine if the actual result met the expected outcome.
-        If it failed, analyze why (e.g., missing features, missing information, logic error).
-        Decide the next action:
+        请判断实际结果是否满足预期结果。
+        如果失败，请分析原因，例如信息缺失、参数不足、逻辑错误、工具受限等。
+        然后决定下一步动作:
         - "continue" if success or failure is trivial and doesn't block progress.
         - "retry" if a different approach to the same task might work.
         - "ask_user" if completely blocked and extra knowledge/action is needed.
 
-        Respond strictly in JSON:
+        只返回 JSON，不要输出解释或 Markdown 代码块。
+        请严格按以下 JSON 返回:
         {{
             "success": true/false,
-            "reflection": "Detailed analysis notes",
+            "reflection": "中文分析说明",
             "action": "continue" / "retry" / "ask_user"
         }}
         """

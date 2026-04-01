@@ -106,6 +106,14 @@ class SkillRoutingTests(unittest.TestCase):
         self.assertEqual(capabilities["tool_skills"][0]["name"], "get_mock_weather")
         self.assertTrue(capabilities["tool_reasons"][0])
 
+    def test_tool_match_supports_contiguous_chinese_query_terms(self):
+        host_tool = FakeTool("get_system_info", "Get hostname and system info. 中文关键词: 主机名 主机 名称 系统 信息")
+        self.manager.register_tool(host_tool)
+
+        matched = self.manager.find_relevant_tools("查询一下主机名称", ["查询", "主机", "名称"])
+
+        self.assertEqual([item["name"] for item in matched], ["get_system_info"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -15,7 +15,7 @@ from langchain_core.tools import StructuredTool
 from config import config
 
 # New Cognitive Imports
-from cognitive.feature_extractor import CognitiveSystem
+from cognitive.feature_extractor import CognitiveSystem, DEFAULT_DOMAIN_LABEL
 from cognitive.planner import TaskPlanner
 from cognitive.reflector import Reflector
 from agent_observability import AgentObservability
@@ -242,16 +242,16 @@ class AgentCore:
             )
 
         replan_prompt_sections = [
-            "Replan the failed subtask into a safer sequence of smaller subtasks.",
-            f"Original user request: {original_request}",
-            f"Failed subtask: {current_subtask.get('description', '')}",
-            f"Expected outcome: {current_subtask.get('expected_outcome', '')}",
-            f"Observed output: {actual_output}",
-            f"Reflection note: {reflection_note}",
-            "Planning goal: avoid repeating the exact failed approach; prefer collecting missing information, decomposing the task further, or switching to a safer sequence.",
+            "请将失败的子任务重新规划为更安全、更小粒度的一组子任务。",
+            f"原始用户请求: {original_request}",
+            f"失败子任务: {current_subtask.get('description', '')}",
+            f"预期结果: {current_subtask.get('expected_outcome', '')}",
+            f"实际观察到的输出: {actual_output}",
+            f"反思说明: {reflection_note}",
+            "规划目标: 避免重复同样的失败路径，优先考虑补充缺失信息、进一步拆分任务，或切换到更安全的执行顺序。",
         ]
         if failure_lines:
-            replan_prompt_sections.append("Recent tool failures:\n" + "\n".join(failure_lines))
+            replan_prompt_sections.append("最近的工具失败记录:\n" + "\n".join(failure_lines))
 
         replanned = self.planner.split_task("\n\n".join(replan_prompt_sections))
         if not self._plans_are_meaningfully_different([current_subtask], replanned):
@@ -259,7 +259,19 @@ class AgentCore:
         return replanned
 
     def _tokenize_text(self, text: str) -> set[str]:
-        return {token for token in re.findall(r"[a-zA-Z0-9_]+", text.lower()) if len(token) > 2}
+        normalized = text.replace("_", " ").replace("-", " ").lower()
+        expanded_tokens = set()
+        for token in re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]{2,}", normalized):
+            if len(token) <= 1:
+                continue
+            expanded_tokens.add(token)
+            if re.fullmatch(r"[\u4e00-\u9fff]{2,}", token):
+                for size in (2, 3):
+                    if len(token) <= size:
+                        continue
+                    for index in range(len(token) - size + 1):
+                        expanded_tokens.add(token[index:index + size])
+        return expanded_tokens
 
     def _classify_tool_exception(self, exc: Exception) -> tuple[str, bool]:
         return self.tool_runtime.classify_tool_exception(exc)
@@ -514,7 +526,7 @@ class AgentCore:
             return
 
         for filename in sorted(os.listdir(mcp_path)):
-            if filename.endswith((".json", ".yaml", ".yml")):
+            if filename.endswith((".json", ".yaml", ".yml")) or filename.endswith("_mcp_server.py"):
                 self.load_mcp_server(filename, rebuild_graph=False)
 
     def select_active_tools(self, query: str):
@@ -523,7 +535,14 @@ class AgentCore:
         based on the user's query semantics, to prevent token overflow.
         Returns the subset of selected tools.
         """
-        capability_bundle = self.skills.assign_capabilities_to_task(query, list(self._tokenize_text(query)))
+        query_terms = list(self._tokenize_text(query))
+        known_tool_terms = {
+            keyword
+            for tool_skill in self.skills.loaded_tool_skills.values()
+            for keyword in tool_skill.get("keywords", [])
+        }
+        routing_terms = [term for term in query_terms if term in known_tool_terms] or query_terms
+        capability_bundle = self.skills.assign_capabilities_to_task(query, routing_terms)
         selected_tools = capability_bundle.get("tools", [])
         if selected_tools:
             return selected_tools
@@ -922,45 +941,49 @@ class AgentCore:
                     console=True,
                 )
             
-            # Generate local prompt for LLM
-            prompt_sections = [
-                f"Original user request: {state['messages'][0].content}",
-                f"Executing Subtask {idx+1}: {subtask_desc}",
-            ]
-            if memory_sections:
-                prompt_sections.append("\n\n".join(memory_sections))
-            if skill_context:
-                prompt_sections.append(skill_context.strip())
-            if tool_skills:
-                tool_context = "Suggested tools:\n" + "\n".join(
-                    f"- {item['name']}: {item.get('description', '')} | reason: {item.get('route_reason', '')}" for item in tool_skills
-                )
-                prompt_sections.append(tool_context)
-            if recent_tool_failures:
-                failure_context_lines = [
-                    f"- {item.get('tool')}: {item.get('error_type')} | retryable={item.get('retryable')} | {item.get('message')}"
-                    for item in recent_tool_failures
+            continuing_after_tool = isinstance(state["messages"][-1], ToolMessage)
+            if continuing_after_tool:
+                messages = state["messages"]
+            else:
+                # Generate local prompt for LLM only for the initial subtask dispatch.
+                prompt_sections = [
+                    f"原始用户请求: {state['messages'][0].content}",
+                    f"正在执行子任务 {idx+1}: {subtask_desc}",
                 ]
-                prompt_sections.append(
-                    "Recent tool failures:\n" + "\n".join(failure_context_lines)
-                )
-                if reroute_mode == "alternative_tools" and reroute_plan.get("alternatives"):
+                if memory_sections:
+                    prompt_sections.append("\n\n".join(memory_sections))
+                if skill_context:
+                    prompt_sections.append(skill_context.strip())
+                if tool_skills:
+                    tool_context = "建议使用的工具:\n" + "\n".join(
+                        f"- {item['name']}: {item.get('description', '')} | reason: {item.get('route_reason', '')}" for item in tool_skills
+                    )
+                    prompt_sections.append(tool_context)
+                if recent_tool_failures:
+                    failure_context_lines = [
+                        f"- {item.get('tool')}: {item.get('error_type')} | retryable={item.get('retryable')} | {item.get('message')}"
+                        for item in recent_tool_failures
+                    ]
                     prompt_sections.append(
-                        "Alternative tools selected after reroute:\n" +
-                        "\n".join(f"- {name}" for name in reroute_plan["alternatives"])
+                        "最近的工具失败记录:\n" + "\n".join(failure_context_lines)
                     )
-                if reroute_plan.get("reason"):
-                    prompt_sections.append(f"Reroute decision: {reroute_plan['reason']}")
-            if not selected_tools:
-                prompt_sections.append(
-                    self._build_no_tool_guidance(
-                        reroute_mode,
-                        recent_failures=recent_tool_failures,
-                        reroute_reason=reroute_plan.get("reason", ""),
+                    if reroute_mode == "alternative_tools" and reroute_plan.get("alternatives"):
+                        prompt_sections.append(
+                            "重路由后选择的备选工具:\n" +
+                            "\n".join(f"- {name}" for name in reroute_plan["alternatives"])
+                        )
+                    if reroute_plan.get("reason"):
+                        prompt_sections.append(f"重路由决策: {reroute_plan['reason']}")
+                if not selected_tools:
+                    prompt_sections.append(
+                        self._build_no_tool_guidance(
+                            reroute_mode,
+                            recent_failures=recent_tool_failures,
+                            reroute_reason=reroute_plan.get("reason", ""),
+                        )
                     )
-                )
-            prompt = "\n\n".join(prompt_sections)
-            messages = state["messages"] + [HumanMessage(content=prompt)]
+                prompt = "\n\n".join(prompt_sections)
+                messages = state["messages"] + [HumanMessage(content=prompt)]
 
             llm = llm_manager.get_llm()
             if selected_tools:
@@ -980,11 +1003,12 @@ class AgentCore:
             )
             llm_manager.log_checkpoint(
                 "subtask_llm_dispatch",
-                details=f"index={idx + 1} | tool_count={len(selected_tools)}",
+                details=f"index={idx + 1} | tool_count={len(selected_tools)} | after_tool={continuing_after_tool}",
                 request_id=request_id,
                 session_id=state.get("session_id", ""),
                 subtask_index=idx + 1,
                 tool_count=len(selected_tools),
+                after_tool=continuing_after_tool,
             )
                 
             response = llm_manager.invoke(messages, source="agent.execute_subtask", llm=llm)
@@ -1030,7 +1054,7 @@ class AgentCore:
             self._record_step_memory(
                 state.get("session_id", self.session_id),
                 request_id,
-                state.get("domain_label", "general"),
+                state.get("domain_label", DEFAULT_DOMAIN_LABEL),
                 current_subtask.get("description", ""),
                 actual,
                 reflection_note,
@@ -1043,9 +1067,7 @@ class AgentCore:
             retry_count = retry_counts.get(retry_key, 0)
             
             if not success and action == "ask_user":
-                blocked_message = (
-                    f"Error blocked subtask. Reflection analysis: {reflection_note}\nNeed user intervention."
-                )
+                blocked_message = actual.strip() if isinstance(actual, str) and actual.strip() else "Need user intervention."
                 llm_manager.log_checkpoint(
                     "agent_blocked",
                     details=f"index={idx + 1} | action=ask_user",

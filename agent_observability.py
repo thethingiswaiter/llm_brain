@@ -68,6 +68,15 @@ class AgentObservability:
                 parsed[key] = match.group(1).strip()
         return parsed
 
+    def parse_subtask_index_from_details(self, details: str) -> int | None:
+        match = re.search(r"(?:^|\|)\s*index=(\d+)", str(details or ""))
+        if not match:
+            return None
+        try:
+            return int(match.group(1))
+        except ValueError:
+            return None
+
     def enrich_failure_detail_fields(self, details: str, latest_extra: dict[str, Any]) -> str:
         parsed = self.parse_failure_detail_fields(details)
         merged = dict(parsed)
@@ -328,7 +337,12 @@ class AgentObservability:
             2,
         )
         reflection_failure_count = 0
+        unique_subtask_indexes: set[int] = set()
         for event in checkpoint_events:
+            if event.get("stage") == "subtask_started":
+                subtask_index = self.parse_subtask_index_from_details(str(event.get("details", "")))
+                if subtask_index is not None:
+                    unique_subtask_indexes.add(subtask_index)
             if event.get("stage") != "reflection_completed":
                 continue
             success = self.extract_bool_from_event(event, "success")
@@ -342,7 +356,7 @@ class AgentObservability:
         tool_rejections = stage_counts.get("tool_rejected", 0)
         tool_cancelled = stage_counts.get("tool_cancelled", 0)
         tool_detached = stage_counts.get("tool_detached", 0)
-        subtask_count = stage_counts.get("subtask_started", 0) or len(latest_state.get("plan", []))
+        subtask_count = len(unique_subtask_indexes) or len(latest_state.get("plan", [])) or stage_counts.get("subtask_started", 0)
 
         return {
             "total_duration_ms": total_duration_ms,

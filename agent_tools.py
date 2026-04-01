@@ -14,6 +14,10 @@ from llm_manager import RequestCancelledError, llm_manager
 
 
 class AgentToolRuntime:
+    CITY_FIELD_HINTS = ("city", "location", "城市", "地点", "地区", "地址", "位置")
+    DATE_FIELD_HINTS = ("date", "日期")
+    TIME_FIELD_HINTS = ("time", "timestamp", "datetime", "时间", "时刻", "时间点", "日期时间")
+
     FAILURE_TYPE_WEIGHTS = {
         "invalid_arguments": 4,
         "dependency_unavailable": 3,
@@ -175,10 +179,11 @@ class AgentToolRuntime:
 
     def validate_named_argument_heuristics(self, field_name: str, value: Any) -> str:
         normalized_name = field_name.strip().lower()
+        raw_name = field_name.strip()
         if value is None:
             return ""
 
-        if "city" in normalized_name or "location" in normalized_name:
+        if any(hint in normalized_name or hint in raw_name for hint in self.CITY_FIELD_HINTS):
             if not isinstance(value, str) or not value.strip():
                 return f"Argument {field_name} must be a non-empty city/location name."
             compact = value.strip()
@@ -186,16 +191,26 @@ class AgentToolRuntime:
                 return f"Argument {field_name} does not look like a valid city/location name: {value}"
 
         date_pattern = r"^\d{4}[-/]\d{2}[-/]\d{2}$"
+        date_pattern_cn = r"^\d{4}年\d{1,2}月\d{1,2}日$"
         time_pattern = r"^\d{2}:\d{2}(:\d{2})?$"
+        time_pattern_cn = r"^(上午|中午|下午|晚上)?\s*\d{1,2}点(半|\d{1,2}分)?$"
         datetime_pattern = r"^\d{4}[-/]\d{2}[-/]\d{2}[ T]\d{2}:\d{2}(:\d{2})?$"
+        datetime_pattern_cn = r"^\d{4}年\d{1,2}月\d{1,2}日\s*(上午|中午|下午|晚上)?\s*\d{1,2}点(半|\d{1,2}分)?$"
 
-        if "date" in normalized_name and isinstance(value, str):
-            if not re.match(date_pattern, value.strip()):
+        if any(hint in normalized_name or hint in raw_name for hint in self.DATE_FIELD_HINTS) and isinstance(value, str):
+            if not (re.match(date_pattern, value.strip()) or re.match(date_pattern_cn, value.strip())):
                 return f"Argument {field_name} must use a recognizable date format like YYYY-MM-DD."
 
-        if normalized_name in {"time", "timestamp", "datetime"} or normalized_name.endswith("_time"):
+        if (
+            normalized_name in {"time", "timestamp", "datetime"}
+            or normalized_name.endswith("_time")
+            or any(hint in normalized_name or hint in raw_name for hint in self.TIME_FIELD_HINTS)
+        ):
             if isinstance(value, str) and not (
-                re.match(time_pattern, value.strip()) or re.match(datetime_pattern, value.strip())
+                re.match(time_pattern, value.strip())
+                or re.match(datetime_pattern, value.strip())
+                or re.match(time_pattern_cn, value.strip())
+                or re.match(datetime_pattern_cn, value.strip())
             ):
                 return f"Argument {field_name} must use a recognizable time format like HH:MM or YYYY-MM-DD HH:MM:SS."
 
@@ -746,29 +761,29 @@ class AgentToolRuntime:
 
         if normalized_mode == "fallback_invalid_arguments" or "invalid_arguments" in error_types:
             return (
-                "Tool-assisted execution is currently unavailable for this subtask. "
-                "Do not guess missing tool arguments or hidden parameters. "
-                "Ask the user explicitly for the missing inputs needed to continue."
+                "当前子任务暂时无法安全使用工具执行。"
+                "不要猜测缺失的工具参数或隐藏参数。"
+                "请明确向用户询问继续执行所需的缺失输入。"
             )
 
         if normalized_mode == "fallback_high_risk_history":
             return (
-                "Tool-assisted execution is currently unavailable for this subtask because the remaining tool paths are high-risk. "
-                "Do not call tools. Provide a direct answer only if it can be produced safely from the existing context. "
-                "If external verification or side effects are still required, explain the limitation clearly and ask the user how to proceed."
+                "当前子任务暂时无法安全使用工具执行，因为剩余工具路径风险较高。"
+                "不要调用工具。只有在现有上下文足以安全完成任务时，才直接给出答案。"
+                "如果仍需要外部验证、额外参数或实际副作用，请清楚说明限制并询问用户如何继续。"
             )
 
         if normalized_mode in {"fallback_retryable_no_alternative", "fallback_no_tools", "normal"}:
             guidance = (
-                "Tool-assisted execution is currently unavailable for this subtask. "
-                "If the task can be completed safely from the existing context, provide the best direct answer without tools. "
-                "If essential external data, parameters, or side effects are still required, ask the user for the missing information or explain the limitation clearly."
+                "当前子任务暂时无法使用工具执行。"
+                "如果依靠现有上下文就能安全完成任务，请直接给出最佳答案。"
+                "如果仍然缺少关键外部数据、参数或必须发生实际副作用，请向用户询问缺失信息或明确说明限制。"
             )
             if reroute_reason:
-                guidance += f" Current limitation: {reroute_reason}."
+                guidance += f" 当前限制: {reroute_reason}。"
             return guidance
 
         return (
-            "Tool-assisted execution is currently unavailable for this subtask. "
-            "Prefer a safe direct answer when possible; otherwise ask the user for the missing information or next-step decision."
+            "当前子任务暂时无法使用工具执行。"
+            "如果可以安全直接回答，就直接回答；否则请向用户询问缺失信息或下一步决策。"
         )

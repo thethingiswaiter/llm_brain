@@ -74,6 +74,30 @@ class ToolArgumentPrevalidationTests(unittest.TestCase):
         self.assertEqual(payload["error_type"], "invalid_arguments")
         self.assertIn("time format", payload["message"].lower())
 
+    def test_wrapped_tool_accepts_chinese_field_names_and_datetime_formats(self):
+        @tool
+        def schedule_trip(出发城市: str, 出发时间: str, 日期: str) -> str:
+            """Schedule a trip with Chinese argument names."""
+            return f"{出发城市}-{出发时间}-{日期}"
+
+        safe_tool = self.agent._wrap_tool_for_runtime(schedule_trip)
+        result = safe_tool.invoke({"出发城市": "北京", "出发时间": "下午3点半", "日期": "2026年4月1日"})
+
+        self.assertEqual(result, "北京-下午3点半-2026年4月1日")
+
+    def test_wrapped_tool_rejects_invalid_chinese_city_argument(self):
+        @tool
+        def get_weather_cn(城市: str) -> str:
+            """Get weather for a Chinese city field."""
+            return 城市
+
+        safe_tool = self.agent._wrap_tool_for_runtime(get_weather_cn)
+        payload = json.loads(safe_tool.invoke({"城市": "12345"}))
+
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error_type"], "invalid_arguments")
+        self.assertIn("城市", payload["message"])
+
     def test_prevalidate_accepts_valid_arguments(self):
         @tool
         def calculate_sum(a: float, b: float) -> float:

@@ -4,7 +4,8 @@ import os
 import tempfile
 import unittest
 
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.tools import tool
 
 from config import config
 
@@ -832,7 +833,7 @@ class AgentIntegrationFlowTests(unittest.TestCase):
                 return AIMessage(content="weather is sunny")
 
         self.agent.cognitive.extract_features = lambda text: (["weather", "beijing"], "weather summary")
-        self.agent.cognitive.determine_domain = lambda text: "general"
+        self.agent.cognitive.determine_domain = lambda text: "综合性图书"
         self.agent.planner.split_task = lambda text: [
             {"id": 1, "description": "check weather in beijing", "expected_outcome": "provide the weather"}
         ]
@@ -866,18 +867,26 @@ class AgentIntegrationFlowTests(unittest.TestCase):
         self.assertEqual(summary["metrics"]["reflection_failure_count"], 0)
 
     def test_invoke_blocked_path_records_blocked_summary(self):
+        class ClarifyingLLM:
+            def bind_tools(self, tools):
+                return self
+
+            def invoke(self, payload):
+                return AIMessage(content="请确认要查询的是本机还是远程设备。")
+
         self._configure_successful_flow()
         self.agent.reflector.verify_and_reflect = lambda desc, expected, actual: (False, "missing parameter", "ask_user")
+        self.llm_manager_module.llm_manager.get_llm = lambda: ClarifyingLLM()
 
         result = self.agent.invoke("book something")
         request_id = self.agent.get_last_request_id()
         summary = self.agent.get_request_summary(request_id)
 
-        self.assertIn("Need user intervention.", result)
+        self.assertEqual(result, "请确认要查询的是本机还是远程设备。")
         self.assertIsNotNone(summary)
         self.assertEqual(summary["status"], "blocked")
         self.assertTrue(summary["blocked"])
-        self.assertIn("Need user intervention.", summary["final_response"])
+        self.assertEqual(summary["final_response"], "请确认要查询的是本机还是远程设备。")
         self.assertEqual(summary["metrics"]["reflection_failure_count"], 1)
         self.assertEqual(summary["metrics"]["blocked_rate"], 1.0)
 
@@ -888,8 +897,16 @@ class AgentIntegrationFlowTests(unittest.TestCase):
         self.assertEqual(first_result, "weather is sunny")
 
         self.agent.reflector.verify_and_reflect = lambda desc, expected, actual: (False, "missing parameter", "ask_user")
+        self.llm_manager_module.llm_manager.get_llm = lambda: type(
+            "ClarifyingLLM",
+            (),
+            {
+                "bind_tools": lambda self, tools: self,
+                "invoke": lambda self, payload: AIMessage(content="Need more booking details."),
+            },
+        )()
         second_result = self.agent.invoke("second request")
-        self.assertIn("Need user intervention.", second_result)
+        self.assertEqual(second_result, "Need more booking details.")
 
         recent = self.agent.get_recent_request_summaries(limit=2)
 
@@ -913,7 +930,7 @@ class AgentIntegrationFlowTests(unittest.TestCase):
                 return AIMessage(content=next(self.responses))
 
         def fake_split_task(text):
-            if "Replan the failed subtask" in text:
+            if "重新规划" in text or "Replan the failed subtask" in text:
                 return [
                     {"id": 1, "description": "collect missing input", "expected_outcome": "required input collected"},
                     {"id": 2, "description": "execute safer action", "expected_outcome": "stable result produced"},
@@ -928,7 +945,7 @@ class AgentIntegrationFlowTests(unittest.TestCase):
             return True, "verified", "continue"
 
         self.agent.cognitive.extract_features = lambda text: (["retry", "replan"], "retry summary")
-        self.agent.cognitive.determine_domain = lambda text: "general"
+        self.agent.cognitive.determine_domain = lambda text: "综合性图书"
         self.agent.planner.split_task = fake_split_task
         self.agent.reflector.verify_and_reflect = fake_reflect
         self.agent.skills.assign_capabilities_to_task = lambda desc, kws: {
@@ -950,6 +967,55 @@ class AgentIntegrationFlowTests(unittest.TestCase):
         self.assertEqual(summary["status"], "completed")
         self.assertEqual(summary["metrics"]["reflection_failure_count"], 1)
         self.assertTrue(any(item.get("stage") == "subtask_replanned" for item in summary["checkpoints"]))
+
+    def test_tool_call_continuation_does_not_append_human_message_after_tool_result(self):
+        @tool
+        def get_hostname() -> str:
+            """Get the local hostname."""
+            return "thething"
+
+        class ToolCallingLLM:
+            def __init__(self):
+                self.calls = []
+
+            def bind_tools(self, tools):
+                return self
+
+            def invoke(self, payload):
+                self.calls.append(payload)
+                if len(self.calls) == 1:
+                    self.test_case.assertIsInstance(payload[-1], HumanMessage)
+                    return AIMessage(
+                        content="",
+                        tool_calls=[{"name": "get_hostname", "args": {}, "id": "call_1", "type": "tool_call"}],
+                    )
+
+                self.test_case.assertIsInstance(payload[-1], ToolMessage)
+                self.test_case.assertNotIsInstance(payload[-1], HumanMessage)
+                return AIMessage(content="主机名称是 thething")
+
+        self.agent.add_tool(get_hostname)
+        llm = ToolCallingLLM()
+        llm.test_case = self
+        self.agent.cognitive.extract_features = lambda text: (["主机", "名称"], "hostname summary")
+        self.agent.cognitive.determine_domain = lambda text: "计算机"
+        self.agent.planner.split_task = lambda text: [
+            {"id": 1, "description": "查询主机名称", "expected_outcome": "返回主机名称"}
+        ]
+        self.agent.reflector.verify_and_reflect = lambda desc, expected, actual: (True, "verified", "continue")
+        self.agent.skills.assign_capabilities_to_task = lambda desc, kws: {
+            "prompt_skill": None,
+            "prompt_skill_reason": "",
+            "tool_skills": [{"name": "get_hostname", "tool": next(tool for tool in self.agent.tools if getattr(tool, "name", "") == "get_hostname"), "description": "Get the local hostname.", "route_reason": "matched hostname", "overlap_count": 2, "match_ratio": 1.0}],
+            "tool_reasons": ["matched hostname"],
+            "tools": [next(tool for tool in self.agent.tools if getattr(tool, "name", "") == "get_hostname")],
+        }
+        self.llm_manager_module.llm_manager.get_llm = lambda: llm
+
+        result = self.agent.invoke("查询一下主机名称")
+
+        self.assertEqual(result, "主机名称是 thething")
+        self.assertEqual(len(llm.calls), 2)
 
 
 if __name__ == "__main__":
