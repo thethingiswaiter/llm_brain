@@ -1,8 +1,11 @@
 import logging
+import os
+import sys
 import time
 from typing import Any
 
 from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import AIMessage
 from config import config
 from llm_factory import build_llm
 from llm_logging import LLMLogging
@@ -11,6 +14,11 @@ from llm_runtime import LLMRuntime, RequestCancelledError
 
 class LLMDependencyUnavailableError(RuntimeError):
     pass
+
+
+class OfflineTestLLM:
+    def invoke(self, payload):
+        return AIMessage(content="[offline-test-llm] live model call skipped during unittest")
 
 class LLMManager:
     def __init__(self):
@@ -152,6 +160,15 @@ class LLMManager:
         return f"Successfully switched to {provider}:{model}"
 
     def _update_llm(self):
+        disable_live_llm = os.getenv("LLM_BRAIN_DISABLE_LIVE_LLM", "").strip().lower()
+        if disable_live_llm in {"1", "true", "yes", "on"}:
+            self._current_llm = OfflineTestLLM()
+            self._llm_init_error = None
+            return
+        if disable_live_llm == "" and "unittest" in sys.modules:
+            self._current_llm = OfflineTestLLM()
+            self._llm_init_error = None
+            return
         self._current_llm = build_llm(config.llm_config)
         self._llm_init_error = None
 

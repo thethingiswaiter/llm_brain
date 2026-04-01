@@ -1,10 +1,20 @@
 import json
 import logging
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from config import config
+from time_utils import CHINA_TIMEZONE
+
+
+class ChinaTimezoneFormatter(logging.Formatter):
+    def formatTime(self, record, datefmt=None):
+        dt = datetime.fromtimestamp(record.created, tz=CHINA_TIMEZONE)
+        if datefmt:
+            return dt.strftime(datefmt)
+        return dt.isoformat(sep=" ", timespec="seconds")
 
 
 class LLMLogging:
@@ -34,7 +44,7 @@ class LLMLogging:
 
         logger.setLevel(logging.INFO)
         logger.propagate = False
-        formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+        formatter = ChinaTimezoneFormatter("%(asctime)s | %(levelname)s | %(message)s")
 
         if not logger.handlers:
             file_handler = logging.FileHandler(log_path, encoding="utf-8")

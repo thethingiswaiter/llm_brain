@@ -1,50 +1,86 @@
 {
-    "default_model": "remote_openai",
-    "models": {
-        "local_ollama": {
-            "provider": "ollama",
-            "model": "lfm2:latest",
-            "base_url": "http://localhost:11434"
+    "llm": {
+        "default_model_key": "remote_openai",
+        "models": {
+            "local_ollama": {
+                "provider": "ollama",
+                "model": "lfm2:latest",
+                "base_url": "http://localhost:11434"
+            },
+            "remote_openai": {
+                "provider": "openai",
+                "model": "deepseek-ai/DeepSeek-V3",
+                "base_url": "https://api.siliconflow.cn/v1",
+                "api_key": "sk-jbcbtxhxhezudufxfwedubhxniaqbuoyvsqjkjmecanisqoq"
+            }
         },
-        "remote_openai": {
-            "provider": "openai",
-            "model": "deepseek-ai/DeepSeek-V3",
-            "base_url": "https://api.siliconflow.cn/v1",
-            "api_key": "sk-jbcbtxhxhezudufxfwedubhxniaqbuoyvsqjkjmecanisqoq"
+        "logging": {
+            "file_name": "llm_trace.log",
+            "max_chars": 10000
+        },
+        "timeouts": {
+            "invoke_seconds": 45
         }
     },
-    "mcp_dir": "mcp_servers",
-    "skills_dir": "skills",
-    "skills_md_dir": "skills_md",
-    "memory_db_path": "memory/memory.db",
-    "memory_backup_dir": "memory/backups",
-    "log_dir": "logs",
-    "llm_log_file": "llm_trace.log",
-    "llm_log_max_chars": 10000,
-    "state_snapshot_dir": "runtime_state/snapshots",
-    "audit_log_dir": "runtime_state/audit",
-    "llm_timeout_seconds": 45,
-    "tool_timeout_seconds": 20,
-    "request_timeout_seconds": 120,
-    "tool_cancellation_grace_seconds": 0.2,
-    "log_retention_days": 7,
-    "snapshot_retention_days": 7,
-    "audit_log_retention_days": 14,
-    "memory_backup_retention_days": 14,
-    "log_retention_max_files": 20,
-    "snapshot_retention_max_request_dirs": 200,
-    "audit_log_retention_max_files": 50,
-    "memory_backup_retention_max_files": 20,
-    "log_retention_max_bytes": 0,
-    "snapshot_retention_max_bytes": 0,
-    "audit_log_retention_max_bytes": 0,
-    "memory_backup_retention_max_bytes": 0,
-    "retention_auto_prune_enabled": true,
-    "retention_auto_prune_min_interval_seconds": 300,
-    "historical_tool_failure_reroute_threshold": 2,
-    "historical_tool_failure_severity_threshold": 6,
-    "prompt_skill_min_overlap": 1,
-    "prompt_skill_min_match_ratio": 0.34,
-    "tool_skill_min_overlap": 1,
-    "tool_skill_min_match_ratio": 0.34
+    "paths": {
+        "mcp_servers_dir": "mcp_servers",
+        "skills_dir": "skills",
+        "skills_md_dir": "skills_md",
+        "logs_dir": "logs",
+        "runtime": {
+            "snapshot_dir": "runtime_state/snapshots",
+            "audit_dir": "runtime_state/audit"
+        },
+        "memory": {
+            "db_file": "memory/memory.db",
+            "backup_dir": "memory/backups"
+        }
+    },
+    "timeouts": {
+        "tool_invoke_seconds": 20,
+        "request_total_seconds": 120,
+        "tool_cancellation_grace_seconds": 0.2
+    },
+    "retention": {
+        "auto_prune": {
+            "enabled": true,
+            "min_interval_seconds": 300
+        },
+        "logs": {
+            "max_age_days": 7,
+            "max_files": 20,
+            "max_bytes": 0
+        },
+        "snapshots": {
+            "max_age_days": 7,
+            "max_request_dirs": 200,
+            "max_bytes": 0
+        },
+        "audit": {
+            "max_age_days": 14,
+            "max_files": 50,
+            "max_bytes": 0
+        },
+        "memory_backups": {
+            "max_age_days": 14,
+            "max_files": 20,
+            "max_bytes": 0
+        }
+    },
+    "routing": {
+        "historical_tool_failures": {
+            "reroute_threshold": 2,
+            "severity_threshold": 6
+        },
+        "skill_match": {
+            "prompt": {
+                "min_overlap": 1,
+                "min_ratio": 0.34
+            },
+            "tool": {
+                "min_overlap": 1,
+                "min_ratio": 0.34
+            }
+        }
+    }
 }

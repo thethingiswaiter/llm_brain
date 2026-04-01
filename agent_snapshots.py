@@ -7,6 +7,7 @@ from typing import Any
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 
 from config import config
+from time_utils import now_china
 from cognitive.feature_extractor import DEFAULT_DOMAIN_LABEL
 from llm_manager import llm_manager
 
@@ -205,7 +206,7 @@ class AgentSnapshotStore:
         snapshot_path = os.path.join(request_dir, f"{snapshot_index:03d}_{stage}.json")
         payload = {
             "schema_version": SNAPSHOT_SCHEMA_VERSION,
-            "created_at": datetime.now(timezone.utc).isoformat(),
+            "created_at": now_china().isoformat(),
             "stage": stage,
             "request_id": request_id,
             "state": self.serialize_state_snapshot(state or {}),

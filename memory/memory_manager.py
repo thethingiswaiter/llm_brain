@@ -1,9 +1,9 @@
 import sqlite3
 import os
 import json
-from datetime import datetime
 from typing import Optional
 from config import config
+from time_utils import now_china_iso
 
 class MemoryManager:
     QUALITY_PRIORITY = {
@@ -134,7 +134,7 @@ class MemoryManager:
                    raw_input: str, raw_output: str, large_file_path: str = "",
                    request_id: Optional[str] = None, memory_type: str = "general",
                    quality_tags = None) -> int:
-        timestamp = datetime.now().isoformat()
+        timestamp = now_china_iso()
         keywords_str = json.dumps(keywords)
         normalized_memory_type = (memory_type or "general").strip().lower()
         quality_tags_str = json.dumps(self._normalize_quality_tags(quality_tags), ensure_ascii=False)

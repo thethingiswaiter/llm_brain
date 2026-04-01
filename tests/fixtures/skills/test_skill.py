@@ -2,10 +2,13 @@ from langchain_core.tools import tool
 import datetime
 
 
+CHINA_TIMEZONE = datetime.timezone(datetime.timedelta(hours=8), name="CST")
+
+
 @tool
 def get_current_time() -> str:
     """获取当前的日期和时间。当用户询问时间、今天是几号等问题时使用此工具。"""
-    now = datetime.datetime.now()
+    now = datetime.datetime.now(CHINA_TIMEZONE)
     return f"当前的系统时间是 {now.strftime('%Y-%m-%d %H:%M:%S')}"
 
 

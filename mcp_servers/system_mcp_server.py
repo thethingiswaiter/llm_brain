@@ -15,6 +15,7 @@ if str(WORKSPACE_ROOT) not in sys.path:
     sys.path.insert(0, str(WORKSPACE_ROOT))
 
 from config import config
+from time_utils import CHINA_TIMEZONE, now_china
 
 try:
     from mcp.server.fastmcp import FastMCP
@@ -95,7 +96,7 @@ def _extract_command_prefix(command: str) -> str:
 def _write_audit_event(tool_name: str, payload: dict[str, Any]) -> None:
     AUDIT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     event = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": now_china().isoformat(),
         "tool": tool_name,
         **payload,
     }
@@ -263,7 +264,9 @@ def collect_system_info() -> dict[str, Any]:
         "python_version": sys.version.split()[0],
         "cpu_count": os.cpu_count(),
         "workspace_root": str(WORKSPACE_ROOT),
-        "current_time_utc": datetime.now(timezone.utc).isoformat(),
+        "current_time": now_china().isoformat(),
+        "current_time_cn": now_china().isoformat(),
+        "timezone": "Asia/Shanghai",
         "disk_total_bytes": disk_usage.total,
         "disk_used_bytes": disk_usage.used,
         "disk_free_bytes": disk_usage.free,
@@ -302,7 +305,7 @@ def inspect_file_system_path(
         "is_file": resolved.is_file(),
         "is_dir": resolved.is_dir(),
         "size_bytes": stat.st_size,
-        "modified_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+        "modified_at": datetime.fromtimestamp(stat.st_mtime, tz=CHINA_TIMEZONE).isoformat(),
     }
 
     if resolved.is_dir():

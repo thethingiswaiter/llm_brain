@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from config import config
+from time_utils import now_china
 
 
 class AgentRetentionManager:
@@ -201,7 +202,7 @@ class AgentRetentionManager:
         }
 
     def _build_targets(self, now: datetime | None = None) -> list[dict[str, Any]]:
-        current_time = now or datetime.now(timezone.utc)
+        current_time = now or now_china()
         return [
             self._collect_file_target(
                 "logs",
@@ -242,7 +243,7 @@ class AgentRetentionManager:
     def get_retention_status(self) -> dict[str, Any]:
         targets = self._build_targets()
         return {
-            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "generated_at": now_china().isoformat(),
             "targets": [{key: value for key, value in target.items() if key not in {"expired_paths", "expired_size_map"}} for target in targets],
             "last_auto_prune": dict(self._last_auto_prune_status),
             "last_auto_prune_check": dict(self._last_auto_prune_check),
@@ -255,7 +256,7 @@ class AgentRetentionManager:
         }
 
     def auto_prune_decision(self) -> tuple[bool, dict[str, Any]]:
-        checked_at = datetime.now(timezone.utc).isoformat()
+        checked_at = now_china().isoformat()
         if not bool(getattr(config, "retention_auto_prune_enabled", True)):
             return False, {
                 "status": "skipped_disabled",
@@ -299,7 +300,7 @@ class AgentRetentionManager:
         deleted_count = int((payload.get("totals", {}) or {}).get("deleted_count", 0) or 0)
         self._last_auto_prune_status = {
             "trigger": decision["trigger"],
-            "executed_at": datetime.now(timezone.utc).isoformat(),
+            "executed_at": now_china().isoformat(),
             "deleted_count": deleted_count,
             "expired_count": int((payload.get("totals", {}) or {}).get("expired_count", 0) or 0),
             "reclaimable_bytes": int((payload.get("totals", {}) or {}).get("reclaimable_bytes", 0) or 0),
@@ -367,7 +368,7 @@ class AgentRetentionManager:
 
         return {
             "mode": "apply" if apply else "dry_run",
-            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "generated_at": now_china().isoformat(),
             "targets": cleaned_targets,
             "totals": {
                 "expired_count": sum(int(target.get("expired_count", 0) or 0) for target in cleaned_targets),
