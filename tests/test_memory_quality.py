@@ -1,11 +1,11 @@
-import importlib
+﻿import importlib
 import os
 import tempfile
 import unittest
 
 from langchain_core.messages import HumanMessage
 
-from config import config
+from core.config import config
 from memory.memory_manager import MemoryManager
 
 
@@ -172,8 +172,7 @@ class MemoryQualityTests(unittest.TestCase):
         self.assertEqual(results[0]["memory_type"], "failure_case")
 
     def test_agent_core_writes_session_and_step_memory_tags(self):
-        import agent_core
-
+        from app.agent import core as agent_core
         agent_core_module = importlib.reload(agent_core)
         agent = agent_core_module.AgentCore()
         agent.cognitive.extract_features = lambda text, domain_hint="": (["weather", "beijing"], "weather lookup")
@@ -225,8 +224,7 @@ class MemoryQualityTests(unittest.TestCase):
         self.assertEqual(session_data["quality_tags"], ["success"])
 
     def test_agent_core_writes_failure_steps_to_failure_case_memory(self):
-        import agent_core
-
+        from app.agent import core as agent_core
         agent_core_module = importlib.reload(agent_core)
         agent = agent_core_module.AgentCore()
         agent.cognitive.extract_features = lambda text, domain_hint="": (["booking", "missing"], "booking failure")
@@ -250,3 +248,5 @@ class MemoryQualityTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+

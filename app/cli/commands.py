@@ -94,7 +94,17 @@ def handle_load_skill(user_input: str, context: dict[str, Any]) -> bool:
     if len(parts) == 2:
         output_func(context["agent_instance"].load_skill(parts[1]))
     else:
-        output_func("Usage: /load_skill <skill_name.py|skill_name.md>")
+        output_func("Usage: /load_skill <skill_name.md>")
+    return True
+
+
+def handle_load_tool(user_input: str, context: dict[str, Any]) -> bool:
+    output_func = context["output_func"]
+    parts = user_input.split(maxsplit=1)
+    if len(parts) == 2:
+        output_func(context["agent_instance"].load_tool(parts[1]))
+    else:
+        output_func("Usage: /load_tool <tool_name.py>")
     return True
 
 
@@ -887,7 +897,8 @@ def handle_plain_message(user_input: str, context: dict[str, Any]) -> bool:
 def build_commands() -> tuple[dict[str, CLICommand], list[str]]:
     command_specs = [
         CLICommand("/llm", "/llm <provider> <model> [base_url] [api_key] - Switch LLM provider (ollama/openai)", handle_llm),
-        CLICommand("/load_skill", "/load_skill <skill_name> - Load a local python skill", handle_load_skill),
+        CLICommand("/load_tool", "/load_tool <tool_name.py> - Load a local python tool", handle_load_tool),
+        CLICommand("/load_skill", "/load_skill <skill_name.md> - Load a local markdown skill", handle_load_skill),
         CLICommand("/replay", "/replay <memory_id> [injected features...] - Replay memory with optional injected features", handle_replay),
         CLICommand("/convert_skill", "/convert_skill <memory_id> - Convert memory into a markdown skill", handle_convert_skill),
         CLICommand("/load_mcp", "/load_mcp <config|server.py|stdio:command ...> - Load an MCP server", handle_load_mcp),

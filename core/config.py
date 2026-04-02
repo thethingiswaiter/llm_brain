@@ -1,6 +1,7 @@
 import os
 import json
 import getpass
+from pathlib import Path
 from pydantic import BaseModel
 from typing import Optional, Dict
 
@@ -12,13 +13,14 @@ class LLMConfig(BaseModel):
 
 class AppConfig:
     def __init__(self):
-        self.base_dir = os.path.dirname(__file__)
+        # core/config.py lives under core/, but runtime paths should resolve from project root.
+        self.base_dir = str(Path(__file__).resolve().parents[1])
         self.config_path = os.path.join(self.base_dir, "config.json")
         self.models_config = {}
         self.default_model_key = ""
         self.mcp_dir = "mcp_servers"
-        self.skills_dir = "skills"
-        self.skills_md_dir = "skills_md"
+        self.tool_dir = "tools"
+        self.skill_dir = "skills"
         self.memory_db_path = os.path.join("memory", "memory.db")
         self.memory_backup_dir = os.path.join("memory", "backups")
         self.log_dir = "logs"
@@ -81,8 +83,8 @@ class AppConfig:
             self.models_config = self._read_value(data, "llm.models", "models", {})
             self.default_model_key = self._read_value(data, "llm.default_model_key", "default_model", "")
             self.mcp_dir = self._read_value(data, "paths.mcp_servers_dir", "mcp_dir", "mcp_servers")
-            self.skills_dir = self._read_value(data, "paths.skills_dir", "skills_dir", "skills")
-            self.skills_md_dir = self._read_value(data, "paths.skills_md_dir", "skills_md_dir", "skills_md")
+            self.tool_dir = self._get_nested(data, "paths.tools_dir", "tools")
+            self.skill_dir = self._get_nested(data, "paths.skill_dir", "skills")
             self.memory_db_path = self._read_value(
                 data,
                 "paths.memory.db_file",

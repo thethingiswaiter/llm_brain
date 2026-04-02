@@ -1,4 +1,4 @@
-import importlib
+﻿import importlib
 import json
 import logging
 import os
@@ -6,7 +6,7 @@ import sys
 import tempfile
 import unittest
 
-from config import config
+from core.config import config
 from mcp_servers.mcp_manager import MCPManager
 
 
@@ -111,9 +111,7 @@ class AgentMCPManagementTests(unittest.TestCase):
         config.llm_log_file = "mcp_agent_management.log"
         config.mcp_dir = os.path.join(self.tempdir.name, "mcp_servers")
         os.makedirs(config.resolve_path(config.mcp_dir), exist_ok=True)
-
-        import agent_core
-
+        from app.agent import core as agent_core
         self.agent_core_module = importlib.reload(agent_core)
         self.agent = self.agent_core_module.AgentCore()
         self.project_root = os.path.dirname(os.path.dirname(__file__))
@@ -181,3 +179,4 @@ class AgentMCPManagementTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

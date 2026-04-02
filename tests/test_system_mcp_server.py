@@ -1,4 +1,4 @@
-import os
+﻿import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -24,6 +24,7 @@ class SystemMCPServerTests(unittest.TestCase):
         self.assertEqual(result["exit_code"], 0)
         self.assertIn("hello", result["stdout"].lower())
         self.assertEqual(result["command_prefix"], "echo")
+        self.assertTrue(result["shell"])
 
     def test_execute_terminal_command_blocks_destructive_patterns(self):
         result = execute_terminal_command("Remove-Item -Recurse -Force *")
@@ -37,6 +38,13 @@ class SystemMCPServerTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertTrue(result["blocked"])
         self.assertEqual(result["command_prefix"], "curl")
+
+    def test_execute_terminal_command_blocks_shell_chaining_operator(self):
+        result = execute_terminal_command("echo hello && whoami")
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["blocked"])
+        self.assertIn("operator", result["reason"].lower())
 
     def test_collect_system_info_returns_expected_fields(self):
         result = collect_system_info()
@@ -103,3 +111,4 @@ class SystemMCPServerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

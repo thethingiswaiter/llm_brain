@@ -7,25 +7,35 @@
 - 项目总览：./docs/project_overview.md
 - 完备化路线图：./docs/completeness_roadmap.md
 - 能力概念说明：./docs/agent.md
+- 项目定位与方向：./docs/project_positioning.md
 
 如果你是第一次接手该仓库，建议按以下顺序阅读：
 
 1. 先看 `docs/project_overview.md`，快速建立整体认知。
-2. 再看 `agent_core.py`、`agent_runtime.py`、`agent_snapshots.py`、`agent_observability.py`、`agent_tools.py`、`cli.py`、`cli_commands.py`、`llm_manager.py`、`llm_logging.py`、`llm_runtime.py`、`llm_factory.py`，理解真实调用链。
-3. 然后按子系统查看 `cognitive/`、`memory/`、`skills_md/`。
+2. 再看 `app/agent/core.py`、`app/agent/runtime.py`、`app/agent/snapshots.py`、`app/agent/observability.py`、`app/agent/tools_runtime.py`、`app/cli/main.py`、`app/cli/commands.py`、`core/llm/manager.py`、`core/llm/logging.py`、`core/llm/runtime.py`、`core/llm/factory.py`，理解真实调用链。
+3. 然后按子系统查看 `cognitive/`、`memory/`、`tools/`、`skills/`。
 4. 最后再看 `docs/completeness_roadmap.md` 和 `docs/agent.md`，分别理解后续方向和能力概念。
 
-说明：运行时自动加载的 Python 技能只从 `skills/` 目录读取；`examples/skills/` 和 `tests/fixtures/skills/` 中的示例/测试技能不会参与自动加载。
+目录分层（标准版）说明：
+
+- `app/`：应用编排层（Agent 主链、CLI 入口）
+- `core/`：基础设施层（配置、LLM 运行时与日志）
+- `tools/`：Python 工具定义
+- `skills/`：Markdown 技能定义
+
+兼容入口说明：仓库根目录仍保留同名文件作为轻量转发入口，方便已有脚本和测试继续运行；新开发请优先使用 `app/` 与 `core/` 下路径。
+
+说明：运行时自动加载的 Python 工具只从 `tools/` 目录读取；`examples/skills/` 和 `tests/fixtures/skills/` 中的示例/测试技能不会参与自动加载。
 
 ## 当前项目重点
 
-- 主入口：`cli.py`
-- 主编排器：`agent_core.py`
+- 主入口：`app/cli/main.py`
+- 主编排器：`app/agent/core.py`
 - 核心执行框架：LangGraph 状态图
 - 认知子系统：`cognitive/`
 - 记忆持久化：`memory/`
-- Python 工具技能：`skills/`
-- Markdown 技能系统：`skills_md/`
+- Python 工具系统：`tools/`
+- Markdown 技能系统：`skills/`
 
 ## 当前状态
 
@@ -35,16 +45,25 @@
 
 1. 根据 `config.json` 准备模型配置，默认走本地 Ollama。
 2. 安装项目依赖。
-3. 运行 `python cli.py` 启动命令行交互。
+3. 运行 `python app/cli/main.py` 启动命令行交互。
 
 补充说明：
 
 - 当前依赖需要 Python 3.10+。
 - 如果本机当前 Python 环境里已有旧版 LangChain 相关依赖，建议执行一次 `python -m pip install -U -r requirements.txt`，避免 `langchain-core`、`langchain-ollama` 等包版本漂移导致导入错误。
 - 当前仓库已完成一次验证，结果为 `Ran 131 tests ... OK`。
+- 现在内置 `tools/terminal_command.py`，会自动加载一个 `bash` 工具（安全白名单、工作区路径约束、危险命令拦截、输出截断、超时上限）。
+- 现在还内置 `tools/langchain_common_tools.py`：自动加载常用工具 `get_current_time`、`calculator`、`list_directory`、`read_text_file`、`grep_text`、`write_text_file`、`json_query`，统一采用 LangChain `@tool` 风格。
+
+### 测试运行建议
+
+- 日常开发快速回归（默认，不含慢集成）：`python tests/run_tests.py`
+- 全量回归（含 CLI + MCP transport 慢集成）：`python tests/run_tests.py --all`
+- 保留原始 discover 方式：`python -m unittest discover -s tests -p "test_*.py"`
 
 ### CLI 命令
-- `/load_skill <skill_name.py|skill_name.md>` 动态加载本地技能文件。
+- `/load_tool <tool_name.py>` 动态加载本地 Python 工具文件。
+- `/load_skill <skill_name.md>` 动态加载本地 Markdown 技能文件。
 - `/load_mcp <config_name.json|config_name.yaml|absolute_path|server.py|stdio:command ...>` 加载 MCP 工具源：既支持原有 JSON/YAML 配置，也支持真实 MCP stdio server。
 - `/list_mcp` 查看已加载的 MCP server。
 - `/refresh_mcp <server_name|source>` 刷新某个 MCP server 并重新枚举工具。
@@ -88,7 +107,7 @@
 
 ### AGENT
 
-当前 `agent_core.py` 已将请求生命周期、快照、请求观测与工具运行时包装分别委托给 `agent_runtime.py`、`agent_snapshots.py`、`agent_observability.py` 和 `agent_tools.py`；`cli.py` 的命令定义已外提到 `cli_commands.py`；`llm_manager.py` 也已将日志、运行时和 provider 构造分别委托给 helper 模块，主入口文件的职责边界比之前清晰。
+当前主链已收口到分层目录：`app/agent/core.py` 负责编排，`app/agent/runtime.py`、`app/agent/snapshots.py`、`app/agent/observability.py`、`app/agent/tools_runtime.py` 分别承接请求生命周期、快照、观测与工具运行时；CLI 入口与命令分发位于 `app/cli/main.py`、`app/cli/commands.py`；LLM 基础设施集中在 `core/llm/`。
 
 ## Python MCP Server
 
@@ -99,6 +118,10 @@
 - `execute_terminal_command`：执行终端命令，默认限制在工作区内，并默认拦截明显破坏性命令。
 - `get_system_info`：查看主机、平台、Python 版本、磁盘空间等系统信息。
 - `inspect_file_system_path`：查看文件或目录信息，并可选返回 UTF-8 文本预览。
+
+另外，agent 运行时也提供了无需额外 MCP 加载的内置 Python 工具：
+
+- `bash`（来自 `tools/terminal_command.py`）：复用同一套安全策略执行终端命令，便于在主工作流中直接使用 opencode 风格的命令执行能力。
 
 当前还增加了一层基础安全控制：
 

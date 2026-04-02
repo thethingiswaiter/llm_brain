@@ -1,4 +1,4 @@
-import importlib
+﻿import importlib
 import logging
 import os
 import tempfile
@@ -7,7 +7,7 @@ import unittest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.tools import tool
 
-from config import config
+from core.config import config
 
 
 class FakeCLIOutput:
@@ -359,8 +359,7 @@ class FakeCLIAgent:
 
 class CLITestCases(unittest.TestCase):
     def test_help_command_lists_registered_commands(self):
-        import cli
-
+        from app.cli import main as cli
         output = FakeCLIOutput()
         cli.start_cli(
             input_func=FakeCLIInput(["help", "quit"]),
@@ -383,8 +382,7 @@ class CLITestCases(unittest.TestCase):
         self.assertIn("/new_session - Start a new memory session", rendered)
 
     def test_request_summary_command_renders_aggregated_output(self):
-        import cli
-
+        from app.cli import main as cli
         output = FakeCLIOutput()
         cli.start_cli(
             input_func=FakeCLIInput(["/request_summary req_cli", "quit"]),
@@ -406,8 +404,7 @@ class CLITestCases(unittest.TestCase):
         self.assertIn("slow_tool | run_id=toolrun_000001 | reason=timeout | source=checkpoint", rendered)
 
     def test_plain_message_command_prints_request_id_and_response(self):
-        import cli
-
+        from app.cli import main as cli
         output = FakeCLIOutput()
         cli.start_cli(
             input_func=FakeCLIInput(["hello agent", "quit"]),
@@ -421,8 +418,7 @@ class CLITestCases(unittest.TestCase):
         self.assertIn("Response: echo:hello agent:session_cli", rendered)
 
     def test_recent_requests_command_renders_recent_request_rows(self):
-        import cli
-
+        from app.cli import main as cli
         output = FakeCLIOutput()
         cli.start_cli(
             input_func=FakeCLIInput(["/recent_requests 2", "quit"]),
@@ -441,8 +437,7 @@ class CLITestCases(unittest.TestCase):
         self.assertIn("attention=stage=agent_blocked,tool_attention=1,tool=weather_tool,error_type=timeout,action=retry_limit", rendered)
 
     def test_recent_requests_command_accepts_filters(self):
-        import cli
-
+        from app.cli import main as cli
         output = FakeCLIOutput()
         cli.start_cli(
             input_func=FakeCLIInput(["/recent_requests 5 status=failed resumed attention", "quit"]),
@@ -459,8 +454,7 @@ class CLITestCases(unittest.TestCase):
         self.assertNotIn("req_recent_2 | status=blocked", rendered)
 
     def test_recent_requests_command_accepts_since_filter(self):
-        import cli
-
+        from app.cli import main as cli
         output = FakeCLIOutput()
         cli.start_cli(
             input_func=FakeCLIInput(["/recent_requests 5 since=30m", "quit"]),
@@ -473,8 +467,7 @@ class CLITestCases(unittest.TestCase):
         self.assertIn("Filters: since=30m", rendered)
 
     def test_recent_requests_command_rejects_invalid_filters(self):
-        import cli
-
+        from app.cli import main as cli
         output = FakeCLIOutput()
         cli.start_cli(
             input_func=FakeCLIInput(["/recent_requests 5 status=bad_status", "quit"]),
@@ -487,8 +480,7 @@ class CLITestCases(unittest.TestCase):
         self.assertIn("Usage: /recent_requests [limit] [status=failed,blocked,...] [resumed] [attention] [since=30m]", rendered)
 
     def test_request_rollup_command_renders_global_aggregate(self):
-        import cli
-
+        from app.cli import main as cli
         output = FakeCLIOutput()
         cli.start_cli(
             input_func=FakeCLIInput(["/request_rollup 5", "quit"]),
@@ -508,8 +500,7 @@ class CLITestCases(unittest.TestCase):
         self.assertIn("Stage totals: planning=20.0 | tool=30.0 | reflection=12.0", rendered)
 
     def test_request_rollup_command_accepts_filters(self):
-        import cli
-
+        from app.cli import main as cli
         output = FakeCLIOutput()
         cli.start_cli(
             input_func=FakeCLIInput(["/request_rollup 5 status=failed,blocked resumed attention", "quit"]),
@@ -522,8 +513,7 @@ class CLITestCases(unittest.TestCase):
         self.assertIn("Filters: statuses=failed,blocked | resumed_only=True | attention_only=True", rendered)
 
     def test_request_rollup_command_accepts_since_filter(self):
-        import cli
-
+        from app.cli import main as cli
         output = FakeCLIOutput()
         cli.start_cli(
             input_func=FakeCLIInput(["/request_rollup 5 since=2h", "quit"]),
@@ -536,8 +526,7 @@ class CLITestCases(unittest.TestCase):
         self.assertIn("Filters: since=2h", rendered)
 
     def test_request_rollup_command_rejects_invalid_filters(self):
-        import cli
-
+        from app.cli import main as cli
         output = FakeCLIOutput()
         cli.start_cli(
             input_func=FakeCLIInput(["/request_rollup 5 status=bad_status", "quit"]),
@@ -550,8 +539,7 @@ class CLITestCases(unittest.TestCase):
         self.assertIn("Usage: /request_rollup [limit] [status=failed,blocked,...] [resumed] [attention] [since=30m]", rendered)
 
     def test_retention_status_command_renders_summary(self):
-        import cli
-
+        from app.cli import main as cli
         output = FakeCLIOutput()
         cli.start_cli(
             input_func=FakeCLIInput(["/retention_status", "quit"]),
@@ -568,8 +556,7 @@ class CLITestCases(unittest.TestCase):
         self.assertIn("snapshots | days=7 | max=200 | max_bytes=10.0 KB | items=3 | expired=1 | total=8.0 KB | reclaimable=2.0 KB", rendered)
 
     def test_prune_runtime_data_command_supports_dry_run_and_apply(self):
-        import cli
-
+        from app.cli import main as cli
         dry_run_output = FakeCLIOutput()
         cli.start_cli(
             input_func=FakeCLIInput(["/prune_runtime_data", "quit"]),
@@ -594,8 +581,7 @@ class CLITestCases(unittest.TestCase):
         self.assertIn("Prune runtime data: mode=apply | expired=2 | reclaimable=3.0 KB | deleted=2", rendered_apply)
 
     def test_failed_requests_command_filters_failed_statuses(self):
-        import cli
-
+        from app.cli import main as cli
         output = FakeCLIOutput()
         cli.start_cli(
             input_func=FakeCLIInput(["/failed_requests 5", "quit"]),
@@ -612,8 +598,7 @@ class CLITestCases(unittest.TestCase):
         self.assertNotIn("req_recent_1 | status=completed", rendered)
 
     def test_resumed_requests_command_filters_resumed_runs(self):
-        import cli
-
+        from app.cli import main as cli
         output = FakeCLIOutput()
         cli.start_cli(
             input_func=FakeCLIInput(["/resumed_requests 5", "quit"]),
@@ -630,8 +615,7 @@ class CLITestCases(unittest.TestCase):
         self.assertNotIn("req_recent_2 | status=blocked", rendered)
 
     def test_failed_requests_command_allows_extra_filters(self):
-        import cli
-
+        from app.cli import main as cli
         output = FakeCLIOutput()
         cli.start_cli(
             input_func=FakeCLIInput(["/failed_requests 5 status=failed attention", "quit"]),
@@ -646,8 +630,7 @@ class CLITestCases(unittest.TestCase):
         self.assertNotIn("req_recent_2 | status=blocked", rendered)
 
     def test_resumed_requests_command_allows_status_filter(self):
-        import cli
-
+        from app.cli import main as cli
         output = FakeCLIOutput()
         cli.start_cli(
             input_func=FakeCLIInput(["/resumed_requests 5 status=failed attention", "quit"]),
@@ -660,8 +643,7 @@ class CLITestCases(unittest.TestCase):
         self.assertIn("Filters: statuses=failed | resumed_only=True | attention_only=True", rendered)
 
     def test_resume_snapshot_command_accepts_reroute_mode(self):
-        import cli
-
+        from app.cli import main as cli
         output = FakeCLIOutput()
         cli.start_cli(
             input_func=FakeCLIInput(["/resume_snapshot req_old planning_completed reroute", "quit"]),
@@ -675,8 +657,7 @@ class CLITestCases(unittest.TestCase):
         self.assertIn("Response: resumed:req_old:planning_completed:reroute", rendered)
 
     def test_list_tool_runs_command_renders_filtered_rows(self):
-        import cli
-
+        from app.cli import main as cli
         output = FakeCLIOutput()
         cli.start_cli(
             input_func=FakeCLIInput(["/list_tool_runs req_cli detached", "quit"]),
@@ -691,8 +672,7 @@ class CLITestCases(unittest.TestCase):
         self.assertNotIn("toolrun_000002", rendered)
 
     def test_failure_memories_command_renders_ranked_results(self):
-        import cli
-
+        from app.cli import main as cli
         output = FakeCLIOutput()
         cli.start_cli(
             input_func=FakeCLIInput(["/failure_memories 5 booking", "quit"]),
@@ -706,8 +686,7 @@ class CLITestCases(unittest.TestCase):
         self.assertIn("#9 | request=req_blocked_memory | type=failure_case | tags=blocked,ask_user | keywords=booking,time | summary=Step: booking failure", rendered)
 
     def test_load_mcp_command_passes_full_reference(self):
-        import cli
-
+        from app.cli import main as cli
         output = FakeCLIOutput()
         fake_agent = FakeCLIAgent()
         cli.start_cli(
@@ -722,8 +701,7 @@ class CLITestCases(unittest.TestCase):
         self.assertEqual(fake_agent.loaded_mcp_refs, ["stdio:python mcp_servers/system_mcp_server.py"])
 
     def test_list_mcp_command_renders_loaded_servers(self):
-        import cli
-
+        from app.cli import main as cli
         output = FakeCLIOutput()
         fake_agent = FakeCLIAgent()
         cli.start_cli(
@@ -738,8 +716,7 @@ class CLITestCases(unittest.TestCase):
         self.assertIn("system_mcp_server | transport=stdio | tools=2", rendered)
 
     def test_unload_mcp_command_passes_reference(self):
-        import cli
-
+        from app.cli import main as cli
         output = FakeCLIOutput()
         fake_agent = FakeCLIAgent()
         cli.start_cli(
@@ -754,8 +731,7 @@ class CLITestCases(unittest.TestCase):
         self.assertEqual(fake_agent.unloaded_mcp_refs, ["system_mcp_server"])
 
     def test_refresh_mcp_command_passes_reference(self):
-        import cli
-
+        from app.cli import main as cli
         output = FakeCLIOutput()
         fake_agent = FakeCLIAgent()
         cli.start_cli(
@@ -770,8 +746,7 @@ class CLITestCases(unittest.TestCase):
         self.assertEqual(fake_agent.refreshed_mcp_refs, ["system_mcp_server"])
 
     def test_new_session_command_updates_session_for_following_message(self):
-        import cli
-
+        from app.cli import main as cli
         output = FakeCLIOutput()
         fake_agent = FakeCLIAgent()
         fake_agent.start_session = lambda session_id=None: session_id or "session_new_cli"
@@ -801,10 +776,8 @@ class AgentIntegrationFlowTests(unittest.TestCase):
         config.state_snapshot_dir = os.path.join(self.tempdir.name, "snapshots")
         config.log_dir = os.path.join(self.tempdir.name, "logs")
         config.llm_log_file = "cli_integration.log"
-
-        import llm_manager
-        import agent_core
-
+        from core.llm import manager as llm_manager
+        from app.agent import core as agent_core
         self.llm_manager_module = importlib.reload(llm_manager)
         self.agent_core_module = importlib.reload(agent_core)
         self.agent = self.agent_core_module.AgentCore()
@@ -833,7 +806,7 @@ class AgentIntegrationFlowTests(unittest.TestCase):
                 return AIMessage(content="weather is sunny")
 
         self.agent.cognitive.extract_features = lambda text: (["weather", "beijing"], "weather summary")
-        self.agent.cognitive.determine_domain = lambda text: "综合性图书"
+        self.agent.cognitive.determine_domain = lambda text: "general"
         self.agent.planner.split_task = lambda text: [
             {"id": 1, "description": "check weather in beijing", "expected_outcome": "provide the weather"}
         ]
@@ -872,7 +845,7 @@ class AgentIntegrationFlowTests(unittest.TestCase):
                 return self
 
             def invoke(self, payload):
-                return AIMessage(content="请确认要查询的是本机还是远程设备。")
+                return AIMessage(content="Please confirm whether to query local or remote host.")
 
         self._configure_successful_flow()
         self.agent.reflector.verify_and_reflect = lambda desc, expected, actual: (False, "missing parameter", "ask_user")
@@ -882,11 +855,11 @@ class AgentIntegrationFlowTests(unittest.TestCase):
         request_id = self.agent.get_last_request_id()
         summary = self.agent.get_request_summary(request_id)
 
-        self.assertEqual(result, "请确认要查询的是本机还是远程设备。")
+        self.assertEqual(result, "Please confirm whether to query local or remote host.")
         self.assertIsNotNone(summary)
         self.assertEqual(summary["status"], "blocked")
         self.assertTrue(summary["blocked"])
-        self.assertEqual(summary["final_response"], "请确认要查询的是本机还是远程设备。")
+        self.assertEqual(summary["final_response"], "Please confirm whether to query local or remote host.")
         self.assertEqual(summary["metrics"]["reflection_failure_count"], 1)
         self.assertEqual(summary["metrics"]["blocked_rate"], 1.0)
 
@@ -930,7 +903,8 @@ class AgentIntegrationFlowTests(unittest.TestCase):
                 return AIMessage(content=next(self.responses))
 
         def fake_split_task(text):
-            if "重新规划" in text or "Replan the failed subtask" in text:
+            lowered = text.lower()
+            if "replan the failed subtask" in lowered or "replan" in lowered or "重新规划" in text:
                 return [
                     {"id": 1, "description": "collect missing input", "expected_outcome": "required input collected"},
                     {"id": 2, "description": "execute safer action", "expected_outcome": "stable result produced"},
@@ -945,7 +919,7 @@ class AgentIntegrationFlowTests(unittest.TestCase):
             return True, "verified", "continue"
 
         self.agent.cognitive.extract_features = lambda text: (["retry", "replan"], "retry summary")
-        self.agent.cognitive.determine_domain = lambda text: "综合性图书"
+        self.agent.cognitive.determine_domain = lambda text: "general"
         self.agent.planner.split_task = fake_split_task
         self.agent.reflector.verify_and_reflect = fake_reflect
         self.agent.skills.assign_capabilities_to_task = lambda desc, kws: {
@@ -992,15 +966,15 @@ class AgentIntegrationFlowTests(unittest.TestCase):
 
                 self.test_case.assertIsInstance(payload[-1], ToolMessage)
                 self.test_case.assertNotIsInstance(payload[-1], HumanMessage)
-                return AIMessage(content="主机名称是 thething")
+                return AIMessage(content="hostname is thething")
 
         self.agent.add_tool(get_hostname)
         llm = ToolCallingLLM()
         llm.test_case = self
-        self.agent.cognitive.extract_features = lambda text: (["主机", "名称"], "hostname summary")
-        self.agent.cognitive.determine_domain = lambda text: "计算机"
+        self.agent.cognitive.extract_features = lambda text: (["hostname", "name"], "hostname summary")
+        self.agent.cognitive.determine_domain = lambda text: "computer"
         self.agent.planner.split_task = lambda text: [
-            {"id": 1, "description": "查询主机名称", "expected_outcome": "返回主机名称"}
+            {"id": 1, "description": "query hostname", "expected_outcome": "return hostname"}
         ]
         self.agent.reflector.verify_and_reflect = lambda desc, expected, actual: (True, "verified", "continue")
         self.agent.skills.assign_capabilities_to_task = lambda desc, kws: {
@@ -1012,11 +986,13 @@ class AgentIntegrationFlowTests(unittest.TestCase):
         }
         self.llm_manager_module.llm_manager.get_llm = lambda: llm
 
-        result = self.agent.invoke("查询一下主机名称")
+        result = self.agent.invoke("query hostname")
 
-        self.assertEqual(result, "主机名称是 thething")
+        self.assertEqual(result, "hostname is thething")
         self.assertEqual(len(llm.calls), 2)
 
 
 if __name__ == "__main__":
     unittest.main()
+
+

@@ -9,8 +9,8 @@ from langchain_core.messages import BaseMessage, ToolMessage
 from langchain_core.tools import StructuredTool
 from pydantic import ValidationError
 
-from config import config
-from llm_manager import RequestCancelledError, llm_manager
+from core.config import config
+from core.llm.manager import RequestCancelledError, llm_manager
 
 
 class AgentToolRuntime:

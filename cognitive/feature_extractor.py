@@ -1,5 +1,5 @@
 from typing import List, Dict, Optional
-from llm_manager import llm_manager
+from core.llm.manager import llm_manager
 from cognitive.structured_output import parse_json_object, StructuredOutputError
 
 

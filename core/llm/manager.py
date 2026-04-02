@@ -6,10 +6,10 @@ from typing import Any
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage
-from config import config
-from llm_factory import build_llm
-from llm_logging import LLMLogging
-from llm_runtime import LLMRuntime, RequestCancelledError
+from core.config import config
+from core.llm.factory import build_llm
+from core.llm.logging import LLMLogging
+from core.llm.runtime import LLMRuntime, RequestCancelledError
 
 
 class LLMDependencyUnavailableError(RuntimeError):

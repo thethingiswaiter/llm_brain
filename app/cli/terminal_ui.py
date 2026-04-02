@@ -143,7 +143,7 @@ class TerminalUI:
                 groups["MCP"].append((command_name, description))
             elif lowered.startswith(("/replay", "/convert_skill", "/failure_memories")):
                 groups["Memory"].append((command_name, description))
-            elif lowered.startswith(("/new_session", "/load_skill")):
+            elif lowered.startswith(("/new_session", "/load_tool", "/load_skill")):
                 groups["Session"].append((command_name, description))
             elif lowered.startswith(("/retention_status", "/prune_runtime_data")):
                 groups["Runtime"].append((command_name, description))

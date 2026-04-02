@@ -5,7 +5,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from config import config
+from core.config import config
 from time_utils import CHINA_TIMEZONE
 
 

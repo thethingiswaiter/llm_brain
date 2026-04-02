@@ -14,7 +14,7 @@ WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
 if str(WORKSPACE_ROOT) not in sys.path:
     sys.path.insert(0, str(WORKSPACE_ROOT))
 
-from config import config
+from core.config import config
 from time_utils import CHINA_TIMEZONE, now_china
 
 try:
@@ -26,29 +26,43 @@ except ImportError:
 SERVER_NAME = "llm-brain-system-tools"
 AUDIT_LOG_PATH = Path(config.resolve_path(config.audit_log_dir)) / "system_mcp_audit.jsonl"
 DEFAULT_TIMEOUT_SECONDS = 20
+MAX_TIMEOUT_SECONDS = 120
 MAX_OUTPUT_CHARS = 12000
 MAX_DIRECTORY_ENTRIES = 200
 MAX_PREVIEW_LINES = 80
 DEFAULT_ALLOWED_COMMAND_PREFIXES = [
+    "bash",
     "cat",
     "cd",
+    "cmd",
     "dir",
     "echo",
     "findstr",
+    "git",
     "get-childitem",
     "get-content",
     "get-location",
     "hostname",
     "ls",
     "more",
+    "npm",
+    "npx",
+    "pip",
+    "pnpm",
+    "poetry",
+    "pwsh",
+    "pytest",
     "pwd",
     "py",
     "python",
+    "python3",
+    "uv",
     "systeminfo",
     "type",
     "ver",
     "where",
     "whoami",
+    "yarn",
 ]
 DESTRUCTIVE_COMMAND_MARKERS = [
     "rm -rf",
@@ -61,6 +75,13 @@ DESTRUCTIVE_COMMAND_MARKERS = [
     "reboot",
     "mkfs",
     "git reset --hard",
+]
+DISALLOWED_SHELL_OPERATORS = [
+    "&&",
+    "||",
+    ";",
+    "\n",
+    "\r",
 ]
 
 
@@ -142,6 +163,9 @@ def get_mcp_security_policy() -> dict[str, Any]:
         "allowed_roots": _get_allowed_root_strings(),
         "allowed_command_prefixes": _get_allowed_command_prefixes(),
         "destructive_command_markers": list(DESTRUCTIVE_COMMAND_MARKERS),
+        "disallowed_shell_operators": list(DISALLOWED_SHELL_OPERATORS),
+        "default_timeout_seconds": DEFAULT_TIMEOUT_SECONDS,
+        "max_timeout_seconds": MAX_TIMEOUT_SECONDS,
     }
 
 
@@ -153,12 +177,55 @@ def _looks_destructive(command: str) -> str:
     return ""
 
 
+def _contains_disallowed_shell_operator(command: str) -> str:
+    for marker in DISALLOWED_SHELL_OPERATORS:
+        if marker in command:
+            return marker
+    return ""
+
+
+def _normalize_timeout_seconds(timeout_seconds: int) -> int:
+    try:
+        timeout = int(timeout_seconds)
+    except (TypeError, ValueError):
+        timeout = DEFAULT_TIMEOUT_SECONDS
+    return max(1, min(timeout, MAX_TIMEOUT_SECONDS))
+
+
+def _resolve_shell_choice(shell: str | None) -> str:
+    shell_choice = (shell or "auto").strip().lower()
+    if shell_choice == "auto":
+        return "powershell" if os.name == "nt" else "bash"
+    return shell_choice
+
+
+def _build_shell_command(command: str, shell: str | None) -> tuple[list[str], str]:
+    shell_choice = _resolve_shell_choice(shell)
+    if shell_choice == "powershell":
+        executable = shutil.which("powershell") or shutil.which("pwsh")
+        if not executable:
+            raise ValueError("PowerShell executable not found in PATH.")
+        return [executable, "-NoProfile", "-Command", command], shell_choice
+    if shell_choice == "cmd":
+        executable = os.environ.get("ComSpec") or shutil.which("cmd")
+        if not executable:
+            raise ValueError("cmd executable not found in PATH.")
+        return [executable, "/c", command], shell_choice
+    if shell_choice in {"bash", "sh"}:
+        executable = shutil.which(shell_choice)
+        if not executable:
+            raise ValueError(f"{shell_choice} executable not found in PATH.")
+        return [executable, "-lc", command], shell_choice
+    raise ValueError("Unsupported shell. Use one of: auto, powershell, cmd, bash, sh.")
+
+
 def execute_terminal_command(
     command: str,
     cwd: str = ".",
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
     allow_outside_workspace: bool = False,
     allow_destructive: bool = False,
+    shell: str = "auto",
 ) -> dict[str, Any]:
     """Run an allowlisted terminal command in the workspace for safe system inspection tasks."""
     if not isinstance(command, str) or not command.strip():
@@ -175,6 +242,18 @@ def execute_terminal_command(
             "command": command,
             "command_prefix": command_prefix,
             "allowed_command_prefixes": allowed_prefixes,
+        }
+        _write_audit_event("execute_terminal_command", result)
+        return result
+
+    disallowed_operator = _contains_disallowed_shell_operator(command)
+    if disallowed_operator:
+        result = {
+            "ok": False,
+            "blocked": True,
+            "reason": f"Command contains disallowed shell operator: {repr(disallowed_operator)}",
+            "command": command,
+            "command_prefix": command_prefix,
         }
         _write_audit_event("execute_terminal_command", result)
         return result
@@ -198,13 +277,28 @@ def execute_terminal_command(
         return result
 
     try:
+        shell_command, resolved_shell = _build_shell_command(command, shell)
+    except Exception as exc:
+        result = {
+            "ok": False,
+            "error": str(exc),
+            "command": command,
+            "cwd": str(resolved_cwd),
+            "shell": shell,
+        }
+        _write_audit_event("execute_terminal_command", result)
+        return result
+
+    normalized_timeout = _normalize_timeout_seconds(timeout_seconds)
+
+    try:
         completed = subprocess.run(
-            command,
+            shell_command,
             cwd=str(resolved_cwd),
-            shell=True,
+            shell=False,
             capture_output=True,
             text=True,
-            timeout=max(1, int(timeout_seconds)),
+            timeout=normalized_timeout,
         )
     except subprocess.TimeoutExpired as exc:
         stdout, stdout_truncated = _truncate_text(exc.stdout or "")
@@ -214,7 +308,8 @@ def execute_terminal_command(
             "timeout": True,
             "command": command,
             "cwd": str(resolved_cwd),
-            "timeout_seconds": timeout_seconds,
+            "shell": resolved_shell,
+            "timeout_seconds": normalized_timeout,
             "stdout": stdout,
             "stderr": stderr,
             "stdout_truncated": stdout_truncated,
@@ -227,6 +322,7 @@ def execute_terminal_command(
             "ok": False,
             "command": command,
             "cwd": str(resolved_cwd),
+            "shell": resolved_shell,
             "error": str(exc),
         }
         _write_audit_event("execute_terminal_command", result)
@@ -240,6 +336,7 @@ def execute_terminal_command(
         "command_prefix": command_prefix,
         "allowed_command_prefixes": allowed_prefixes,
         "cwd": str(resolved_cwd),
+        "shell": resolved_shell,
         "exit_code": completed.returncode,
         "stdout": stdout,
         "stderr": stderr,
@@ -351,6 +448,7 @@ if FastMCP is not None:
         timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
         allow_outside_workspace: bool = False,
         allow_destructive: bool = False,
+        shell: str = "auto",
     ) -> dict[str, Any]:
         """Execute a safe allowlisted terminal command such as hostname or dir for local system inspection."""
         return execute_terminal_command(
@@ -359,6 +457,7 @@ if FastMCP is not None:
             timeout_seconds=timeout_seconds,
             allow_outside_workspace=allow_outside_workspace,
             allow_destructive=allow_destructive,
+            shell=shell,
         )
 
     @mcp.tool(name="get_system_info")

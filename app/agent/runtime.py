@@ -6,9 +6,9 @@ from typing import Any
 
 from langchain_core.messages import HumanMessage
 
-from config import config
+from core.config import config
 from cognitive.feature_extractor import DEFAULT_DOMAIN_LABEL
-from llm_manager import LLMDependencyUnavailableError, RequestCancelledError, llm_manager
+from core.llm.manager import LLMDependencyUnavailableError, RequestCancelledError, llm_manager
 
 
 class AgentRuntime:

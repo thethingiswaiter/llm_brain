@@ -1,10 +1,10 @@
 import logging
 
-from llm_manager import llm_manager
-from agent_core import agent
-from cli_commands import build_commands, handle_plain_message
-from terminal_ui import TerminalUI
-from config import config
+from core.llm.manager import llm_manager
+from app.agent.core import agent
+from app.cli.commands import build_commands, handle_plain_message
+from app.cli.terminal_ui import TerminalUI
+from core.config import config
 
 
 def _status_text_for_input(user_input: str, is_command: bool) -> str:
@@ -30,7 +30,8 @@ def _status_text_for_input(user_input: str, is_command: bool) -> str:
         "/replay": "Replaying memory",
         "/convert_skill": "Converting memory to skill",
         "/llm": "Switching model",
-        "/load_skill": "Loading skill",
+        "/load_tool": "Loading tool",
+        "/load_skill": "Loading markdown skill",
         "/new_session": "Starting new session",
     }
     return command_status_map.get(command_name, "Running command")

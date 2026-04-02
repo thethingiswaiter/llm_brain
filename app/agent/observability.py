@@ -4,8 +4,8 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from config import config
-from llm_manager import llm_manager
+from core.config import config
+from core.llm.manager import llm_manager
 
 
 class AgentObservability:

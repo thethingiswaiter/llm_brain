@@ -1,4 +1,4 @@
-import importlib
+﻿import importlib
 import json
 import os
 import tempfile
@@ -6,30 +6,39 @@ import unittest
 
 from langchain_core.tools import tool
 
-from config import config
+from core.config import config
 
 
 class ToolArgumentPrevalidationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.original_memory_db_path = config.memory_db_path
+        cls.original_memory_backup_dir = config.memory_backup_dir
+        cls.original_state_snapshot_dir = config.state_snapshot_dir
+        cls.tempdir = tempfile.TemporaryDirectory()
+
+        config.memory_db_path = os.path.join(cls.tempdir.name, "memory.db")
+        config.memory_backup_dir = os.path.join(cls.tempdir.name, "backups")
+        config.state_snapshot_dir = os.path.join(cls.tempdir.name, "snapshots")
+
+        from app.agent import core as agent_core
+
+        cls.agent_core_module = importlib.reload(agent_core)
+        cls.shared_agent = cls.agent_core_module.AgentCore(
+            auto_load_tools=False,
+            auto_load_mcp=False,
+            build_graph=False,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        config.memory_db_path = cls.original_memory_db_path
+        config.memory_backup_dir = cls.original_memory_backup_dir
+        config.state_snapshot_dir = cls.original_state_snapshot_dir
+        cls.tempdir.cleanup()
+
     def setUp(self):
-        self.original_memory_db_path = config.memory_db_path
-        self.original_memory_backup_dir = config.memory_backup_dir
-        self.original_state_snapshot_dir = config.state_snapshot_dir
-        self.tempdir = tempfile.TemporaryDirectory()
-
-        config.memory_db_path = os.path.join(self.tempdir.name, "memory.db")
-        config.memory_backup_dir = os.path.join(self.tempdir.name, "backups")
-        config.state_snapshot_dir = os.path.join(self.tempdir.name, "snapshots")
-
-        import agent_core
-
-        self.agent_core_module = importlib.reload(agent_core)
-        self.agent = self.agent_core_module.AgentCore()
-
-    def tearDown(self):
-        config.memory_db_path = self.original_memory_db_path
-        config.memory_backup_dir = self.original_memory_backup_dir
-        config.state_snapshot_dir = self.original_state_snapshot_dir
-        self.tempdir.cleanup()
+        self.agent = self.__class__.shared_agent
 
     def test_prevalidate_rejects_missing_required_argument(self):
         @tool
@@ -116,3 +125,5 @@ class ToolArgumentPrevalidationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+

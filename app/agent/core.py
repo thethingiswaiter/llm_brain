@@ -9,23 +9,23 @@ from threading import Event, Lock
 from typing import Annotated, Literal, TypedDict, List, Dict, Any
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage, ToolMessage
 from langgraph.graph import StateGraph, START, END, add_messages
-from llm_manager import llm_manager
+from core.llm.manager import llm_manager
 from langgraph.prebuilt import ToolNode
 from langchain_core.tools import StructuredTool
-from config import config
+from core.config import config
 
 # New Cognitive Imports
 from cognitive.feature_extractor import CognitiveSystem, DEFAULT_DOMAIN_LABEL
 from cognitive.planner import TaskPlanner
 from cognitive.reflector import Reflector
-from agent_observability import AgentObservability
-from agent_retention import AgentRetentionManager
-from agent_runtime import AgentRuntime
-from agent_snapshots import AgentSnapshotStore
-from agent_tools import AgentToolRuntime
+from app.agent.observability import AgentObservability
+from app.agent.retention import AgentRetentionManager
+from app.agent.runtime import AgentRuntime
+from app.agent.snapshots import AgentSnapshotStore
+from app.agent.tools_runtime import AgentToolRuntime
 from memory.memory_manager import MemoryManager
 from mcp_servers.mcp_manager import MCPManager
-from skills_md.skill_parser import SkillManager
+from skill.skill_parser import SkillManager
 
 class AgentState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
@@ -46,11 +46,14 @@ class AgentState(TypedDict):
     final_response: str
 
 class AgentCore:
-    def __init__(self):
+    def __init__(self, *, auto_load_tools: bool = True, auto_load_mcp: bool = False, build_graph: bool = True):
         self.tools = []
-        self.loaded_python_skill_files = set()
+        self.loaded_python_tool_files = set()
         self.loaded_tool_names = set()
         self.graph = None
+        self.auto_load_tools = auto_load_tools
+        self.auto_load_mcp = auto_load_mcp
+        self.auto_build_graph = build_graph
         self.session_id = self._generate_session_id()
         self.last_request_id = ""
         self._request_cancellations: Dict[str, Event] = {}
@@ -70,9 +73,12 @@ class AgentCore:
         self.runtime = AgentRuntime(self)
         self.tool_runtime = AgentToolRuntime(self)
         
-        self._auto_load_skills()
-        self._auto_load_mcp_servers()
-        self._build_graph()
+        if self.auto_load_tools:
+            self._auto_load_tools()
+        if self.auto_load_mcp:
+            self._auto_load_mcp_servers()
+        if self.auto_build_graph:
+            self._build_graph()
 
     def _generate_session_id(self) -> str:
         return f"session_{uuid.uuid4().hex[:12]}"
@@ -494,23 +500,23 @@ class AgentCore:
             quality_tags=quality_tags or ["success"],
         )
 
-    def _auto_load_skills(self):
-        """Automatically scan and load python skills from the skills directory"""
-        skills_path = os.path.join(os.path.dirname(__file__), config.skills_dir)
-        if not os.path.exists(skills_path):
-            os.makedirs(skills_path)
+    def _auto_load_tools(self):
+        """Automatically scan and load python tools from the tool directory."""
+        tools_path = config.resolve_path(config.tool_dir)
+        if not os.path.exists(tools_path):
+            os.makedirs(tools_path)
             return
 
-        for filename in os.listdir(skills_path):
-            if not self._is_auto_loadable_skill_file(filename):
+        for filename in os.listdir(tools_path):
+            if not self._is_auto_loadable_tool_file(filename):
                 if filename.endswith(".py") and not filename.startswith("__"):
                     llm_manager.log_event(
-                        f"Python skill auto-load skipped | file={filename} | reason=reserved_example_or_test_prefix"
+                        f"Python tool auto-load skipped | file={filename} | reason=reserved_example_or_test_prefix"
                     )
                 continue
-            self._load_python_skill_file(os.path.join(skills_path, filename), rebuild_graph=False)
+            self._load_python_tool_file(os.path.join(tools_path, filename), rebuild_graph=False)
 
-    def _is_auto_loadable_skill_file(self, filename: str) -> bool:
+    def _is_auto_loadable_tool_file(self, filename: str) -> bool:
         normalized = os.path.basename(filename).strip().lower()
         if not normalized.endswith(".py"):
             return False
@@ -560,10 +566,10 @@ class AgentCore:
         self._build_graph()
         return True
 
-    def _load_python_skill_file(self, file_path: str, rebuild_graph: bool = True):
+    def _load_python_tool_file(self, file_path: str, rebuild_graph: bool = True):
         filename = os.path.basename(file_path)
-        if filename in self.loaded_python_skill_files:
-            return False, f"Python skill {filename} is already loaded."
+        if filename in self.loaded_python_tool_files:
+            return False, f"Python tool {filename} is already loaded."
 
         module_name = os.path.splitext(filename)[0]
         try:
@@ -571,7 +577,7 @@ class AgentCore:
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
             if not hasattr(module, "tools"):
-                return False, f"Skill file {filename} does not export a tools list."
+                return False, f"Tool file {filename} does not export a tools list."
 
             added_tools = []
             for tool in module.tools:
@@ -584,41 +590,47 @@ class AgentCore:
                     self.loaded_tool_names.add(tool_name)
                 added_tools.append(safe_tool)
             self.skills.register_tools(added_tools, source_type="python", source_file=filename)
-            self.loaded_python_skill_files.add(filename)
+            self.loaded_python_tool_files.add(filename)
             if rebuild_graph:
                 self._build_graph()
             llm_manager.log_event(
-                f"Python skill loaded | file={filename} | tool_count={len(added_tools)} | rebuild_graph={rebuild_graph}"
+                f"Python tool loaded | file={filename} | tool_count={len(added_tools)} | rebuild_graph={rebuild_graph}"
             )
-            return True, f"Loaded Python skill file: {filename}"
+            return True, f"Loaded Python tool file: {filename}"
         except Exception as e:
             llm_manager.log_event(
-                f"Python skill load failed | file={filename} | error={e}",
+                f"Python tool load failed | file={filename} | error={e}",
                 level=40,
             )
-            return False, f"Failed to load skill {filename}: {e}"
+            return False, f"Failed to load tool {filename}: {e}"
+
+    def load_tool(self, tool_name: str):
+        normalized_name = tool_name.strip()
+        if not normalized_name:
+            return "Usage: /load_tool <tool_name.py>"
+
+        python_name = normalized_name if normalized_name.endswith(".py") else f"{normalized_name}.py"
+        python_path = os.path.join(config.resolve_path(config.tool_dir), python_name)
+        if not os.path.exists(python_path):
+            return f"Tool not found: {tool_name}"
+        _, message = self._load_python_tool_file(python_path)
+        return message
 
     def load_skill(self, skill_name: str):
         normalized_name = skill_name.strip()
         if not normalized_name:
-            return "Usage: /load_skill <skill_name.py|skill_name.md>"
+            return "Usage: /load_skill <skill_name.md>"
 
         if normalized_name.endswith(".md"):
-            skill = self.skills.load_skill_md(normalized_name)
+            skill = self.skills.load_skill(normalized_name)
             if not skill:
-                return f"Markdown skill not found: {normalized_name}"
-            return f"Loaded Markdown skill: {skill['name']} ({normalized_name})"
-
-        python_name = normalized_name if normalized_name.endswith(".py") else f"{normalized_name}.py"
-        python_path = os.path.join(os.path.dirname(__file__), config.skills_dir, python_name)
-        if os.path.exists(python_path):
-            _, message = self._load_python_skill_file(python_path)
-            return message
+                return f"Skill not found: {normalized_name}"
+            return f"Loaded skill: {skill['name']} ({normalized_name})"
 
         markdown_name = normalized_name if normalized_name.endswith(".md") else f"{normalized_name}.md"
-        skill = self.skills.load_skill_md(markdown_name)
+        skill = self.skills.load_skill(markdown_name)
         if skill:
-            return f"Loaded Markdown skill: {skill['name']} ({markdown_name})"
+            return f"Loaded skill: {skill['name']} ({markdown_name})"
 
         return f"Skill not found: {skill_name}"
 
@@ -1343,11 +1355,11 @@ entry_node: "main"
 ---
 {logic}
 """
-        filepath = os.path.join(self.skills.skills_md_dir, f"{name}.md")
+        filepath = os.path.join(self.skills.skill_dir, f"{name}.md")
         with open(filepath, "w", encoding="utf-8") as f:
             f.write(md_content)
 
-        self.skills.load_skill_md(f"{name}.md", force_reload=True)
+        self.skills.load_skill(f"{name}.md", force_reload=True)
         return f"Successfully converted memory {memory_id} to skill {name}.md"
 
 agent = AgentCore()

@@ -1,4 +1,4 @@
-import importlib
+﻿import importlib
 import logging
 import os
 import sqlite3
@@ -7,7 +7,7 @@ import unittest
 
 from langchain_core.messages import AIMessage
 
-from config import config
+from core.config import config
 from memory.memory_manager import MemoryManager
 
 
@@ -86,10 +86,8 @@ class AgentRetryLimitFailureTests(unittest.TestCase):
         config.state_snapshot_dir = os.path.join(self.tempdir.name, "snapshots")
         config.log_dir = os.path.join(self.tempdir.name, "logs")
         config.llm_log_file = "failure_cases.log"
-
-        import llm_manager
-        import agent_core
-
+        from core.llm import manager as llm_manager
+        from app.agent import core as agent_core
         self.llm_manager_module = importlib.reload(llm_manager)
         self.agent_core_module = importlib.reload(agent_core)
         self.agent = self.agent_core_module.AgentCore()
@@ -153,3 +151,4 @@ class AgentRetryLimitFailureTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

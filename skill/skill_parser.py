@@ -2,8 +2,8 @@ import yaml
 import os
 import re
 from typing import Dict, List, Any, Optional
-from config import config
-from llm_manager import llm_manager
+from core.config import config
+from core.llm.manager import llm_manager
 
 class SkillManager:
     STOPWORDS = {
@@ -14,13 +14,13 @@ class SkillManager:
         "请", "请问", "帮我", "一下", "看看", "看下", "查下", "查询一下", "告诉我", "我想", "我要", "有没有", "怎么", "如何",
     }
 
-    def __init__(self, skills_md_dir: str = None):
-        self.skills_md_dir = config.resolve_path(skills_md_dir or config.skills_md_dir)
+    def __init__(self, skill_dir: str = None):
+        self.skill_dir = config.resolve_path(skill_dir or config.skill_dir)
         self.loaded_skills: List[Dict[str, Any]] = []
         self.loaded_tool_skills: Dict[str, Dict[str, Any]] = {}
         self.loaded_skill_files: set[str] = set()
-        if not os.path.exists(self.skills_md_dir):
-            os.makedirs(self.skills_md_dir)
+        if not os.path.exists(self.skill_dir):
+            os.makedirs(self.skill_dir)
         self.refresh_skills()
 
     def _normalize_keywords(self, keywords: List[str]) -> List[str]:
@@ -103,9 +103,9 @@ class SkillManager:
     def refresh_skills(self) -> int:
         self.loaded_skills = []
         self.loaded_skill_files = set()
-        for filename in sorted(os.listdir(self.skills_md_dir)):
+        for filename in sorted(os.listdir(self.skill_dir)):
             if filename.endswith(".md"):
-                self.load_skill_md(filename)
+                self.load_skill(filename)
         return len(self.loaded_skills)
 
     def _evict_skill_cache(self, filename: str):
@@ -115,7 +115,7 @@ class SkillManager:
         ]
         self.loaded_skill_files.discard(filename)
 
-    def load_skill_md(self, filename: str, force_reload: bool = False) -> Optional[Dict[str, Any]]:
+    def load_skill(self, filename: str, force_reload: bool = False) -> Optional[Dict[str, Any]]:
         filename = os.path.basename(filename)
         if force_reload:
             self._evict_skill_cache(filename)
@@ -125,7 +125,7 @@ class SkillManager:
                 if skill.get("source_file") == filename:
                     return skill
 
-        path = os.path.join(self.skills_md_dir, filename)
+        path = os.path.join(self.skill_dir, filename)
         if not os.path.exists(path):
             return None
 
@@ -277,7 +277,3 @@ class SkillManager:
             "tool_reasons": [item.get("route_reason", "") for item in tool_skills],
         }
 
-    def assign_skill_to_task(self, task_description: str, extracted_keywords: List[str]):
-        """Backwards-compatible wrapper for prompt skill selection."""
-        capabilities = self.assign_capabilities_to_task(task_description, extracted_keywords)
-        return capabilities.get("prompt_skill")

@@ -1,9 +1,9 @@
-import os
+﻿import os
 import tempfile
 import unittest
 
-from config import config
-from skills_md.skill_parser import SkillManager
+from core.config import config
+from skill.skill_parser import SkillManager
 
 
 class FakeTool:
@@ -47,7 +47,7 @@ class SkillRoutingTests(unittest.TestCase):
         )
         with open(path, "w", encoding="utf-8") as file_handle:
             file_handle.write(content)
-        return self.manager.load_skill_md(filename, force_reload=True)
+        return self.manager.load_skill(filename, force_reload=True)
 
     def test_tool_match_requires_minimum_ratio(self):
         weather_tool = FakeTool("get_mock_weather", "Get weather for a city")
@@ -117,3 +117,4 @@ class SkillRoutingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

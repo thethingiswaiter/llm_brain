@@ -6,10 +6,10 @@ from typing import Any
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 
-from config import config
+from core.config import config
 from time_utils import now_china
 from cognitive.feature_extractor import DEFAULT_DOMAIN_LABEL
-from llm_manager import llm_manager
+from core.llm.manager import llm_manager
 
 
 SNAPSHOT_SCHEMA_VERSION = 1

@@ -1,4 +1,4 @@
-import copy
+﻿import copy
 import importlib
 import json
 import logging
@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 from langchain_core.tools import tool
 
-from config import config
+from core.config import config
 from cognitive.structured_output import (
     StructuredOutputFormatError,
     StructuredOutputSchemaError,
@@ -104,9 +104,7 @@ class ObservabilityMetricsTests(unittest.TestCase):
         config.memory_db_path = os.path.join(self.tempdir.name, "memory.db")
         config.memory_backup_dir = os.path.join(self.tempdir.name, "backups")
         config.state_snapshot_dir = os.path.join(self.tempdir.name, "snapshots")
-
-        import agent_core
-
+        from app.agent import core as agent_core
         self.agent_core_module = importlib.reload(agent_core)
         self.agent = self.agent_core_module.AgentCore()
 
@@ -122,16 +120,16 @@ class ObservabilityMetricsTests(unittest.TestCase):
 
     def test_build_request_metrics_deduplicates_reentered_subtask_started_events(self):
         events = [
-            {"event_type": "checkpoint", "stage": "subtask_started", "details": "index=1 | description=查询主机名称", "logged_at": "2026-04-01 14:00:00,000"},
+            {"event_type": "checkpoint", "stage": "subtask_started", "details": "index=1 | description=鏌ヨ涓绘満鍚嶇О", "logged_at": "2026-04-01 14:00:00,000"},
             {"event_type": "checkpoint", "stage": "tool_started", "details": "tool=get_system_info", "logged_at": "2026-04-01 14:00:01,000"},
             {"event_type": "checkpoint", "stage": "tool_succeeded", "details": "tool=get_system_info", "logged_at": "2026-04-01 14:00:02,000"},
-            {"event_type": "checkpoint", "stage": "subtask_started", "details": "index=1 | description=查询主机名称", "logged_at": "2026-04-01 14:00:03,000"},
+            {"event_type": "checkpoint", "stage": "subtask_started", "details": "index=1 | description=鏌ヨ涓绘満鍚嶇О", "logged_at": "2026-04-01 14:00:03,000"},
             {"event_type": "checkpoint", "stage": "reflection_completed", "details": "index=1 | success=True | action=continue", "logged_at": "2026-04-01 14:00:04,000"},
         ]
 
         metrics = self.agent.observability.build_request_metrics(
             events,
-            latest_state={"plan": [{"id": 1, "description": "查询主机名称"}], "retry_counts": {}},
+            latest_state={"plan": [{"id": 1, "description": "鏌ヨ涓绘満鍚嶇О"}], "retry_counts": {}},
             status="completed",
         )
 
@@ -149,9 +147,7 @@ class AgentStateSnapshotTests(unittest.TestCase):
         config.memory_db_path = os.path.join(self.tempdir.name, "memory.db")
         config.memory_backup_dir = os.path.join(self.tempdir.name, "backups")
         config.state_snapshot_dir = os.path.join(self.tempdir.name, "snapshots")
-
-        import agent_core
-
+        from app.agent import core as agent_core
         self.agent_core_module = importlib.reload(agent_core)
         self.agent = self.agent_core_module.AgentCore()
 
@@ -211,9 +207,7 @@ class ToolSafetyWrapperTests(unittest.TestCase):
         config.memory_db_path = os.path.join(self.tempdir.name, "memory.db")
         config.memory_backup_dir = os.path.join(self.tempdir.name, "backups")
         config.state_snapshot_dir = os.path.join(self.tempdir.name, "snapshots")
-
-        import agent_core
-
+        from app.agent import core as agent_core
         self.agent_core_module = importlib.reload(agent_core)
         self.agent = self.agent_core_module.AgentCore()
 
@@ -306,7 +300,7 @@ class ToolSafetyWrapperTests(unittest.TestCase):
 
 class TimeoutControlTests(unittest.TestCase):
     def test_build_structured_payload_includes_core_guardrail_fields(self):
-        from llm_manager import llm_manager
+        from core.llm.manager import llm_manager
 
         with llm_manager.request_scope("req_guardrail", session_id="session_guardrail"):
             payload = llm_manager._build_structured_payload(
@@ -322,7 +316,7 @@ class TimeoutControlTests(unittest.TestCase):
         self.assertEqual(payload["outcome"], "started")
 
     def test_llm_manager_timeout_raises_timeout_error(self):
-        from llm_manager import llm_manager
+        from core.llm.manager import llm_manager
 
         class SlowLLM:
             def invoke(self, payload):
@@ -339,7 +333,7 @@ class TimeoutControlTests(unittest.TestCase):
 
     def test_llm_manager_cancellation_raises_request_cancelled(self):
         from threading import Event
-        from llm_manager import llm_manager, RequestCancelledError
+        from core.llm.manager import llm_manager, RequestCancelledError
 
         class SlowLLM:
             def invoke(self, payload):
@@ -354,7 +348,7 @@ class TimeoutControlTests(unittest.TestCase):
                 llm_manager.invoke("hello", source="test.cancel", llm=SlowLLM())
 
     def test_llm_manager_dependency_failure_raises_specific_error(self):
-        from llm_manager import LLMDependencyUnavailableError, llm_manager
+        from core.llm.manager import LLMDependencyUnavailableError, llm_manager
 
         class BrokenLLM:
             def invoke(self, payload):
@@ -373,9 +367,7 @@ class TimeoutControlTests(unittest.TestCase):
         config.memory_backup_dir = os.path.join(self.tempdir.name, "backups")
         config.state_snapshot_dir = os.path.join(self.tempdir.name, "snapshots")
         config.request_timeout_seconds = 0.01
-
-        import agent_core
-
+        from app.agent import core as agent_core
         agent_core_module = importlib.reload(agent_core)
         agent = agent_core_module.AgentCore()
         original_graph = agent.graph
@@ -405,9 +397,8 @@ class TimeoutControlTests(unittest.TestCase):
         config.memory_db_path = os.path.join(self.tempdir.name, "memory.db")
         config.memory_backup_dir = os.path.join(self.tempdir.name, "backups")
         config.state_snapshot_dir = os.path.join(self.tempdir.name, "snapshots")
-
-        import agent_core
-        from llm_manager import LLMDependencyUnavailableError
+        from app.agent import core as agent_core
+        from core.llm.manager import LLMDependencyUnavailableError
 
         agent_core_module = importlib.reload(agent_core)
         agent = agent_core_module.AgentCore()
@@ -472,9 +463,7 @@ class RetentionManagerTests(unittest.TestCase):
         config.memory_backup_retention_max_bytes = 0
         config.retention_auto_prune_enabled = True
         config.retention_auto_prune_min_interval_seconds = 300
-
-        import agent_core
-
+        from app.agent import core as agent_core
         self.agent_core_module = importlib.reload(agent_core)
         self.agent = self.agent_core_module.AgentCore()
 
@@ -717,9 +706,7 @@ class SnapshotResumeTests(unittest.TestCase):
         config.memory_db_path = os.path.join(self.tempdir.name, "memory.db")
         config.memory_backup_dir = os.path.join(self.tempdir.name, "backups")
         config.state_snapshot_dir = os.path.join(self.tempdir.name, "snapshots")
-
-        import agent_core
-
+        from app.agent import core as agent_core
         self.agent_core_module = importlib.reload(agent_core)
         self.agent = self.agent_core_module.AgentCore()
 
@@ -1165,9 +1152,7 @@ class RecentRequestFilterTests(unittest.TestCase):
         config.memory_db_path = os.path.join(self.tempdir.name, "memory.db")
         config.memory_backup_dir = os.path.join(self.tempdir.name, "backups")
         config.state_snapshot_dir = os.path.join(self.tempdir.name, "snapshots")
-
-        import agent_core
-
+        from app.agent import core as agent_core
         self.agent_core_module = importlib.reload(agent_core)
         self.agent = self.agent_core_module.AgentCore()
 
@@ -1217,26 +1202,36 @@ class RecentRequestFilterTests(unittest.TestCase):
 
 
 class ToolRerouteTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.original_memory_db_path = config.memory_db_path
+        cls.original_memory_backup_dir = config.memory_backup_dir
+        cls.original_state_snapshot_dir = config.state_snapshot_dir
+        cls.tempdir = tempfile.TemporaryDirectory()
+
+        config.memory_db_path = os.path.join(cls.tempdir.name, "memory.db")
+        config.memory_backup_dir = os.path.join(cls.tempdir.name, "backups")
+        config.state_snapshot_dir = os.path.join(cls.tempdir.name, "snapshots")
+
+        from app.agent import core as agent_core
+
+        cls.agent_core_module = importlib.reload(agent_core)
+        cls.shared_agent = cls.agent_core_module.AgentCore(
+            auto_load_tools=False,
+            auto_load_mcp=False,
+            build_graph=False,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        config.memory_db_path = cls.original_memory_db_path
+        config.memory_backup_dir = cls.original_memory_backup_dir
+        config.state_snapshot_dir = cls.original_state_snapshot_dir
+        cls.tempdir.cleanup()
+
     def setUp(self):
-        self.original_memory_db_path = config.memory_db_path
-        self.original_memory_backup_dir = config.memory_backup_dir
-        self.original_state_snapshot_dir = config.state_snapshot_dir
-        self.tempdir = tempfile.TemporaryDirectory()
-
-        config.memory_db_path = os.path.join(self.tempdir.name, "memory.db")
-        config.memory_backup_dir = os.path.join(self.tempdir.name, "backups")
-        config.state_snapshot_dir = os.path.join(self.tempdir.name, "snapshots")
-
-        import agent_core
-
-        self.agent_core_module = importlib.reload(agent_core)
-        self.agent = self.agent_core_module.AgentCore()
-
-    def tearDown(self):
-        config.memory_db_path = self.original_memory_db_path
-        config.memory_backup_dir = self.original_memory_backup_dir
-        config.state_snapshot_dir = self.original_state_snapshot_dir
-        self.tempdir.cleanup()
+        self.agent = self.__class__.shared_agent
+        self.agent.skills.loaded_tool_skills = {}
 
     def test_collect_recent_tool_failures_reads_trailing_tool_messages(self):
         messages = [
@@ -1676,9 +1671,7 @@ class RequestCancellationTests(unittest.TestCase):
         config.memory_db_path = os.path.join(self.tempdir.name, "memory.db")
         config.memory_backup_dir = os.path.join(self.tempdir.name, "backups")
         config.state_snapshot_dir = os.path.join(self.tempdir.name, "snapshots")
-
-        import agent_core
-
+        from app.agent import core as agent_core
         self.agent_core_module = importlib.reload(agent_core)
         self.agent = self.agent_core_module.AgentCore()
 
@@ -1749,10 +1742,8 @@ class ObservabilityTests(unittest.TestCase):
         config.state_snapshot_dir = os.path.join(self.tempdir.name, "snapshots")
         config.log_dir = os.path.join(self.tempdir.name, "logs")
         config.llm_log_file = "observability.log"
-
-        import llm_manager
-        import agent_core
-
+        from core.llm import manager as llm_manager
+        from app.agent import core as agent_core
         self.llm_manager_module = importlib.reload(llm_manager)
         self.agent_core_module = importlib.reload(agent_core)
         self.agent = self.agent_core_module.AgentCore()
@@ -2483,3 +2474,4 @@ class ObservabilityTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

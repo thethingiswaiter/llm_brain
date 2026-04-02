@@ -2,7 +2,7 @@ import sqlite3
 import os
 import json
 from typing import Optional
-from config import config
+from core.config import config
 from time_utils import now_china_iso
 
 class MemoryManager:

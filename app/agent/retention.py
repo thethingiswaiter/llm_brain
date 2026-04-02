@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from config import config
+from core.config import config
 from time_utils import now_china
 
 
@@ -316,7 +316,7 @@ class AgentRetentionManager:
         }
         if deleted_count:
             try:
-                from llm_manager import llm_manager
+                from core.llm.manager import llm_manager
 
                 llm_manager.log_structured_event(
                     "retention_auto_prune",

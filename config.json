@@ -24,8 +24,8 @@
     },
     "paths": {
         "mcp_servers_dir": "mcp_servers",
-        "skills_dir": "skills",
-        "skills_md_dir": "skills_md",
+        "tools_dir": "tools",
+        "skill_dir": "skills",
         "logs_dir": "logs",
         "runtime": {
             "snapshot_dir": "runtime_state/snapshots",

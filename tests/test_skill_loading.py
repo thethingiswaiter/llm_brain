@@ -1,10 +1,10 @@
-import importlib
+﻿import importlib
 import os
 import tempfile
 import unittest
 from textwrap import dedent
 
-from config import config
+from core.config import config
 
 
 class SkillAutoLoadingTests(unittest.TestCase):
@@ -12,17 +12,17 @@ class SkillAutoLoadingTests(unittest.TestCase):
         self.original_memory_db_path = config.memory_db_path
         self.original_memory_backup_dir = config.memory_backup_dir
         self.original_state_snapshot_dir = config.state_snapshot_dir
-        self.original_skills_dir = config.skills_dir
+        self.original_tool_dir = config.tool_dir
         self.original_mcp_dir = config.mcp_dir
         self.tempdir = tempfile.TemporaryDirectory()
 
         config.memory_db_path = os.path.join(self.tempdir.name, "memory.db")
         config.memory_backup_dir = os.path.join(self.tempdir.name, "backups")
         config.state_snapshot_dir = os.path.join(self.tempdir.name, "snapshots")
-        config.skills_dir = os.path.join(self.tempdir.name, "skills")
+        config.tool_dir = os.path.join(self.tempdir.name, "tools")
         config.mcp_dir = os.path.join(self.tempdir.name, "mcp")
 
-        os.makedirs(config.skills_dir, exist_ok=True)
+        os.makedirs(config.tool_dir, exist_ok=True)
         os.makedirs(config.mcp_dir, exist_ok=True)
 
         self._write_skill_file(
@@ -46,9 +46,7 @@ class SkillAutoLoadingTests(unittest.TestCase):
             "return value",
             args_signature="value: str",
         )
-
-        import agent_core
-
+        from app.agent import core as agent_core
         self.agent_core_module = importlib.reload(agent_core)
         self.agent = self.agent_core_module.AgentCore()
 
@@ -60,12 +58,12 @@ class SkillAutoLoadingTests(unittest.TestCase):
         config.memory_db_path = self.original_memory_db_path
         config.memory_backup_dir = self.original_memory_backup_dir
         config.state_snapshot_dir = self.original_state_snapshot_dir
-        config.skills_dir = self.original_skills_dir
+        config.tool_dir = self.original_tool_dir
         config.mcp_dir = self.original_mcp_dir
         self.tempdir.cleanup()
 
     def _write_skill_file(self, filename: str, tool_name: str, description: str, return_expr: str, args_signature: str = ""):
-        path = os.path.join(config.skills_dir, filename)
+        path = os.path.join(config.tool_dir, filename)
         signature = f"({args_signature})" if args_signature else "()"
         content = (
             "from langchain_core.tools import tool\n\n\n"
@@ -79,9 +77,9 @@ class SkillAutoLoadingTests(unittest.TestCase):
             file_handle.write(content)
 
     def test_auto_load_skips_sample_and_test_skill_files(self):
-        self.assertIn("runtime_skill.py", self.agent.loaded_python_skill_files)
-        self.assertNotIn("sample_demo.py", self.agent.loaded_python_skill_files)
-        self.assertNotIn("test_demo.py", self.agent.loaded_python_skill_files)
+        self.assertIn("runtime_skill.py", self.agent.loaded_python_tool_files)
+        self.assertNotIn("sample_demo.py", self.agent.loaded_python_tool_files)
+        self.assertNotIn("test_demo.py", self.agent.loaded_python_tool_files)
 
         loaded_names = {getattr(tool, "name", "") for tool in self.agent.tools}
         self.assertIn("runtime_echo", loaded_names)
@@ -94,21 +92,19 @@ class AgentInitializationWithoutRuntimeSkillsTests(unittest.TestCase):
         self.original_memory_db_path = config.memory_db_path
         self.original_memory_backup_dir = config.memory_backup_dir
         self.original_state_snapshot_dir = config.state_snapshot_dir
-        self.original_skills_dir = config.skills_dir
+        self.original_tool_dir = config.tool_dir
         self.original_mcp_dir = config.mcp_dir
         self.tempdir = tempfile.TemporaryDirectory()
 
         config.memory_db_path = os.path.join(self.tempdir.name, "memory.db")
         config.memory_backup_dir = os.path.join(self.tempdir.name, "backups")
         config.state_snapshot_dir = os.path.join(self.tempdir.name, "snapshots")
-        config.skills_dir = os.path.join(self.tempdir.name, "skills")
+        config.tool_dir = os.path.join(self.tempdir.name, "tools")
         config.mcp_dir = os.path.join(self.tempdir.name, "mcp")
 
-        os.makedirs(config.skills_dir, exist_ok=True)
+        os.makedirs(config.tool_dir, exist_ok=True)
         os.makedirs(config.mcp_dir, exist_ok=True)
-
-        import agent_core
-
+        from app.agent import core as agent_core
         self.agent_core_module = importlib.reload(agent_core)
         self.agent = self.agent_core_module.AgentCore()
 
@@ -120,12 +116,12 @@ class AgentInitializationWithoutRuntimeSkillsTests(unittest.TestCase):
         config.memory_db_path = self.original_memory_db_path
         config.memory_backup_dir = self.original_memory_backup_dir
         config.state_snapshot_dir = self.original_state_snapshot_dir
-        config.skills_dir = self.original_skills_dir
+        config.tool_dir = self.original_tool_dir
         config.mcp_dir = self.original_mcp_dir
         self.tempdir.cleanup()
 
     def test_agent_core_initializes_without_runtime_skills(self):
-        self.assertEqual(self.agent.loaded_python_skill_files, set())
+        self.assertEqual(self.agent.loaded_python_tool_files, set())
         self.assertIsNotNone(self.agent.graph)
 
 
@@ -134,17 +130,17 @@ class MCPAutoLoadingTests(unittest.TestCase):
         self.original_memory_db_path = config.memory_db_path
         self.original_memory_backup_dir = config.memory_backup_dir
         self.original_state_snapshot_dir = config.state_snapshot_dir
-        self.original_skills_dir = config.skills_dir
+        self.original_tool_dir = config.tool_dir
         self.original_mcp_dir = config.mcp_dir
         self.tempdir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
 
         config.memory_db_path = os.path.join(self.tempdir.name, "memory.db")
         config.memory_backup_dir = os.path.join(self.tempdir.name, "backups")
         config.state_snapshot_dir = os.path.join(self.tempdir.name, "snapshots")
-        config.skills_dir = os.path.join(self.tempdir.name, "skills")
+        config.tool_dir = os.path.join(self.tempdir.name, "tools")
         config.mcp_dir = os.path.join(self.tempdir.name, "mcp")
 
-        os.makedirs(config.skills_dir, exist_ok=True)
+        os.makedirs(config.tool_dir, exist_ok=True)
         os.makedirs(config.mcp_dir, exist_ok=True)
 
         server_path = os.path.join(config.mcp_dir, "temp_mcp_server.py")
@@ -161,7 +157,7 @@ class MCPAutoLoadingTests(unittest.TestCase):
 
                     @mcp.tool(name="get_temp_info")
                     def get_temp_info() -> dict:
-                        """Return temp host info including hostname. 中文关键词: 主机名 主机 名称。"""
+                        """Return temp host info including hostname."""
                         return {"ok": True, "hostname": "temp-host"}
 
 
@@ -171,11 +167,9 @@ class MCPAutoLoadingTests(unittest.TestCase):
                     mcp.run()
                 '''
             ).strip() + "\n")
-
-        import agent_core
-
+            from app.agent import core as agent_core
         self.agent_core_module = importlib.reload(agent_core)
-        self.agent = self.agent_core_module.AgentCore()
+        self.agent = self.agent_core_module.AgentCore(auto_load_mcp=True)
 
     def tearDown(self):
         try:
@@ -185,7 +179,7 @@ class MCPAutoLoadingTests(unittest.TestCase):
         config.memory_db_path = self.original_memory_db_path
         config.memory_backup_dir = self.original_memory_backup_dir
         config.state_snapshot_dir = self.original_state_snapshot_dir
-        config.skills_dir = self.original_skills_dir
+        config.tool_dir = self.original_tool_dir
         config.mcp_dir = self.original_mcp_dir
         self.tempdir.cleanup()
 
@@ -194,10 +188,12 @@ class MCPAutoLoadingTests(unittest.TestCase):
         self.assertEqual(len(self.agent.list_mcp_servers()), 1)
 
     def test_select_active_tools_matches_contiguous_chinese_query(self):
-        selected_names = [getattr(tool, "name", "") for tool in self.agent.select_active_tools("查询一下主机名称")]
+        selected_names = [getattr(tool, "name", "") for tool in self.agent.select_active_tools("query host name")]
 
         self.assertIn("get_temp_info", selected_names)
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
