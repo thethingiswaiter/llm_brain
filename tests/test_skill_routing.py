@@ -3,7 +3,7 @@ import tempfile
 import unittest
 
 from core.config import config
-from skill.skill_parser import SkillManager
+from app.agent.skill_parser import SkillManager
 
 
 class FakeTool:

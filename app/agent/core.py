@@ -22,10 +22,10 @@ from app.agent.observability import AgentObservability
 from app.agent.retention import AgentRetentionManager
 from app.agent.runtime import AgentRuntime
 from app.agent.snapshots import AgentSnapshotStore
+from app.agent.skill_parser import SkillManager
 from app.agent.tools_runtime import AgentToolRuntime
 from memory.memory_manager import MemoryManager
 from mcp_servers.mcp_manager import MCPManager
-from skill.skill_parser import SkillManager
 
 class AgentState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]

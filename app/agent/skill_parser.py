@@ -5,6 +5,7 @@ from typing import Dict, List, Any, Optional
 from core.config import config
 from core.llm.manager import llm_manager
 
+
 class SkillManager:
     STOPWORDS = {
         "a", "an", "the", "and", "for", "with", "that", "this", "from", "into", "your", "have",
@@ -258,7 +259,9 @@ class SkillManager:
                         "matched_terms": matched_terms,
                         "overlap_count": overlap,
                         "match_ratio": match_ratio,
-                        "route_reason": self._build_route_reason(tool_skill.get("name", "unknown_tool"), matched_terms, overlap, match_ratio),
+                        "route_reason": self._build_route_reason(
+                            tool_skill.get("name", "unknown_tool"), matched_terms, overlap, match_ratio
+                        ),
                     },
                 )
             )
@@ -276,4 +279,3 @@ class SkillManager:
             "tools": [item["tool"] for item in tool_skills],
             "tool_reasons": [item.get("route_reason", "") for item in tool_skills],
         }
-
