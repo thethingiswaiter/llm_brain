@@ -807,7 +807,7 @@ class AgentIntegrationFlowTests(unittest.TestCase):
 
         self.agent.cognitive.extract_features = lambda text: (["weather", "beijing"], "weather summary")
         self.agent.cognitive.determine_domain = lambda text: "general"
-        self.agent.planner.split_task = lambda text: [
+        self.agent.planner.split_task = lambda text, thinking_mode=False: [
             {"id": 1, "description": "check weather in beijing", "expected_outcome": "provide the weather"}
         ]
         self.agent.reflector.verify_and_reflect = lambda desc, expected, actual: (True, "verified", "continue")
@@ -902,7 +902,7 @@ class AgentIntegrationFlowTests(unittest.TestCase):
             def invoke(self, payload):
                 return AIMessage(content=next(self.responses))
 
-        def fake_split_task(text):
+        def fake_split_task(text, thinking_mode=False):
             lowered = text.lower()
             if "replan the failed subtask" in lowered or "replan" in lowered or "重新规划" in text:
                 return [
@@ -973,7 +973,7 @@ class AgentIntegrationFlowTests(unittest.TestCase):
         llm.test_case = self
         self.agent.cognitive.extract_features = lambda text: (["hostname", "name"], "hostname summary")
         self.agent.cognitive.determine_domain = lambda text: "computer"
-        self.agent.planner.split_task = lambda text: [
+        self.agent.planner.split_task = lambda text, thinking_mode=False: [
             {"id": 1, "description": "query hostname", "expected_outcome": "return hostname"}
         ]
         self.agent.reflector.verify_and_reflect = lambda desc, expected, actual: (True, "verified", "continue")
@@ -983,6 +983,52 @@ class AgentIntegrationFlowTests(unittest.TestCase):
             "tool_skills": [{"name": "get_hostname", "tool": next(tool for tool in self.agent.tools if getattr(tool, "name", "") == "get_hostname"), "description": "Get the local hostname.", "route_reason": "matched hostname", "overlap_count": 2, "match_ratio": 1.0}],
             "tool_reasons": ["matched hostname"],
             "tools": [next(tool for tool in self.agent.tools if getattr(tool, "name", "") == "get_hostname")],
+        }
+        self.llm_manager_module.llm_manager.get_llm = lambda: llm
+
+        result = self.agent.invoke("query hostname")
+
+        self.assertEqual(result, "hostname is thething")
+        self.assertEqual(len(llm.calls), 2)
+
+    def test_empty_llm_response_with_single_selected_tool_synthesizes_tool_call(self):
+        @tool
+        def get_hostname() -> str:
+            """Get the local hostname."""
+            return "thething"
+
+        class EmptyThenAnswerLLM:
+            def __init__(self):
+                self.calls = []
+
+            def bind_tools(self, tools):
+                return self
+
+            def invoke(self, payload):
+                self.calls.append(payload)
+                if len(self.calls) == 1:
+                    self.test_case.assertIsInstance(payload[-1], HumanMessage)
+                    return AIMessage(content="")
+
+                self.test_case.assertIsInstance(payload[-1], ToolMessage)
+                return AIMessage(content="hostname is thething")
+
+        self.agent.add_tool(get_hostname)
+        llm = EmptyThenAnswerLLM()
+        llm.test_case = self
+        selected_tool = next(tool for tool in self.agent.tools if getattr(tool, "name", "") == "get_hostname")
+        self.agent.cognitive.extract_features = lambda text: (["hostname", "name"], "hostname summary")
+        self.agent.cognitive.determine_domain = lambda text: "computer"
+        self.agent.planner.split_task = lambda text, thinking_mode=False: [
+            {"id": 1, "description": "query hostname", "expected_outcome": "return hostname"}
+        ]
+        self.agent.reflector.verify_and_reflect = lambda desc, expected, actual: (True, "verified", "continue")
+        self.agent.skills.assign_capabilities_to_task = lambda desc, kws: {
+            "prompt_skill": None,
+            "prompt_skill_reason": "",
+            "tool_skills": [{"name": "get_hostname", "tool": selected_tool, "description": "Get the local hostname.", "route_reason": "matched hostname", "overlap_count": 2, "match_ratio": 1.0}],
+            "tool_reasons": ["matched hostname"],
+            "tools": [selected_tool],
         }
         self.llm_manager_module.llm_manager.get_llm = lambda: llm
 

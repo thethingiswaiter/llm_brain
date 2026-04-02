@@ -106,6 +106,26 @@ class SkillRoutingTests(unittest.TestCase):
         self.assertEqual(capabilities["tool_skills"][0]["name"], "get_mock_weather")
         self.assertTrue(capabilities["tool_reasons"][0])
 
+    def test_assign_capabilities_prefers_tools_for_execution_tasks(self):
+        self._write_skill(
+            "fs.md",
+            "filesystem_helper",
+            ["目录", "文件", "统计"],
+            "Filesystem prompt helper",
+            "fs body",
+        )
+        list_tool = FakeTool("list_directory", "列出工作区内目录项（安全边界：仅允许工作区内路径）。")
+        self.manager.register_tool(list_tool)
+
+        capabilities = self.manager.assign_capabilities_to_task(
+            "查一下你现在目录下有多少文件",
+            ["文件数量", "目录", "统计"],
+        )
+
+        self.assertIsNone(capabilities["prompt_skill"])
+        self.assertEqual(capabilities["prompt_skill_reason"], "suppressed_in_tool_execution_mode")
+        self.assertEqual([item["name"] for item in capabilities["tool_skills"]], ["list_directory"])
+
     def test_tool_match_supports_contiguous_chinese_query_terms(self):
         host_tool = FakeTool("get_system_info", "Get hostname and system info. 中文关键词: 主机名 主机 名称 系统 信息")
         self.manager.register_tool(host_tool)
@@ -113,6 +133,24 @@ class SkillRoutingTests(unittest.TestCase):
         matched = self.manager.find_relevant_tools("查询一下主机名称", ["查询", "主机", "名称"])
 
         self.assertEqual([item["name"] for item in matched], ["get_system_info"])
+
+    def test_directory_file_count_query_matches_list_directory_tool(self):
+        list_tool = FakeTool("list_directory", "列出工作区内目录项（安全边界：仅允许工作区内路径）。")
+        self.manager.register_tool(list_tool)
+
+        matched = self.manager.find_relevant_tools("查一下你现在目录下有多少文件", ["文件数量", "目录", "统计"])
+
+        self.assertEqual([item["name"] for item in matched], ["list_directory"])
+        self.assertIn("目录", matched[0]["matched_terms"])
+
+    def test_tool_match_uses_relaxed_fallback_for_execution_queries(self):
+        borderline_tool = FakeTool("status_lookup", "Lookup system status and service metadata. 中文关键词: 系统")
+        self.manager.register_tool(borderline_tool)
+
+        matched = self.manager.find_relevant_tools("查一下并执行检查", ["系统", "状态", "检查", "服务", "元数据"])
+
+        self.assertEqual([item["name"] for item in matched], ["status_lookup"])
+        self.assertIn("relaxed_tool_threshold", matched[0]["route_reason"])
 
 
 if __name__ == "__main__":

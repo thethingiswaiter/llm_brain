@@ -324,6 +324,94 @@ class AgentCore:
     def _collect_recent_tool_failures(self, messages: List[BaseMessage]) -> List[Dict[str, Any]]:
         return self.tool_runtime.collect_recent_tool_failures(messages)
 
+    def _response_needs_tool_fallback(self, response: BaseMessage) -> bool:
+        if not isinstance(response, AIMessage):
+            return False
+        if getattr(response, "tool_calls", None):
+            return False
+        content = response.content
+        if isinstance(content, str):
+            return not content.strip()
+        return not str(content or "").strip()
+
+    def _infer_path_argument(self, user_query: str, subtask_desc: str) -> str | None:
+        combined = "\n".join(part for part in [user_query, subtask_desc] if part)
+        windows_match = re.search(r"([a-zA-Z]:(?:\\[^\\/:*?\"<>|\r\n]+)+)", combined)
+        if windows_match:
+            return windows_match.group(1)
+
+        workspace_root = config.resolve_path(".")
+        workspace_name = os.path.basename(workspace_root).lower()
+        lowered = combined.lower()
+        if workspace_name and workspace_name in lowered and any(marker in combined for marker in ["当前项目", "workspace", "项目目录"]):
+            return workspace_root
+        return None
+
+    def _build_tool_fallback_args(self, tool: Any, user_query: str, subtask_desc: str) -> Dict[str, Any] | None:
+        args_schema = getattr(tool, "args_schema", None)
+        if not args_schema:
+            return {}
+
+        if hasattr(args_schema, "model_json_schema"):
+            schema = args_schema.model_json_schema()
+        else:
+            return None
+
+        properties = schema.get("properties", {}) or {}
+        required_fields = set(schema.get("required", []) or [])
+        if not properties:
+            return {}
+        if len(properties) != 1:
+            return None
+
+        field_name = next(iter(properties.keys()))
+        normalized_field_name = field_name.strip().lower()
+        if normalized_field_name not in {"path", "file_path", "filepath", "dir_path", "directory", "directory_path"}:
+            return None
+
+        inferred_path = self._infer_path_argument(user_query, subtask_desc)
+        if field_name in required_fields and not inferred_path:
+            return None
+        if inferred_path:
+            return {field_name: inferred_path}
+        return {}
+
+    def _maybe_synthesize_tool_call(
+        self,
+        response: BaseMessage,
+        selected_tools: List[Any],
+        user_query: str,
+        subtask_desc: str,
+        request_id: str,
+    ) -> BaseMessage:
+        if not self._response_needs_tool_fallback(response):
+            return response
+        if len(selected_tools) != 1:
+            return response
+
+        tool = selected_tools[0]
+        tool_name = getattr(tool, "name", "")
+        fallback_args = self._build_tool_fallback_args(tool, user_query, subtask_desc)
+        if fallback_args is None:
+            return response
+
+        llm_manager.log_checkpoint(
+            "tool_call_synthesized",
+            details=f"tool={tool_name} | reason=empty_llm_response",
+            request_id=request_id,
+            console=False,
+            tool_name=tool_name,
+        )
+        return AIMessage(
+            content="",
+            tool_calls=[{
+                "name": tool_name,
+                "args": fallback_args,
+                "id": f"call_{uuid.uuid4().hex[:8]}",
+                "type": "tool_call",
+            }],
+        )
+
     def _merge_failed_tools(
         self,
         failed_tools: Dict[str, List[str]],
@@ -800,7 +888,7 @@ class AgentCore:
             )
             
             # 2. Planning (Decompose complex tasks into granular subtasks)
-            plan = self.planner.split_task(last_message_content)
+            plan = self.planner.split_task(last_message_content, thinking_mode=False)
             self._raise_if_request_cancelled(request_id)
             llm_manager.log_checkpoint(
                 "planning_completed",
@@ -1024,6 +1112,13 @@ class AgentCore:
             )
                 
             response = llm_manager.invoke(messages, source="agent.execute_subtask", llm=llm)
+            response = self._maybe_synthesize_tool_call(
+                response,
+                selected_tools,
+                state["messages"][0].content if state.get("messages") else "",
+                subtask_desc,
+                request_id,
+            )
             return {
                 "messages": [response],
                 "failed_tools": merged_failed_tools,

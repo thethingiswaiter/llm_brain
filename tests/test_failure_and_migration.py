@@ -117,7 +117,7 @@ class AgentRetryLimitFailureTests(unittest.TestCase):
 
         self.agent.cognitive.extract_features = lambda text: (["retry", "planner"], "retry summary")
         self.agent.cognitive.determine_domain = lambda text: "general"
-        self.agent.planner.split_task = lambda text: [
+        self.agent.planner.split_task = lambda text, thinking_mode=False: [
             {"id": 1, "description": "perform unstable action", "expected_outcome": "stable result"}
         ]
         self.agent.reflector.verify_and_reflect = lambda desc, expected, actual: (False, "still failing", "retry")

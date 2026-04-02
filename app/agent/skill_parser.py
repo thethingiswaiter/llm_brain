@@ -14,6 +14,41 @@ class SkillManager:
         "when", "where", "which", "what", "tell", "give", "show", "user", "name", "tool",
         "请", "请问", "帮我", "一下", "看看", "看下", "查下", "查询一下", "告诉我", "我想", "我要", "有没有", "怎么", "如何",
     }
+    TOOL_KEYWORD_HINTS = {
+        "list_directory": [
+            "目录",
+            "当前目录",
+            "工作区",
+            "文件",
+            "文件夹",
+            "列表",
+            "列出",
+            "统计",
+            "数量",
+            "总数",
+            "个数",
+        ],
+        "read_text_file": [
+            "文件",
+            "读取",
+            "打开文件",
+            "查看内容",
+            "文本",
+            "行",
+        ],
+        "grep_text": [
+            "搜索",
+            "查找",
+            "匹配",
+            "关键字",
+            "文本搜索",
+        ],
+    }
+    TOOL_EXECUTION_MARKERS = {
+        "查", "查询", "列出", "统计", "读取", "读", "搜索", "查找", "写入", "保存", "删除", "执行",
+        "目录", "文件", "路径", "终端", "命令", "workspace", "目录下", "文件夹",
+        "list", "count", "read", "write", "search", "grep", "directory", "file", "path",
+    }
 
     def __init__(self, skill_dir: str = None):
         self.skill_dir = config.resolve_path(skill_dir or config.skill_dir)
@@ -73,6 +108,17 @@ class SkillManager:
         return (
             f"matched {overlap} term(s) [{matched_text}] "
             f"with ratio={match_ratio:.2f} for candidate={candidate_name}"
+        )
+
+    def _is_tool_execution_task(self, task_description: str, extracted_keywords: List[str]) -> bool:
+        task_terms = set(self._tokenize_text(task_description))
+        keyword_terms = set(self._normalize_keywords(extracted_keywords))
+        combined_terms = task_terms | keyword_terms
+        if not combined_terms:
+            return False
+        return any(
+            marker in combined_terms or any(marker in term for term in combined_terms)
+            for marker in self.TOOL_EXECUTION_MARKERS
         )
 
     def _best_term_match(
@@ -169,6 +215,7 @@ class SkillManager:
 
         description = getattr(tool, "description", "") or ""
         keywords = self._normalize_keywords(self._tokenize_text(f"{tool_name} {description}"))
+        keywords = self._normalize_keywords(keywords + self.TOOL_KEYWORD_HINTS.get(tool_name, []))
         tool_skill = {
             "name": tool_name,
             "description": description,
@@ -226,28 +273,18 @@ class SkillManager:
                 }
         return best_skill
 
-    def find_relevant_tools(self, task_description: str, extracted_keywords: List[str], limit: int = 3) -> List[Dict[str, Any]]:
-        keyword_terms = set(self._normalize_keywords(extracted_keywords))
-        description_terms = set(self._tokenize_text(task_description))
-        candidate_term_sets = []
-        if keyword_terms:
-            candidate_term_sets.append(keyword_terms)
-        if description_terms and description_terms not in candidate_term_sets:
-            candidate_term_sets.append(description_terms)
-
-        if not candidate_term_sets:
-            return []
-
+    def _rank_tools(
+        self,
+        candidate_term_sets: List[set[str]],
+        min_overlap: int,
+        min_ratio: float,
+        limit: int,
+    ) -> List[Dict[str, Any]]:
         ranked_tools = []
         for tool_skill in self.loaded_tool_skills.values():
             tool_terms = set(tool_skill.get("keywords", []))
             matched_terms, overlap, match_ratio, task_terms = self._best_term_match(candidate_term_sets, tool_terms)
-            if not self._passes_threshold(
-                overlap,
-                task_terms,
-                config.tool_skill_min_overlap,
-                config.tool_skill_min_match_ratio,
-            ):
+            if not self._passes_threshold(overlap, task_terms, min_overlap, min_ratio):
                 continue
             ranked_tools.append(
                 (
@@ -269,12 +306,49 @@ class SkillManager:
         ranked_tools.sort(key=lambda item: (item[0], item[1], item[2], item[3]["name"]), reverse=True)
         return [item[3] for item in ranked_tools[:limit]]
 
+    def find_relevant_tools(self, task_description: str, extracted_keywords: List[str], limit: int = 3) -> List[Dict[str, Any]]:
+        keyword_terms = set(self._normalize_keywords(extracted_keywords))
+        description_terms = set(self._tokenize_text(task_description))
+        candidate_term_sets = []
+        if keyword_terms:
+            candidate_term_sets.append(keyword_terms)
+        if description_terms and description_terms not in candidate_term_sets:
+            candidate_term_sets.append(description_terms)
+
+        if not candidate_term_sets:
+            return []
+        strict_matches = self._rank_tools(
+            candidate_term_sets,
+            config.tool_skill_min_overlap,
+            config.tool_skill_min_match_ratio,
+            limit,
+        )
+        if strict_matches:
+            return strict_matches
+
+        if not self._is_tool_execution_task(task_description, extracted_keywords):
+            return []
+
+        relaxed_matches = self._rank_tools(
+            candidate_term_sets,
+            min_overlap=1,
+            min_ratio=0.0,
+            limit=limit,
+        )
+        for item in relaxed_matches:
+            item["route_reason"] = f"{item.get('route_reason', '')} | relaxed_tool_threshold"
+        return relaxed_matches
+
     def assign_capabilities_to_task(self, task_description: str, extracted_keywords: List[str]) -> Dict[str, Any]:
         prompt_skill = self.find_best_skill(extracted_keywords)
         tool_skills = self.find_relevant_tools(task_description, extracted_keywords)
+        prompt_skill_reason = prompt_skill.get("route_reason", "") if prompt_skill else ""
+        if tool_skills and self._is_tool_execution_task(task_description, extracted_keywords):
+            prompt_skill = None
+            prompt_skill_reason = "suppressed_in_tool_execution_mode"
         return {
             "prompt_skill": prompt_skill,
-            "prompt_skill_reason": prompt_skill.get("route_reason", "") if prompt_skill else "",
+            "prompt_skill_reason": prompt_skill_reason,
             "tool_skills": tool_skills,
             "tools": [item["tool"] for item in tool_skills],
             "tool_reasons": [item.get("route_reason", "") for item in tool_skills],

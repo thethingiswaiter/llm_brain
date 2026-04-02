@@ -116,7 +116,7 @@ class MemoryQualityTests(unittest.TestCase):
         manager.add_memory(
             "session_distinct",
             "general",
-            ["weather"],
+            ["weather", "beijing"],
             "weather lookup",
             "check weather in beijing",
             "sunny",
@@ -127,7 +127,7 @@ class MemoryQualityTests(unittest.TestCase):
         manager.add_memory(
             "session_distinct",
             "general",
-            ["weather"],
+            ["weather", "beijing"],
             "weather lookup",
             "check weather in beijing",
             "rainy",
@@ -170,6 +170,82 @@ class MemoryQualityTests(unittest.TestCase):
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0]["request_id"], "req_blocked")
         self.assertEqual(results[0]["memory_type"], "failure_case")
+
+    def test_retrieve_memory_returns_empty_when_keywords_do_not_match(self):
+        manager = MemoryManager()
+        manager.add_memory(
+            "session_weather",
+            "general",
+            ["weather", "beijing"],
+            "successful weather lookup",
+            "input weather",
+            "output weather",
+            request_id="req_weather",
+            memory_type="step",
+            quality_tags=["success"],
+        )
+
+        results = manager.retrieve_memory(match_keywords=["nginx", "config"], limit=5)
+
+        self.assertEqual(results, [])
+
+    def test_retrieve_memory_requires_full_keyword_match_by_default(self):
+        manager = MemoryManager()
+        manager.add_memory(
+            "session_partial",
+            "general",
+            ["weather"],
+            "weather only memory",
+            "input weather",
+            "output weather",
+            request_id="req_partial",
+            memory_type="step",
+            quality_tags=["success"],
+        )
+
+        results = manager.retrieve_memory(match_keywords=["weather", "beijing"], limit=5)
+
+        self.assertEqual(results, [])
+
+    def test_retrieve_memory_can_relax_match_threshold_via_hook(self):
+        manager = MemoryManager()
+        manager.add_memory(
+            "session_partial",
+            "general",
+            ["weather"],
+            "weather only memory",
+            "input weather",
+            "output weather",
+            request_id="req_partial",
+            memory_type="step",
+            quality_tags=["success"],
+        )
+
+        results = manager.retrieve_memory(
+            match_keywords=["weather", "beijing"],
+            limit=5,
+            min_overlap_ratio=0.5,
+        )
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["request_id"], "req_partial")
+
+    def test_retrieve_memory_returns_empty_when_keywords_missing(self):
+        manager = MemoryManager()
+        manager.add_memory(
+            "session_weather",
+            "general",
+            ["weather", "beijing"],
+            "successful weather lookup",
+            "input weather",
+            "output weather",
+            request_id="req_weather",
+            memory_type="step",
+            quality_tags=["success"],
+        )
+
+        self.assertEqual(manager.retrieve_memory(match_keywords=[], limit=5), [])
+        self.assertEqual(manager.retrieve_memory(match_keywords=None, limit=5), [])
 
     def test_agent_core_writes_session_and_step_memory_tags(self):
         from app.agent import core as agent_core

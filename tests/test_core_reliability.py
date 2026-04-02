@@ -82,6 +82,56 @@ class TaskPlannerTests(unittest.TestCase):
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0]["description"], "查询一下主机名称")
 
+    def test_split_task_collapses_direct_lookup_count_request_in_default_mode(self):
+        import cognitive.planner as planner_module
+        from cognitive.planner import TaskPlanner
+
+        class FakeResponse:
+            def __init__(self, content):
+                self.content = content
+
+        planner = TaskPlanner()
+        original_invoke = planner_module.llm_manager.invoke
+        planner_module.llm_manager.invoke = lambda prompt, source="": FakeResponse(
+            """[
+              {"id": 1, "description": "打开 VSCode 项目目录", "expected_outcome": "定位到目录"},
+              {"id": 2, "description": "列出当前目录下的所有文件和文件夹", "expected_outcome": "得到目录项列表"},
+              {"id": 3, "description": "统计列表中文件和文件夹的总数", "expected_outcome": "得到总数"}
+            ]"""
+        )
+        try:
+            result = planner.split_task(r"D:\file\vscode\llm_brain 当前项目下有多少个文件")
+        finally:
+            planner_module.llm_manager.invoke = original_invoke
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["description"], r"D:\file\vscode\llm_brain 当前项目下有多少个文件")
+
+    def test_split_task_preserves_validation_style_subtasks_in_thinking_mode(self):
+        import cognitive.planner as planner_module
+        from cognitive.planner import TaskPlanner
+
+        class FakeResponse:
+            def __init__(self, content):
+                self.content = content
+
+        planner = TaskPlanner()
+        original_invoke = planner_module.llm_manager.invoke
+        planner_module.llm_manager.invoke = lambda prompt, source="": FakeResponse(
+            """[
+              {"id": 1, "description": "打开 VSCode 项目目录", "expected_outcome": "定位到目录"},
+              {"id": 2, "description": "列出当前目录下的所有文件和文件夹", "expected_outcome": "得到目录项列表"},
+              {"id": 3, "description": "统计列表中文件和文件夹的总数", "expected_outcome": "得到总数"}
+            ]"""
+        )
+        try:
+            result = planner.split_task(r"D:\file\vscode\llm_brain 当前项目下有多少个文件", thinking_mode=True)
+        finally:
+            planner_module.llm_manager.invoke = original_invoke
+
+        self.assertEqual(len(result), 3)
+        self.assertEqual(result[0]["description"], "打开 VSCode 项目目录")
+
 
 class DomainClassificationTests(unittest.TestCase):
     def test_normalize_domain_label_uses_chinese_tree_only(self):

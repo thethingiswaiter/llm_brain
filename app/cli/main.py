@@ -1,4 +1,13 @@
 import logging
+import sys
+from pathlib import Path
+
+# Allow running this file directly via "python app/cli/main.py".
+if __package__ is None or __package__ == "":
+    project_root = Path(__file__).resolve().parents[2]
+    root_str = str(project_root)
+    if root_str not in sys.path:
+        sys.path.insert(0, root_str)
 
 from core.llm.manager import llm_manager
 from app.agent.core import agent

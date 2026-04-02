@@ -1,6 +1,7 @@
 import sqlite3
 import os
 import json
+import math
 from typing import Optional
 from core.config import config
 from time_utils import now_china_iso
@@ -238,21 +239,37 @@ class MemoryManager:
         conn.close()
         return updated
 
-    def retrieve_memory(self, threshold=1, match_keywords=None, limit: int = 5,
-                        exclude_conv_id: Optional[str] = None, exclude_ids: Optional[list] = None):
+    def retrieve_memory(
+        self,
+        threshold=1,
+        match_keywords=None,
+        limit: int = 5,
+        exclude_conv_id: Optional[str] = None,
+        exclude_ids: Optional[list] = None,
+        min_overlap_ratio: float = 1.0,
+        min_overlap_count: Optional[int] = None,
+    ):
         """Two-stage read: First read keywords and summary."""
+        normalized_keywords = {
+            kw.strip().lower() for kw in (match_keywords or [])
+            if isinstance(kw, str) and kw.strip()
+        }
+        # Strict retrieval: when no query keywords are provided, avoid returning unrelated memories.
+        if not normalized_keywords:
+            return []
+
         conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
         query = "SELECT id, conv_id, request_id, memory_type, quality_tags, summary, keywords, weight FROM interactions WHERE weight >= ?"
         c.execute(query, (threshold,))
         results = c.fetchall()
-
-        normalized_keywords = {
-            kw.strip().lower() for kw in (match_keywords or [])
-            if isinstance(kw, str) and kw.strip()
-        }
         excluded_ids = set(exclude_ids or [])
         ranked_results = []
+        clamped_ratio = min(max(float(min_overlap_ratio), 0.0), 1.0)
+        required_overlap = min_overlap_count
+        if required_overlap is None:
+            required_overlap = math.ceil(len(normalized_keywords) * clamped_ratio)
+        required_overlap = max(1, int(required_overlap))
 
         for memory_id, conv_id, request_id, memory_type, quality_tags_raw, summary, keywords_raw, weight in results:
             if exclude_conv_id and conv_id == exclude_conv_id:
@@ -279,25 +296,21 @@ class MemoryManager:
                 "quality_score": self._quality_score(parsed_quality_tags),
             })
 
-        if normalized_keywords:
-            matched_results = [item for item in ranked_results if item["overlap_count"] > 0]
-            ranked_results = matched_results or ranked_results
-            for item in matched_results:
-                c.execute("UPDATE interactions SET weight = weight + 1 WHERE id = ?", (item["id"],))
+        matched_results = [item for item in ranked_results if item["overlap_count"] >= required_overlap]
+        if not matched_results:
+            conn.close()
+            return []
+        ranked_results = matched_results
+        for item in matched_results:
+            c.execute("UPDATE interactions SET weight = weight + 1 WHERE id = ?", (item["id"],))
 
         conn.commit()
         conn.close()
 
-        if normalized_keywords:
-            ranked_results.sort(
-                key=lambda item: (item["overlap_count"], item["quality_score"], item["weight"], item["id"]),
-                reverse=True,
-            )
-        else:
-            ranked_results.sort(
-                key=lambda item: (item["quality_score"], item["weight"], item["id"]),
-                reverse=True,
-            )
+        ranked_results.sort(
+            key=lambda item: (item["overlap_count"], item["quality_score"], item["weight"], item["id"]),
+            reverse=True,
+        )
         return ranked_results[:limit]
 
     def retrieve_failure_memories(
@@ -306,12 +319,16 @@ class MemoryManager:
         limit: int = 5,
         exclude_conv_id: Optional[str] = None,
         exclude_ids: Optional[list] = None,
+        min_overlap_ratio: float = 1.0,
+        min_overlap_count: Optional[int] = None,
     ):
         results = self.retrieve_memory(
             match_keywords=match_keywords,
             limit=max(limit * 3, limit),
             exclude_conv_id=exclude_conv_id,
             exclude_ids=exclude_ids,
+            min_overlap_ratio=min_overlap_ratio,
+            min_overlap_count=min_overlap_count,
         )
         failure_results = [
             item for item in results

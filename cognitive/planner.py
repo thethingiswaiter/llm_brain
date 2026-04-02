@@ -8,8 +8,16 @@ class TaskPlanner:
         "查看",
         "获取",
         "显示",
+        "多少",
+        "几个",
+        "数量",
+        "总数",
+        "统计",
         "告诉我",
         "show me",
+        "how many",
+        "count",
+        "total",
         "what is",
         "what's",
         "lookup",
@@ -82,7 +90,7 @@ class TaskPlanner:
             return False
         return all(any(marker in description for marker in self.META_SUBTASK_MARKERS) for description in descriptions)
 
-    def split_task(self, user_query: str) -> List[Dict[str, Any]]:
+    def split_task(self, user_query: str, thinking_mode: bool = False) -> List[Dict[str, Any]]:
         """
         根据核心需求规范，将复杂任务拆解成细粒度的“子任务”。
         要求：输出为JSON数组，每个子任务包含描述、预期结果等。
@@ -126,6 +134,11 @@ class TaskPlanner:
                     "description": description,
                     "expected_outcome": expected_outcome or "User request fulfilled.",
                 })
+            if not thinking_mode and self._looks_like_direct_lookup(user_query) and len(normalized_subtasks) > 1:
+                llm_manager.log_event(
+                    "Task splitting collapsed to single-step plan | reason=direct_lookup_default_mode"
+                )
+                return self._single_task_plan(user_query)
             if self._looks_like_direct_lookup(user_query) and self._looks_over_decomposed(normalized_subtasks):
                 llm_manager.log_event(
                     "Task splitting collapsed to single-step plan | reason=direct_lookup_over_decomposed"

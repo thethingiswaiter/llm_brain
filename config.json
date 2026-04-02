@@ -1,6 +1,6 @@
 {
     "llm": {
-        "default_model_key": "remote_openai",
+        "default_model_key": "local_ollama",
         "models": {
             "local_ollama": {
                 "provider": "ollama",
