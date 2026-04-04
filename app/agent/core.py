@@ -29,6 +29,7 @@ from mcp_servers.mcp_manager import MCPManager
 
 class AgentState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
+    raw_query: str
     plan: List[Dict[str, Any]]
     current_subtask_index: int
     reflections: List[str]
@@ -44,6 +45,9 @@ class AgentState(TypedDict):
     replan_counts: Dict[str, int]
     blocked: bool
     final_response: str
+    lite_mode: bool
+    normalized_query: str
+    subtask_feature_cache: Dict[str, Dict[str, Any]]
 
 class AgentCore:
     def __init__(self, *, auto_load_tools: bool = True, auto_load_mcp: bool = False, build_graph: bool = True):
@@ -57,6 +61,7 @@ class AgentCore:
         self.session_id = self._generate_session_id()
         self.last_request_id = ""
         self._request_cancellations: Dict[str, Event] = {}
+        self._cancelled_request_ids: set[str] = set()
         self._request_lock = Lock()
         self._request_event_factory = Event
         
@@ -279,6 +284,23 @@ class AgentCore:
                         expanded_tokens.add(token[index:index + size])
         return expanded_tokens
 
+    def _is_non_explicit_chat(self, text: str) -> bool:
+        if not bool(getattr(config, "lite_chat_enabled", True)):
+            return False
+        normalized = re.sub(r"\s+", " ", str(text or "").strip()).lower()
+        if not normalized:
+            return False
+        if len(normalized) > 24:
+            return False
+        if re.search(r"\d", normalized):
+            return False
+        if re.search(r"(请|帮我|怎么|如何|why|how|what|查询|执行|创建|删除|运行)", normalized):
+            return False
+        patterns = getattr(config, "lite_chat_patterns", [])
+        if not isinstance(patterns, list) or not patterns:
+            return False
+        return any(re.fullmatch(str(pattern), normalized, flags=re.IGNORECASE) for pattern in patterns)
+
     def _classify_tool_exception(self, exc: Exception) -> tuple[str, bool]:
         return self.tool_runtime.classify_tool_exception(exc)
 
@@ -293,6 +315,38 @@ class AgentCore:
 
     def _wrap_tool_for_runtime(self, tool):
         return self.tool_runtime.wrap_tool_for_runtime(tool)
+
+    def _append_builtin_fallback_tools(self, selected_tools: List[Any] | None) -> List[Any]:
+        merged_tools: List[Any] = []
+        seen_names: set[str] = set()
+
+        for tool in list(selected_tools or []):
+            tool_name = str(getattr(tool, "name", "") or "").strip()
+            if tool_name and tool_name in seen_names:
+                continue
+            merged_tools.append(tool)
+            if tool_name:
+                seen_names.add(tool_name)
+
+        fallback_names = getattr(self.skills, "ALWAYS_APPEND_TOOL_NAMES", {"bash"})
+        for tool in self.tools:
+            tool_name = str(getattr(tool, "name", "") or "").strip()
+            if not tool_name or tool_name not in fallback_names or tool_name in seen_names:
+                continue
+            merged_tools.append(tool)
+            seen_names.add(tool_name)
+
+        return merged_tools
+
+    def _get_non_builtin_fallback_tools(self, selected_tools: List[Any] | None) -> List[Any]:
+        fallback_names = getattr(self.skills, "ALWAYS_APPEND_TOOL_NAMES", {"bash"})
+        filtered_tools: List[Any] = []
+        for tool in list(selected_tools or []):
+            tool_name = str(getattr(tool, "name", "") or "").strip()
+            if tool_name in fallback_names:
+                continue
+            filtered_tools.append(tool)
+        return filtered_tools
 
     def _select_relevant_memories(self, memories: List[Dict[str, Any]], keywords: List[str], limit: int = 3):
         keyword_set = {kw.strip().lower() for kw in keywords if isinstance(kw, str) and kw.strip()}
@@ -386,10 +440,11 @@ class AgentCore:
     ) -> BaseMessage:
         if not self._response_needs_tool_fallback(response):
             return response
-        if len(selected_tools) != 1:
+        synthesis_candidates = self._get_non_builtin_fallback_tools(selected_tools)
+        if len(synthesis_candidates) != 1:
             return response
 
-        tool = selected_tools[0]
+        tool = synthesis_candidates[0]
         tool_name = getattr(tool, "name", "")
         fallback_args = self._build_tool_fallback_args(tool, user_query, subtask_desc)
         if fallback_args is None:
@@ -516,6 +571,89 @@ class AgentCore:
             reroute_reason=reroute_reason,
         )
 
+    def _strip_internal_response_markup(self, text: str) -> str:
+        cleaned = str(text or "")
+        cleaned = re.sub(r"<function-call>.*?</function-call>", "", cleaned, flags=re.IGNORECASE | re.DOTALL)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        return cleaned.strip()
+
+    def _looks_like_tool_capability_block(self, actual: str, reflection_note: str) -> bool:
+        combined = "\n".join([
+            self._strip_internal_response_markup(actual),
+            self._strip_internal_response_markup(reflection_note),
+        ]).lower()
+        if "<function-call>" in str(actual or "").lower():
+            return True
+        capability_markers = [
+            "当前工具",
+            "工具调用限制",
+            "无法直接搜索文件名",
+            "无法使用工具",
+            "支持文件名搜索的工具",
+            "请提供当前工作区",
+            "工作区的具体路径",
+            "工具受限",
+            "工具能力",
+            "tool limitations",
+            "cannot directly search file",
+            "support file-name search",
+            "current workspace path",
+        ]
+        return any(marker in combined for marker in capability_markers)
+
+    def _looks_like_missing_information_block(self, actual: str, reflection_note: str) -> bool:
+        combined = "\n".join([
+            self._strip_internal_response_markup(actual),
+            self._strip_internal_response_markup(reflection_note),
+        ]).lower()
+        missing_info_markers = [
+            "缺少",
+            "未提供",
+            "请补充",
+            "请确认",
+            "参数不足",
+            "missing parameter",
+            "missing information",
+            "need user",
+            "need confirmation",
+        ]
+        return any(marker in combined for marker in missing_info_markers)
+
+    def _build_blocked_user_response(
+        self,
+        subtask_desc: str,
+        actual: str,
+        reflection_note: str,
+        recent_failures: List[Dict[str, Any]] | None = None,
+        *,
+        retry_limit: bool = False,
+    ) -> str:
+        sanitized_actual = self._strip_internal_response_markup(actual)
+        sanitized_reflection = self._strip_internal_response_markup(reflection_note)
+        recent_failures = list(recent_failures or [])
+        error_types = {str(item.get("error_type", "") or "").lower() for item in recent_failures}
+
+        if (
+            sanitized_actual
+            and not self._looks_like_tool_capability_block(actual, reflection_note)
+            and not retry_limit
+        ):
+            return sanitized_actual
+
+        if "invalid_arguments" in error_types or self._looks_like_missing_information_block(actual, reflection_note):
+            prefix = f"当前还不能继续执行“{subtask_desc}”，因为缺少必要信息。"
+        elif self._looks_like_tool_capability_block(actual, reflection_note):
+            prefix = f"当前没能完成“{subtask_desc}”，因为现有工具能力不足，无法直接完成所需操作。"
+        elif retry_limit:
+            prefix = f"当前没能完成“{subtask_desc}”，因为这条执行路径已经重试到上限，仍然无法得到可靠结果。"
+        else:
+            prefix = f"当前暂时无法完成“{subtask_desc}”。"
+
+        detail = sanitized_reflection or sanitized_actual
+        if detail:
+            return f"{prefix}{detail}"
+        return prefix
+
     def _format_memory_context(self, memories: List[Dict[str, Any]]) -> str:
         if not memories:
             return ""
@@ -549,8 +687,10 @@ class AgentCore:
         return "Relevant memory details:\n" + "\n".join(details)
 
     def _record_step_memory(self, session_id: str, request_id: str, domain: str, subtask_desc: str,
-                            actual: str, reflection_note: str, quality_tags: List[str] | None = None):
-        step_keywords, step_summary = self.cognitive.extract_features(subtask_desc)
+                            actual: str, reflection_note: str, quality_tags: List[str] | None = None,
+                            step_keywords: List[str] | None = None, step_summary: str = ""):
+        if step_keywords is None or not step_summary:
+            step_keywords, step_summary = self.cognitive.extract_features(subtask_desc)
         memory_output = actual.strip()
         if reflection_note:
             memory_output = f"{memory_output}\n\nReflection: {reflection_note}".strip()
@@ -568,6 +708,53 @@ class AgentCore:
             memory_type=memory_type,
             quality_tags=normalized_quality_tags,
         )
+
+    def _should_bypass_intent_rewrite(self, text: str) -> bool:
+        normalized = str(text or "").strip()
+        if not normalized:
+            return True
+        lowered = normalized.lower()
+        if normalized.startswith("/"):
+            return True
+        return lowered in {"exit", "quit", "help"}
+
+    def _get_subtask_features(
+        self,
+        state: AgentState,
+        idx: int,
+        subtask_desc: str,
+        request_id: str,
+    ) -> tuple[List[str], str, Dict[str, Dict[str, Any]]]:
+        cache = dict(state.get("subtask_feature_cache", {}))
+        cache_key = str(idx)
+        cached_entry = cache.get(cache_key, {})
+        if cached_entry.get("description") == subtask_desc:
+            cached_keywords = [str(item).strip() for item in cached_entry.get("keywords", []) if str(item).strip()]
+            cached_summary = str(cached_entry.get("summary", "")).strip()
+            return cached_keywords[:5], cached_summary, cache
+
+        subtask_keywords, subtask_summary = self.cognitive.extract_features(subtask_desc)
+        self._raise_if_request_cancelled(request_id)
+        normalized_keywords = list(subtask_keywords)[:5]
+        cache[cache_key] = {
+            "description": subtask_desc,
+            "keywords": normalized_keywords,
+            "summary": str(subtask_summary or "").strip(),
+        }
+        return normalized_keywords, str(subtask_summary or "").strip(), cache
+
+    def _build_execution_messages(self, messages: List[BaseMessage], normalized_query: str, reset_history: bool = False) -> List[BaseMessage]:
+        if not messages:
+            return []
+        effective_query = str(normalized_query or "").strip()
+        if not effective_query:
+            return [messages[0]] if reset_history and messages else list(messages)
+
+        updated_messages = [messages[0]] if reset_history else list(messages)
+        first_message = updated_messages[0]
+        if isinstance(first_message, HumanMessage) and str(first_message.content) != effective_query:
+            updated_messages[0] = HumanMessage(content=effective_query)
+        return updated_messages
 
     def _finalize_session_memory(self, state: AgentState, final_output: str, quality_tags: List[str] | None = None):
         session_memory_id = state.get("session_memory_id")
@@ -638,9 +825,7 @@ class AgentCore:
         routing_terms = [term for term in query_terms if term in known_tool_terms] or query_terms
         capability_bundle = self.skills.assign_capabilities_to_task(query, routing_terms)
         selected_tools = capability_bundle.get("tools", [])
-        if selected_tools:
-            return selected_tools
-        return []
+        return self._append_builtin_fallback_tools(selected_tools)
 
     def add_tool(self, tool):
         safe_tool = self._wrap_tool_for_runtime(tool)
@@ -862,12 +1047,80 @@ class AgentCore:
                 console=True,
                 session_id=session_id,
             )
+
+            if self._is_non_explicit_chat(last_message_content):
+                lite_keywords = list(self._tokenize_text(last_message_content))[:5]
+                domain = DEFAULT_DOMAIN_LABEL
+                session_memory_id = 0
+                if bool(getattr(config, "lite_chat_persist_memory", False)):
+                    session_memory_id = self.memory.add_memory(
+                        session_id,
+                        domain,
+                        lite_keywords,
+                        "非明确任务交流，使用轻量流程。",
+                        last_message_content,
+                        "",
+                        "",
+                        request_id=request_id,
+                        memory_type="session_main",
+                        quality_tags=["pending", "lite_mode"],
+                    )
+                plan = [{
+                    "id": 1,
+                    "description": "对用户的日常交流进行简洁回复",
+                    "expected_outcome": "给出礼貌、简洁且自然的回应。",
+                }]
+                llm_manager.log_checkpoint(
+                    "planning_completed",
+                    details=f"subtask_count=1 | domain={domain} | mode=lite_chat",
+                    request_id=request_id,
+                    console=True,
+                    session_id=session_id,
+                    duration_ms=(time.monotonic() - planning_started_at) * 1000,
+                    subtask_count=1,
+                    domain=domain,
+                    mode="lite_chat",
+                )
+                next_state = {
+                    "plan": plan,
+                    "raw_query": last_message_content,
+                    "current_subtask_index": 0,
+                    "global_keywords": lite_keywords,
+                    "reflections": [],
+                    "failed_tools": {},
+                    "failed_tool_signals": {},
+                    "session_id": session_id,
+                    "request_id": request_id,
+                    "session_memory_id": session_memory_id,
+                    "domain_label": domain,
+                    "memory_summaries": [],
+                    "retry_counts": {},
+                    "replan_counts": {},
+                    "blocked": False,
+                    "final_response": "",
+                    "lite_mode": True,
+                    "normalized_query": last_message_content,
+                    "subtask_feature_cache": {},
+                }
+                self._persist_state_snapshot(
+                    request_id,
+                    "planning_completed",
+                    next_state,
+                    extra={"subtask_count": 1, "domain": domain, "mode": "lite_chat"},
+                )
+                return next_state
+
+            normalized_query = last_message_content
+            if bool(getattr(config, "intent_rewrite_enabled", True)) and not self._should_bypass_intent_rewrite(last_message_content):
+                normalized_query = self.cognitive.rewrite_intent(last_message_content)
+                self._raise_if_request_cancelled(request_id)
             
             # 1. Feature Extraction (Global task constraints: max 30 keywords)
-            keywords, summary = self.cognitive.extract_features(last_message_content)
+            keywords, summary = self.cognitive.extract_features(normalized_query)
             self._raise_if_request_cancelled(request_id)
             normalized_keywords = list(keywords)[:30]
-            domain = self.cognitive.determine_domain(last_message_content)
+            domain = self.cognitive.determine_domain(normalized_query)
+            self._raise_if_request_cancelled(request_id)
             memory_summaries = self.memory.retrieve_memory(
                 match_keywords=normalized_keywords,
                 limit=5,
@@ -888,7 +1141,7 @@ class AgentCore:
             )
             
             # 2. Planning (Decompose complex tasks into granular subtasks)
-            plan = self.planner.split_task(last_message_content, thinking_mode=False)
+            plan = self.planner.split_task(normalized_query, thinking_mode=False)
             self._raise_if_request_cancelled(request_id)
             llm_manager.log_checkpoint(
                 "planning_completed",
@@ -903,6 +1156,7 @@ class AgentCore:
             
             next_state = {
                 "plan": plan,
+                "raw_query": last_message_content,
                 "current_subtask_index": 0,
                 "global_keywords": normalized_keywords,
                 "reflections": [],
@@ -917,6 +1171,9 @@ class AgentCore:
                 "replan_counts": {},
                 "blocked": False,
                 "final_response": "",
+                "lite_mode": False,
+                "normalized_query": normalized_query,
+                "subtask_feature_cache": {},
             }
             self._persist_state_snapshot(
                 request_id,
@@ -933,16 +1190,61 @@ class AgentCore:
             self._raise_if_request_cancelled(request_id)
             failed_tools_state = dict(state.get("failed_tools", {}))
             failed_tool_signals_state = dict(state.get("failed_tool_signals", {}))
+            recent_tool_failures = self._collect_recent_tool_failures(state.get("messages", []))
+            merged_failed_tools = self._merge_failed_tools(failed_tools_state, idx, recent_tool_failures)
+            merged_failed_tool_signals = self._merge_failed_tool_signals(failed_tool_signals_state, idx, recent_tool_failures)
             
             if idx >= len(plan):
                 final_response = state.get("final_response") or "All subtasks completed successfully."
                 return {"messages": [AIMessage(content=final_response)]}
+
+            if state.get("lite_mode", False):
+                current_subtask = plan[idx]
+                subtask_desc = current_subtask.get("description", "")
+                llm_manager.log_checkpoint(
+                    "subtask_started",
+                    details=f"index={idx + 1} | description={subtask_desc[:120]} | mode=lite_chat",
+                    request_id=request_id,
+                    console=True,
+                    session_id=state.get("session_id", ""),
+                    subtask_index=idx + 1,
+                    subtask_description=subtask_desc[:120],
+                    mode="lite_chat",
+                )
+                llm = llm_manager.get_llm()
+                self._persist_state_snapshot(
+                    request_id,
+                    "subtask_prepared",
+                    state,
+                    extra={
+                        "subtask_index": idx + 1,
+                        "subtask_description": subtask_desc,
+                        "selected_tools": [],
+                        "failed_tools": [],
+                        "failed_tool_signal_tools": [],
+                        "mode": "lite_chat",
+                    },
+                )
+                llm_manager.log_checkpoint(
+                    "subtask_llm_dispatch",
+                    details=f"index={idx + 1} | tool_count=0 | after_tool=False | mode=lite_chat",
+                    request_id=request_id,
+                    session_id=state.get("session_id", ""),
+                    subtask_index=idx + 1,
+                    tool_count=0,
+                    after_tool=False,
+                    mode="lite_chat",
+                )
+                response = llm_manager.invoke(state["messages"], source="agent.execute_subtask", llm=llm)
+                self._raise_if_request_cancelled(request_id)
+                return {
+                    "messages": [response],
+                    "failed_tools": merged_failed_tools,
+                    "failed_tool_signals": merged_failed_tool_signals,
+                }
                 
             current_subtask = plan[idx]
             subtask_desc = current_subtask.get("description", "")
-            recent_tool_failures = self._collect_recent_tool_failures(state.get("messages", []))
-            merged_failed_tools = self._merge_failed_tools(failed_tools_state, idx, recent_tool_failures)
-            merged_failed_tool_signals = self._merge_failed_tool_signals(failed_tool_signals_state, idx, recent_tool_failures)
             llm_manager.log_checkpoint(
                 "subtask_started",
                 details=f"index={idx + 1} | description={subtask_desc[:120]}",
@@ -953,9 +1255,13 @@ class AgentCore:
                 subtask_description=subtask_desc[:120],
             )
             
-            # Subtask feature extraction: 3-5 keywords
-            sub_kws, _ = self.cognitive.extract_features(subtask_desc)
-            sub_kws = sub_kws[:5]
+            continuing_after_tool = isinstance(state["messages"][-1], ToolMessage)
+            sub_kws, _, updated_subtask_feature_cache = self._get_subtask_features(
+                state,
+                idx,
+                subtask_desc,
+                request_id,
+            )
 
             relevant_memories = self._select_relevant_memories(state.get("memory_summaries", []), sub_kws)
             if not relevant_memories:
@@ -1040,14 +1346,19 @@ class AgentCore:
                     request_id=request_id,
                     console=True,
                 )
+            selected_tools = self._append_builtin_fallback_tools(selected_tools)
             
-            continuing_after_tool = isinstance(state["messages"][-1], ToolMessage)
+            normalized_query = str(state.get("normalized_query", "")).strip()
+            execution_messages = self._build_execution_messages(
+                state["messages"],
+                normalized_query,
+                reset_history=not continuing_after_tool,
+            )
             if continuing_after_tool:
-                messages = state["messages"]
+                messages = execution_messages
             else:
                 # Generate local prompt for LLM only for the initial subtask dispatch.
                 prompt_sections = [
-                    f"原始用户请求: {state['messages'][0].content}",
                     f"正在执行子任务 {idx+1}: {subtask_desc}",
                 ]
                 if memory_sections:
@@ -1083,7 +1394,7 @@ class AgentCore:
                         )
                     )
                 prompt = "\n\n".join(prompt_sections)
-                messages = state["messages"] + [HumanMessage(content=prompt)]
+                messages = execution_messages + [HumanMessage(content=prompt)]
 
             llm = llm_manager.get_llm()
             if selected_tools:
@@ -1112,6 +1423,7 @@ class AgentCore:
             )
                 
             response = llm_manager.invoke(messages, source="agent.execute_subtask", llm=llm)
+            self._raise_if_request_cancelled(request_id)
             response = self._maybe_synthesize_tool_call(
                 response,
                 selected_tools,
@@ -1119,10 +1431,12 @@ class AgentCore:
                 subtask_desc,
                 request_id,
             )
+            self._raise_if_request_cancelled(request_id)
             return {
                 "messages": [response],
                 "failed_tools": merged_failed_tools,
                 "failed_tool_signals": merged_failed_tool_signals,
+                "subtask_feature_cache": updated_subtask_feature_cache,
             }
 
         def reflect_and_advance(state: AgentState):
@@ -1138,11 +1452,59 @@ class AgentCore:
             current_subtask = plan[idx]
             expected = current_subtask.get("expected_outcome", "")
             actual = messages[-1].content
+
+            if state.get("lite_mode", False):
+                reflections = list(state.get("reflections", []))
+                reflections.append(f"Subtask {idx+1}: lite_mode auto-continue")
+                next_index = idx + 1
+                failed_tools_state = dict(state.get("failed_tools", {}))
+                failed_tool_signals_state = dict(state.get("failed_tool_signals", {}))
+                failed_tools_state.pop(str(idx), None)
+                failed_tool_signals_state.pop(str(idx), None)
+                if next_index >= len(plan):
+                    llm_manager.log_checkpoint(
+                        "agent_completed",
+                        details=f"subtask_count={len(plan)} | mode=lite_chat",
+                        request_id=request_id,
+                        console=True,
+                        mode="lite_chat",
+                    )
+                    self._finalize_session_memory(state, actual, quality_tags=["success", "lite_mode"])
+                    self._persist_state_snapshot(
+                        request_id,
+                        "agent_completed",
+                        state,
+                        extra={"subtask_count": len(plan), "final_output": actual, "mode": "lite_chat"},
+                    )
+                else:
+                    llm_manager.log_checkpoint(
+                        "subtask_advanced",
+                        details=f"next_index={next_index + 1} | mode=lite_chat",
+                        request_id=request_id,
+                        mode="lite_chat",
+                    )
+                    self._persist_state_snapshot(
+                        request_id,
+                        "subtask_advanced",
+                        state,
+                        extra={"next_index": next_index, "mode": "lite_chat"},
+                    )
+                return {
+                    "current_subtask_index": next_index,
+                    "reflections": reflections,
+                    "failed_tools": failed_tools_state,
+                    "failed_tool_signals": failed_tool_signals_state,
+                    "blocked": False,
+                    "final_response": actual if next_index >= len(plan) else state.get("final_response", ""),
+                    "retry_counts": dict(state.get("retry_counts", {})),
+                    "replan_counts": dict(state.get("replan_counts", {})),
+                }
             
             # 3. Verification & Reflection
             success, reflection_note, action = self.reflector.verify_and_reflect(
                 current_subtask.get("description", ""), expected, actual
             )
+            self._raise_if_request_cancelled(request_id)
             llm_manager.log_checkpoint(
                 "reflection_completed",
                 details=f"index={idx + 1} | success={success} | action={action}",
@@ -1158,6 +1520,8 @@ class AgentCore:
             reflections.append(f"Subtask {idx+1}: {reflection_note}")
             failed_tools_state = dict(state.get("failed_tools", {}))
             failed_tool_signals_state = dict(state.get("failed_tool_signals", {}))
+            subtask_feature_cache = dict(state.get("subtask_feature_cache", {}))
+            cached_subtask_features = subtask_feature_cache.get(str(idx), {})
             self._record_step_memory(
                 state.get("session_id", self.session_id),
                 request_id,
@@ -1166,6 +1530,8 @@ class AgentCore:
                 actual,
                 reflection_note,
                 quality_tags=["success"] if (success or action == "continue") else (["ask_user", "blocked"] if action == "ask_user" else ["retry"]),
+                step_keywords=list(cached_subtask_features.get("keywords", [])),
+                step_summary=str(cached_subtask_features.get("summary", "") or ""),
             )
 
             retry_counts = dict(state.get("retry_counts", {}))
@@ -1174,7 +1540,12 @@ class AgentCore:
             retry_count = retry_counts.get(retry_key, 0)
             
             if not success and action == "ask_user":
-                blocked_message = actual.strip() if isinstance(actual, str) and actual.strip() else "Need user intervention."
+                blocked_message = self._build_blocked_user_response(
+                    current_subtask.get("description", "当前子任务"),
+                    actual if isinstance(actual, str) else str(actual or ""),
+                    reflection_note,
+                    recent_failures=self._collect_recent_tool_failures(messages),
+                )
                 llm_manager.log_checkpoint(
                     "agent_blocked",
                     details=f"index={idx + 1} | action=ask_user",
@@ -1185,7 +1556,15 @@ class AgentCore:
                 self._persist_state_snapshot(
                     request_id,
                     "agent_blocked",
-                    state,
+                    {
+                        **state,
+                        "reflections": reflections,
+                        "blocked": True,
+                        "final_response": blocked_message,
+                        "retry_counts": retry_counts,
+                        "replan_counts": replan_counts,
+                        "failed_tool_signals": failed_tool_signals_state,
+                    },
                     extra={"subtask_index": idx + 1, "action": action, "reflection_note": reflection_note},
                 )
                 self._finalize_session_memory(state, blocked_message, quality_tags=["ask_user", "blocked"])
@@ -1295,13 +1674,17 @@ class AgentCore:
                         "failed_tool_signals": failed_tool_signals_state,
                         "retry_counts": retry_counts,
                         "replan_counts": replan_counts,
+                        "subtask_feature_cache": {},
                         "blocked": False,
                     }
 
             if retry_count >= 2:
-                blocked_message = (
-                    f"Subtask {idx+1} exceeded retry limit. Reflection analysis: {reflection_note}\n"
-                    "Need user intervention."
+                blocked_message = self._build_blocked_user_response(
+                    current_subtask.get("description", f"子任务 {idx+1}"),
+                    actual if isinstance(actual, str) else str(actual or ""),
+                    reflection_note,
+                    recent_failures=recent_tool_failures,
+                    retry_limit=True,
                 )
                 llm_manager.log_checkpoint(
                     "agent_blocked",
@@ -1313,7 +1696,15 @@ class AgentCore:
                 self._persist_state_snapshot(
                     request_id,
                     "agent_blocked",
-                    state,
+                    {
+                        **state,
+                        "reflections": reflections,
+                        "blocked": True,
+                        "final_response": blocked_message,
+                        "retry_counts": retry_counts,
+                        "replan_counts": replan_counts,
+                        "failed_tool_signals": failed_tool_signals_state,
+                    },
                     extra={"subtask_index": idx + 1, "action": "retry_limit", "reflection_note": reflection_note},
                 )
                 self._finalize_session_memory(state, blocked_message, quality_tags=["blocked", "retry"])

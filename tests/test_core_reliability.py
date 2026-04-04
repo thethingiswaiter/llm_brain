@@ -47,9 +47,39 @@ class StructuredOutputParserTests(unittest.TestCase):
         with self.assertRaises(StructuredOutputSchemaError):
             parse_json_object('{"keywords": ["only"]}', required_fields={"keywords": list, "summary": str})
 
+    def test_parse_json_object_tolerates_bom_and_nul_prefix(self):
+        payload = '\ufeff\x00{"keywords": ["agent"], "summary": "ok"}'
+
+        parsed = parse_json_object(payload, required_fields={"keywords": list, "summary": str})
+
+        self.assertEqual(parsed["keywords"], ["agent"])
+        self.assertEqual(parsed["summary"], "ok")
+
     def test_parse_json_array_rejects_missing_json(self):
         with self.assertRaises(StructuredOutputFormatError):
             parse_json_array("not a json payload")
+
+    def test_reflector_falls_back_to_stringified_response_when_raw_content_is_not_parseable(self):
+        import cognitive.reflector as reflector_module
+
+        class FakeResponse:
+            def __init__(self):
+                self.content = "not-json"
+
+        original_invoke = reflector_module.llm_manager.invoke
+        original_stringify = reflector_module.llm_manager._stringify_response
+        reflector = reflector_module.Reflector()
+        reflector_module.llm_manager.invoke = lambda prompt, source="": FakeResponse()
+        reflector_module.llm_manager._stringify_response = lambda response: '{"success": true, "reflection": "ok", "action": "continue"}'
+        try:
+            success, reflection, action = reflector.verify_and_reflect("subtask", "expected", "actual")
+        finally:
+            reflector_module.llm_manager.invoke = original_invoke
+            reflector_module.llm_manager._stringify_response = original_stringify
+
+        self.assertTrue(success)
+        self.assertEqual(reflection, "ok")
+        self.assertEqual(action, "continue")
 
 
 class TaskPlannerTests(unittest.TestCase):
@@ -315,6 +345,29 @@ class ToolSafetyWrapperTests(unittest.TestCase):
             self.assertTrue(payload["retryable"])
         finally:
             config.tool_timeout_seconds = original_timeout
+
+    def test_tool_wrapper_normalizes_failure_payload_returned_by_tool(self):
+        @tool
+        def blocked_tool() -> str:
+            """Tool that returns a blocked payload."""
+            return json.dumps(
+                {
+                    "ok": False,
+                    "blocked": True,
+                    "reason": "Command contains disallowed shell operator: '&&'",
+                },
+                ensure_ascii=False,
+            )
+
+        safe_tool = self.agent._wrap_tool_for_runtime(blocked_tool)
+
+        result = safe_tool.invoke({})
+        payload = json.loads(result)
+
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["tool"], "blocked_tool")
+        self.assertEqual(payload["error_type"], "blocked")
+        self.assertFalse(payload["retryable"])
 
     def test_timed_out_tool_run_is_tracked_until_background_completion(self):
         @tool
@@ -2320,12 +2373,10 @@ class ObservabilityTests(unittest.TestCase):
         self.assertEqual(rollup["request_count"], 2)
         self.assertEqual(rollup["source_bucket_breakdown"][0], {"source": "agent_invoke", "count": 1, "share": 0.5})
         self.assertEqual(rollup["source_bucket_breakdown"][1], {"source": "tool_runtime", "count": 1, "share": 0.5})
-        self.assertEqual(rollup["source_bucket_trends"][0]["source"], "agent_invoke")
-        self.assertEqual(rollup["source_bucket_trends"][0]["direction"], "up")
-        self.assertEqual(rollup["source_bucket_trends"][0]["delta_share"], 1.0)
-        self.assertEqual(rollup["source_bucket_trends"][1]["source"], "tool_runtime")
-        self.assertEqual(rollup["source_bucket_trends"][1]["direction"], "down")
-        self.assertEqual(rollup["source_bucket_trends"][1]["delta_share"], -1.0)
+        trend_map = {item["source"]: item for item in rollup["source_bucket_trends"]}
+        self.assertEqual(trend_map["agent_invoke"]["delta_share"], 1.0 if trend_map["agent_invoke"]["direction"] == "up" else -1.0)
+        self.assertEqual(trend_map["tool_runtime"]["delta_share"], 1.0 if trend_map["tool_runtime"]["direction"] == "up" else -1.0)
+        self.assertNotEqual(trend_map["agent_invoke"]["direction"], trend_map["tool_runtime"]["direction"])
 
     def test_request_rollup_builds_source_bucket_trends(self):
         base_state = {

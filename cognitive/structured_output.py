@@ -15,7 +15,7 @@ class StructuredOutputSchemaError(StructuredOutputError):
 
 
 def _strip_code_fence(text: str) -> str:
-    stripped = text.strip()
+    stripped = str(text or "").replace("\ufeff", "").replace("\x00", "").strip()
     if not stripped.startswith("```"):
         return stripped
 

@@ -177,6 +177,31 @@ class AgentToolRuntime:
             ensure_ascii=False,
         )
 
+    def normalize_tool_result_payload(self, tool_name: str, result: Any) -> tuple[Any, dict[str, Any] | None]:
+        payload = None
+        if isinstance(result, str):
+            try:
+                decoded = json.loads(result)
+            except (TypeError, json.JSONDecodeError):
+                return result, None
+            if isinstance(decoded, dict) and decoded.get("ok") is False:
+                payload = dict(decoded)
+        elif isinstance(result, dict) and result.get("ok") is False:
+            payload = dict(result)
+        else:
+            return result, None
+
+        payload.setdefault("tool", tool_name)
+        if not payload.get("error_type"):
+            payload["error_type"] = "blocked" if payload.get("blocked") else "execution_error"
+        if "retryable" not in payload:
+            payload["retryable"] = False if payload.get("blocked") else True
+        if not payload.get("message"):
+            payload["message"] = str(payload.get("reason") or payload.get("error") or "Tool execution failed.")
+
+        normalized_result = json.dumps(payload, ensure_ascii=False) if isinstance(result, str) else payload
+        return normalized_result, payload
+
     def validate_named_argument_heuristics(self, field_name: str, value: Any) -> str:
         normalized_name = field_name.strip().lower()
         raw_name = field_name.strip()
@@ -333,6 +358,31 @@ class AgentToolRuntime:
                         break
                     except FuturesTimeoutError:
                         continue
+                result, error_payload = self.normalize_tool_result_payload(tool_name, result)
+                if error_payload:
+                    stage_name = "tool_rejected" if not bool(error_payload.get("retryable", False)) else "tool_failed"
+                    llm_manager.log_checkpoint(
+                        stage_name,
+                        details=f"tool={tool_name} | error_type={error_payload.get('error_type', 'execution_error')}",
+                        request_id=request_id,
+                        level=40,
+                        console=True,
+                        duration_ms=(time.monotonic() - started_at) * 1000,
+                        tool_name=tool_name,
+                        error_type=error_payload.get("error_type", "execution_error"),
+                        retryable=bool(error_payload.get("retryable", False)),
+                    )
+                    llm_manager.log_event(
+                        (
+                            f"Tool execution returned failure payload | tool={tool_name} | "
+                            f"error_type={error_payload.get('error_type', 'execution_error')} | "
+                            f"retryable={bool(error_payload.get('retryable', False))} | "
+                            f"message={error_payload.get('message', '')}"
+                        ),
+                        level=40,
+                        request_id=request_id,
+                    )
+                    return result
                 llm_manager.log_checkpoint(
                     "tool_succeeded",
                     details=f"tool={tool_name}",
@@ -425,8 +475,6 @@ class AgentToolRuntime:
         except (TypeError, json.JSONDecodeError):
             return None
         if not isinstance(payload, dict) or payload.get("ok", True):
-            return None
-        if not payload.get("tool"):
             return None
         return payload
 

@@ -7,7 +7,7 @@ from typing import Any
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 
 from core.config import config
-from time_utils import now_china
+from core.time_utils import now_china
 from cognitive.feature_extractor import DEFAULT_DOMAIN_LABEL
 from core.llm.manager import llm_manager
 

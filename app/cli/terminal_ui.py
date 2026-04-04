@@ -4,219 +4,98 @@ from contextlib import contextmanager
 import logging
 from typing import Any, Callable
 
-try:
-    from rich import box
-    from rich.console import Console
-    from rich.columns import Columns
-    from rich.panel import Panel
-    from rich.table import Table
-
-    RICH_AVAILABLE = True
-except ImportError:
-    Console = None
-    Columns = None
-    Panel = None
-    Table = None
-    box = None
-    RICH_AVAILABLE = False
-
 
 class TerminalUI:
     def __init__(self, output_func: Callable[[str], None], input_func: Callable[[str], str]):
         self.output_func = output_func
         self.input_func = input_func
-        self.rich_enabled = bool(RICH_AVAILABLE and output_func is print and input_func is input)
-        self.console = Console() if self.rich_enabled else None
+        self.structured_output_enabled = False
 
     def emit(self, message: str = "") -> None:
-        if self.rich_enabled and self.console is not None:
-            self.console.print(message, markup=False)
+        self.output_func(str(message or ""))
+
+    def _emit_plain_section(self, title: str, lines: list[str], leading_blank_line: bool = False) -> None:
+        section_lines = [str(item) for item in lines if str(item or "").strip()]
+        if not section_lines:
             return
-        self.output_func(message)
-
-    def _status_style(self, value: str) -> str:
-        normalized = str(value or "").strip().lower()
-        if normalized in {"completed", "success", "ok"}:
-            return "bold green"
-        if normalized in {"failed", "error", "cancelled", "timed_out", "blocked"}:
-            return "bold red"
-        if normalized in {"in_progress", "active", "running", "detached"}:
-            return "bold yellow"
-        return "bold cyan"
-
-    def _stage_style(self, stage: str, level: int = logging.INFO) -> tuple[str, str]:
-        normalized = str(stage or "").strip().lower()
-        if level >= logging.ERROR or "error" in normalized or "failed" in normalized:
-            return "red", "x"
-        if "cancel" in normalized or "timeout" in normalized or "blocked" in normalized:
-            return "yellow", "!"
-        if normalized.endswith("started") or normalized.endswith("requested") or normalized.endswith("dispatch"):
-            return "cyan", ">"
-        if normalized.endswith("completed") or normalized.endswith("finished") or normalized.endswith("resumed"):
-            return "green", "*"
-        return "magenta", "-"
-
-    def _format_status_value(self, value: Any) -> str:
-        text = str(value or "-")
-        return f"[{self._status_style(text)}]{text}[/{self._status_style(text)}]"
-
-    def _format_cell(self, column: str, value: Any) -> str:
-        column_key = str(column or "").strip().lower()
-        if column_key in {"status"}:
-            return self._format_status_value(value)
-        if column_key in {"stage", "latest stage"}:
-            style, icon = self._stage_style(str(value or ""))
-            return f"[{style}]{icon} {value}[/{style}]"
-        if column_key in {"attention"} and str(value or "-") != "-":
-            return f"[yellow]{value}[/yellow]"
-        if column_key in {"resumed from"} and str(value or "-") != "-":
-            return f"[cyan]{value}[/cyan]"
-        return str(value)
+        if leading_blank_line:
+            self.output_func("")
+        self.output_func(f"{title}:")
+        for item in section_lines:
+            self.output_func(f"  {item}")
 
     def prompt(self) -> str:
-        if self.rich_enabled and self.console is not None:
-            return self.console.input("[bold cyan]Agent[/bold cyan] > ")
         return self.input_func("\nAgent> ")
 
-    def render_prompt_bar(self, session_id: str, request_id: str, mcp_count: int, model_label: str) -> None:
-        if not self.rich_enabled or self.console is None:
-            return
-        request_text = request_id or "-"
-        bar = (
-            f"[dim]session[/dim] [cyan]{session_id}[/cyan]    "
-            f"[dim]last_request[/dim] [white]{request_text}[/white]    "
-            f"[dim]mcp[/dim] [magenta]{mcp_count}[/magenta]    "
-            f"[dim]model[/dim] [green]{model_label}[/green]"
-        )
-        self.console.print(bar)
+    def render_prompt_bar(
+        self,
+        session_id: str,
+        request_id: str,
+        mcp_count: int,
+        model_label: str,
+        selection_label: str = "",
+        overview: dict[str, Any] | None = None,
+    ) -> None:
+        return
 
     def render_welcome(self, session_id: str) -> None:
-        if not self.rich_enabled or self.console is None or Panel is None:
-            self.emit("Welcome to the General Agent CLI (LangGraph 1.x based)")
-            self.emit(f"Session: {session_id}")
-            self.emit("Type 'help' to see special commands or just type your query.")
-            return
-
-        hero = Panel.fit(
-            f"[bold white]General Agent CLI[/bold white]\n"
-            f"[dim]LangGraph-based interactive runtime[/dim]\n\n"
-            f"[cyan]Session[/cyan]  {session_id}\n"
-            f"[green]Flow[/green]     plan -> act -> tool -> reflect\n"
-            f"[yellow]Hint[/yellow]     use [bold]help[/bold] to browse commands",
-            title="llm_brain",
-            border_style="cyan",
-            padding=(1, 2),
-        )
-        quick_tips = Panel.fit(
-            "[bold]/request_summary[/bold] inspect one request\n"
-            "[bold]/recent_requests[/bold] scan recent runs\n"
-            "[bold]/request_rollup[/bold] inspect failure trends\n"
-            "[bold]/list_tool_runs[/bold] watch detached tools",
-            title="Quick Start",
-            border_style="magenta",
-            padding=(1, 2),
-        )
-        if Columns is not None:
-            self.console.print(Columns([hero, quick_tips], expand=False, equal=True))
-        else:
-            self.console.print(hero)
-            self.console.print(quick_tips)
-
-    def _group_command_texts(self, command_texts: list[str]) -> list[tuple[str, list[tuple[str, str]]]]:
-        groups = {
-            "Runtime": [],
-            "Requests": [],
-            "MCP": [],
-            "Memory": [],
-            "Session": [],
-            "Model": [],
-            "Other": [],
-        }
-        for item in command_texts:
-            command_name, description = item.split(" - ", 1)
-            lowered = command_name.lower()
-            if lowered.startswith("/llm"):
-                groups["Model"].append((command_name, description))
-            elif lowered.startswith(("/request_", "/recent_", "/failed_", "/resumed_", "/list_tool_runs", "/cancel_request", "/list_snapshots", "/resume_snapshot")):
-                groups["Requests"].append((command_name, description))
-            elif lowered.startswith(("/load_mcp", "/list_mcp", "/refresh_mcp", "/unload_mcp")):
-                groups["MCP"].append((command_name, description))
-            elif lowered.startswith(("/replay", "/convert_skill", "/failure_memories")):
-                groups["Memory"].append((command_name, description))
-            elif lowered.startswith(("/new_session", "/load_tool", "/load_skill")):
-                groups["Session"].append((command_name, description))
-            elif lowered.startswith(("/retention_status", "/prune_runtime_data")):
-                groups["Runtime"].append((command_name, description))
-            else:
-                groups["Other"].append((command_name, description))
-        ordered = []
-        for name in ("Model", "Session", "Requests", "MCP", "Memory", "Runtime", "Other"):
-            items = groups[name]
-            if items:
-                ordered.append((name, items))
-        return ordered
+        self.emit("Welcome to the General Agent CLI (LangGraph 1.x based)")
+        self.emit(f"Session: {session_id}")
+        self.emit("Type 'help' to see special commands or just type your query.")
 
     def render_help(self, command_texts: list[str]) -> None:
-        if not self.rich_enabled or self.console is None or Table is None:
-            self.emit("Available commands:")
-            for item in command_texts:
-                self.emit(f"  {item}")
-            self.emit("  <any other text> - Send message to Agent")
-            return
+        self.emit("Available commands:")
+        for item in command_texts:
+            self.emit(f"  {item}")
+        self.emit("  <any other text> - Send message to Agent")
 
-        panels = []
-        for group_name, items in self._group_command_texts(command_texts):
-            table = Table(box=box.SIMPLE_HEAVY, show_header=True, header_style="bold cyan")
-            table.add_column("Command", style="bold white", no_wrap=True)
-            table.add_column("Description", style="white")
-            for command_name, description in items:
-                table.add_row(command_name, description)
-            panels.append(Panel(table, title=group_name, border_style="cyan"))
-        panels.append(Panel.fit("<any other text>\nSend message to Agent", title="Default Input", border_style="green"))
-        if Columns is not None:
-            self.console.print(Columns(panels, equal=True, expand=True))
-        else:
-            for panel in panels:
-                self.console.print(panel)
-
-    def render_response(self, request_id: str, response: str) -> None:
-        if not self.rich_enabled or self.console is None or Panel is None:
-            if request_id:
-                self.emit(f"Request ID: {request_id}")
-            self.emit(f"\nResponse: {response}")
-            return
-
+    def render_response(self, request_id: str, response: str, summary: dict[str, Any] | None = None) -> None:
         if request_id:
-            self.console.print(f"[dim]Request ID:[/dim] [bold]{request_id}[/bold]")
-        self.console.print(Panel.fit(response or "", title="Response", border_style="green"))
+            self.emit(f"Request ID: {request_id}")
+        if summary:
+            metrics = summary.get("metrics", {}) or {}
+            self._emit_plain_section(
+                "Summary",
+                [
+                    f"request={summary.get('request_id') or '-'} | "
+                    f"stage={summary.get('latest_stage') or '-'} | "
+                    f"mode={'lite_chat' if summary.get('lite_mode') else 'task'} | "
+                    f"progress={summary.get('subtask_index', 0)}/{summary.get('plan_length', 0)} | "
+                    f"tool_calls={metrics.get('tool_call_count', 0)} | "
+                    f"total_ms={metrics.get('total_duration_ms', '-')}"
+                ],
+            )
+            raw_query = str(summary.get("raw_query") or "").strip()
+            normalized_query = str(summary.get("normalized_query") or "").strip()
+            mode_text = "lite_chat" if summary.get("lite_mode") else "task"
+            status_text = str(summary.get("status") or "-")
+            context_lines = []
+            if raw_query:
+                context_lines.append(f"Input: {raw_query}")
+            if normalized_query and normalized_query != raw_query:
+                context_lines.append(f"Intent: {normalized_query}")
+            context_lines.append(f"Mode: {mode_text} | Status: {status_text}")
+            self._emit_plain_section("Conversation Context", context_lines, leading_blank_line=True)
+            blocked_reason = str(summary.get("blocked_reason") or "").strip()
+            if blocked_reason:
+                self._emit_plain_section("Risk", [f"Blocked Reason: {blocked_reason}"], leading_blank_line=True)
+            suggestions = summary.get("suggested_actions") or []
+            if suggestions:
+                self._emit_plain_section("Next Actions", ["Next: " + " | ".join(str(item) for item in suggestions)], leading_blank_line=True)
+        self._emit_plain_section("Response", [response], leading_blank_line=True)
 
     def render_key_value_block(self, title: str, rows: list[tuple[str, Any]]) -> None:
-        if not self.rich_enabled or self.console is None or Table is None:
-            for key, value in rows:
-                self.emit(f"{key}: {value}")
-            return
-
-        table = Table(title=title, box=box.SIMPLE, show_header=False)
-        table.add_column("Key", style="bold cyan", no_wrap=True)
-        table.add_column("Value", style="white")
-        for key, value in rows:
-            table.add_row(str(key), str(value))
-        self.console.print(table)
+        lines = [f"{key}: {value}" for key, value in rows]
+        self._emit_plain_section(title, lines, leading_blank_line=True)
 
     def render_list_table(self, title: str, columns: list[str], rows: list[list[Any]]) -> None:
-        if not self.rich_enabled or self.console is None or Table is None:
-            self.emit(title)
-            for row in rows:
-                self.emit("  - " + " | ".join(str(item) for item in row))
+        if not rows:
             return
-
-        table = Table(title=title, box=box.SIMPLE_HEAVY, header_style="bold cyan")
-        for column in columns:
-            table.add_column(column)
+        formatted_rows = []
         for row in rows:
-            formatted_row = [self._format_cell(column, item) for column, item in zip(columns, row)]
-            table.add_row(*formatted_row)
-        self.console.print(table)
+            parts = [f"{column}={value}" for column, value in zip(columns, row)]
+            formatted_rows.append(" | ".join(parts))
+        self._emit_plain_section(title, formatted_rows, leading_blank_line=True)
 
     def render_request_summary(
         self,
@@ -225,80 +104,67 @@ class TerminalUI:
         stage_duration_line: str,
         triage_line: str,
     ) -> None:
-        if not self.rich_enabled or self.console is None or Table is None or Panel is None:
-            return
-
-        self.render_key_value_block(
-            "Request Summary",
+        request_id = str(summary.get("request_id") or "")
+        if request_id:
+            self.emit(f"Request ID: {request_id}")
+        self._emit_plain_section(
+            "Summary",
             [
-                ("Request ID", summary.get("request_id") or "-"),
-                ("Status", self._format_status_value(summary.get("status") or "-")),
-                ("Session ID", summary.get("session_id") or "-"),
-                ("Latest stage", self._format_cell("stage", summary.get("latest_stage") or "-")),
-                ("Progress", f"{summary.get('subtask_index', 0)}/{summary.get('plan_length', 0)}"),
-                ("Snapshots", summary.get("snapshot_count", 0)),
-                ("Memories", summary.get("memory_count", 0)),
-                ("Checkpoints", summary.get("checkpoint_count", 0)),
+                f"request={summary.get('request_id') or '-'} | "
+                f"stage={summary.get('latest_stage') or '-'} | "
+                f"mode={'lite_chat' if summary.get('lite_mode') else 'task'} | "
+                f"progress={summary.get('subtask_index', 0)}/{summary.get('plan_length', 0)} | "
+                f"tool_calls={(summary.get('metrics', {}) or {}).get('tool_call_count', 0)} | "
+                f"total_ms={(summary.get('metrics', {}) or {}).get('total_duration_ms', '-')}"
             ],
         )
+        context_lines = [
+            f"Mode: {'lite_chat' if summary.get('lite_mode') else 'task'}",
+            f"Status: {summary.get('status') or '-'}",
+            f"Session ID: {summary.get('session_id') or '-'}",
+            f"Latest stage: {summary.get('latest_stage') or '-'}",
+            f"Progress: {summary.get('subtask_index', 0)}/{summary.get('plan_length', 0)}",
+        ]
+        raw_query = str(summary.get("raw_query") or "").strip()
+        normalized_query = str(summary.get("normalized_query") or "").strip()
+        if raw_query:
+            context_lines.insert(0, f"Input: {raw_query}")
+        if normalized_query and normalized_query != raw_query:
+            context_lines.insert(1, f"Intent: {normalized_query}")
+        self._emit_plain_section("Conversation Context", context_lines, leading_blank_line=True)
         if metrics_line:
-            self.console.print(Panel.fit(metrics_line, title="Metrics", border_style="blue"))
+            self._emit_plain_section("Metrics", [metrics_line], leading_blank_line=True)
         if stage_duration_line:
-            self.console.print(Panel.fit(stage_duration_line, title="Stage Durations", border_style="magenta"))
+            self._emit_plain_section("Stage Durations", [stage_duration_line], leading_blank_line=True)
         if triage_line:
-            self.console.print(Panel.fit(triage_line, title="Triage", border_style="yellow"))
-
-        if summary.get("final_response"):
-            self.console.print(Panel(summary["final_response"], title="Final Response", border_style="green"))
-
-        checkpoints = summary.get("checkpoints") or []
-        if checkpoints:
-            checkpoint_rows = []
-            for item in checkpoints[-5:]:
-                checkpoint_rows.append([
-                    item.get("logged_at") or "-",
-                    item.get("stage") or "-",
-                    item.get("details") or "-",
-                ])
-            self.render_list_table("Recent Checkpoints", ["Logged at", "Stage", "Details"], checkpoint_rows)
-
-        memories = summary.get("memories") or []
-        if memories:
-            memory_rows = []
-            for item in memories[-5:]:
-                memory_rows.append([
-                    f"#{item.get('id')}",
-                    item.get("memory_type") or "-",
-                    ",".join(item.get("quality_tags", [])) or "-",
-                    item.get("summary") or "-",
-                ])
-            self.render_list_table("Related Memories", ["ID", "Type", "Tags", "Summary"], memory_rows)
-
-        detached_tools = summary.get("detached_tools") or []
-        if detached_tools:
-            tool_rows = []
-            for item in detached_tools[-5:]:
-                runtime_value = "-"
-                if item.get("detached_runtime_ms") is not None:
-                    runtime_value = f"detached_ms={item['detached_runtime_ms']}"
-                elif item.get("runtime_ms") is not None:
-                    runtime_value = f"runtime_ms={item['runtime_ms']}"
-                tool_rows.append([
-                    item.get("tool_name") or "-",
-                    item.get("tool_run_id") or "-",
-                    item.get("reason") or "-",
-                    item.get("source") or "-",
-                    runtime_value,
-                ])
-            self.render_list_table("Detached Tools", ["Tool", "Run ID", "Reason", "Source", "Runtime"], tool_rows)
+            self._emit_plain_section("Triage", [triage_line], leading_blank_line=True)
 
     def render_recent_requests(self, heading: str, rows: list[list[Any]]) -> None:
-        if not self.rich_enabled:
+        if not rows:
+            self.emit("No matching requests found.")
             return
-        self.render_list_table(
-            heading,
-            ["Request", "Status", "Stage", "Session", "Updated", "Total ms", "Detached", "Resumed from", "Attention"],
-            rows,
+        self.emit(heading)
+        for row in rows:
+            self.emit("  - " + " | ".join(str(item) for item in row))
+
+    def render_conversation_history(self, heading: str, rows: list[list[Any]]) -> None:
+        if not rows:
+            self.emit("No matching requests found.")
+            return
+        self.emit(heading)
+        for row in rows:
+            self.emit("  - " + " | ".join(str(item) for item in row))
+
+    def render_tool_feedback(self, rows: list[dict[str, Any]]) -> None:
+        if not rows:
+            return
+        self._emit_plain_section(
+            "Tool Feedback",
+            [
+                f"- [{item.get('status') or '-'}] {item.get('tool') or '-'} | summary={item.get('summary') or '-'} | source={item.get('source') or '-'} | run_id={item.get('run_id') or '-'}"
+                for item in rows
+            ],
+            leading_blank_line=True,
         )
 
     def render_request_rollup(
@@ -314,106 +180,63 @@ class TerminalUI:
         stage_totals_line: str,
         latest_updated_at: str,
     ) -> None:
-        if not self.rich_enabled or self.console is None or Panel is None:
-            return
-        self.render_key_value_block("Request Rollup", overview_rows)
-        for title, line, style in (
-            ("Filters", filters_line, "cyan"),
-            ("Statuses", status_line, "blue"),
-            ("Totals", totals_line, "green"),
-            ("Top Failures", top_failures_line, "yellow"),
-            ("Failure Combos", combos_line, "magenta"),
-            ("Source Buckets", source_buckets_line, "cyan"),
-            ("Source Trends", source_trends_line, "magenta"),
-            ("Stage Totals", stage_totals_line, "blue"),
-        ):
+        overview_line = "Request rollup: " + " | ".join(f"{key.lower().replace(' ', '_')}={value}" for key, value in overview_rows)
+        self.emit(overview_line)
+        for line in (filters_line, status_line, totals_line, top_failures_line, combos_line, source_buckets_line, source_trends_line, stage_totals_line):
             if line:
-                self.console.print(Panel.fit(line, title=title, border_style=style))
+                self.emit(line)
         if latest_updated_at:
-            self.console.print(f"[dim]Latest updated_at:[/dim] {latest_updated_at}")
+            self.emit(f"Latest updated_at: {latest_updated_at}")
 
     def render_mcp_servers(self, servers: list[dict[str, Any]]) -> None:
-        if not self.rich_enabled:
-            return
         if not servers:
             self.emit("No MCP servers loaded.")
             return
-        rows = []
+        self.emit("Loaded MCP servers:")
         for item in servers:
-            rows.append([
-                item.get("name") or "-",
-                item.get("transport") or "-",
-                len(item.get("tool_names", [])),
-                item.get("source") or "-",
-            ])
-        self.render_list_table("Loaded MCP Servers", ["Name", "Transport", "Tools", "Source"], rows)
+            self.emit(
+                f"  - {item.get('name') or '-'} | transport={item.get('transport') or '-'} | tools={len(item.get('tool_names', []))} | source={item.get('source') or '-'}"
+            )
 
     def render_snapshots(self, snapshots: list[dict[str, Any]]) -> None:
-        if not self.rich_enabled:
-            return
         if not snapshots:
             self.emit("No snapshots found.")
             return
-        rows = []
+        self.emit("Available snapshots:")
         for item in snapshots:
-            rows.append([
-                item.get("index"),
-                item.get("file") or "-",
-                item.get("stage") or "-",
-                item.get("subtask_index"),
-                item.get("blocked"),
-                item.get("completed"),
-            ])
-        self.render_list_table("Available Snapshots", ["Index", "File", "Stage", "Subtask", "Blocked", "Completed"], rows)
+            self.emit(
+                f"  - [{item.get('index')}] {item.get('file') or '-'} | stage={item.get('stage') or '-'} | subtask={item.get('subtask_index')} | blocked={item.get('blocked')} | completed={item.get('completed')}"
+            )
 
     def render_tool_runs(self, items: list[dict[str, Any]]) -> None:
-        if not self.rich_enabled:
-            return
-        rows = []
+        self.emit("Tracked tool runs:")
         for item in items:
             runtime_value = "-"
             if item.get("detached_runtime_ms") is not None:
                 runtime_value = f"detached_ms={item['detached_runtime_ms']}"
             elif item.get("runtime_ms") is not None:
                 runtime_value = f"runtime_ms={item['runtime_ms']}"
-            rows.append([
-                item.get("tool_run_id") or "-",
-                item.get("tool_name") or "-",
-                item.get("request_id") or "-",
-                item.get("status") or "-",
-                item.get("reason") or "-",
-                runtime_value,
-            ])
-        self.render_list_table("Tracked Tool Runs", ["Run ID", "Tool", "Request", "Status", "Reason", "Runtime"], rows)
+            self.emit(
+                f"  - {item.get('tool_run_id') or '-'} | tool={item.get('tool_name') or '-'} | request={item.get('request_id') or '-'} | status={item.get('status') or '-'} | reason={item.get('reason') or '-'} | {runtime_value}"
+            )
 
     def render_retention_targets(self, rows: list[list[Any]]) -> None:
-        if not self.rich_enabled:
-            return
-        self.render_list_table(
-            "Retention Targets",
-            ["Target", "Days", "Max", "Max bytes", "Items", "Expired", "Total", "Reclaimable"],
-            rows,
-        )
+        for row in rows:
+            self.emit(
+                f"  - {row[0]} | days={row[1]} | max={row[2]} | max_bytes={row[3]} | items={row[4]} | expired={row[5]} | total={row[6]} | reclaimable={row[7]}"
+            )
 
     def render_failure_memories(self, rows: list[list[Any]], keywords: list[str]) -> None:
-        if not self.rich_enabled:
-            return
-        title = "Failure Memories"
         if keywords:
-            title += f" ({','.join(keywords)})"
-        self.render_list_table(title, ["ID", "Request", "Type", "Tags", "Keywords", "Summary"], rows)
+            self.emit("Failure memories: keywords=" + ",".join(keywords))
+        else:
+            self.emit("Failure memories:")
+        for row in rows:
+            self.emit("  - " + " | ".join(str(item) for item in row))
 
     def render_stage_event(self, stage: str, request_id: str = "", level: int = logging.INFO) -> None:
-        if not self.rich_enabled or self.console is None:
-            return
-        color, icon = self._stage_style(stage, level=level)
-        request_suffix = f" [dim]{request_id}[/dim]" if request_id else ""
-        self.console.print(f"[{color}]{icon}[/{color}] [{color}]{stage}[/{color}]{request_suffix}")
+        return
 
     @contextmanager
     def busy(self, status_text: str):
-        if not self.rich_enabled or self.console is None:
-            yield
-            return
-        with self.console.status(f"[bold cyan]{status_text}[/bold cyan]", spinner="dots"):
-            yield
+        yield

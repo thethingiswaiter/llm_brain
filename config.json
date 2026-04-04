@@ -1,10 +1,15 @@
 {
     "llm": {
-        "default_model_key": "local_ollama",
+        "default_model_key": "ollama_gemma4",
         "models": {
-            "local_ollama": {
+            "ollama_lfm2": {
                 "provider": "ollama",
                 "model": "lfm2:latest",
+                "base_url": "http://localhost:11434"
+            },
+            "ollama_gemma4": {
+                "provider": "ollama",
+                "model": "gemma4:26b",
                 "base_url": "http://localhost:11434"
             },
             "remote_openai": {
@@ -81,6 +86,21 @@
                 "min_overlap": 1,
                 "min_ratio": 0.34
             }
+        }
+    },
+    "conversation": {
+        "intent_rewrite": {
+            "enabled": true
+        },
+        "lite_chat": {
+            "enabled": true,
+            "persist_memory": false,
+            "patterns": [
+                "^(你好|您好|嗨|哈喽|hello|hi|hey)[!！。\\s]*$",
+                "^(早上好|中午好|下午好|晚上好|晚安)[!！。\\s]*$",
+                "^(在吗|有人吗|忙吗)[?？!！。\\s]*$",
+                "^(谢谢|感谢|辛苦了|thx|thanks)[!！。\\s]*$"
+            ]
         }
     }
 }

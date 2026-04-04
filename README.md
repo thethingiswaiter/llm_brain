@@ -17,7 +17,7 @@
 
 1. docs/project_positioning.md
 2. docs/project_overview.md
-3. app/agent/core.py + app/cli/main.py
+3. main.py + app/agent/core.py + app/cli/main.py
 4. docs/completeness_roadmap.md
 
 ## 快速开始
@@ -30,11 +30,13 @@ python -m pip install -U -r requirements.txt
 
 2. 按 config.json 配置模型（默认可用本地 Ollama）。
 
-3. 启动 CLI：
+3. 启动终端界面：
 
 ```bash
-python app/cli/main.py
+python main.py
 ```
+
+默认入口会优先启动 Textual TUI；如果当前环境没有安装 Textual，会自动回退到旧的行式 CLI。
 
 ## 测试策略
 

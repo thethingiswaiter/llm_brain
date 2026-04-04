@@ -72,6 +72,30 @@ class CognitiveSystem:
     def __init__(self):
         self.domain_tree = list(DOMAIN_TREE)
 
+    def rewrite_intent(self, text: str) -> str:
+        """Rewrite user intent into a concise, style-normalized expression without adding new facts."""
+        source_text = str(text or "").strip()
+        if not source_text:
+            return ""
+
+        prompt = f"""
+        你是一个中文优先的意图重述器。请将用户输入重写为更统一、简洁的表达。
+        目标:
+        1. 去掉语气助词、口头禅和风格噪声。
+        2. 消除不同用户语言习惯差异，保留核心意图不变。
+        3. 不添加原文没有的新信息。
+        4. 只返回重写后的单行文本，不要解释。
+        用户输入:
+        {source_text}
+        """
+        try:
+            response = llm_manager.invoke(prompt, source="feature_extractor.rewrite_intent")
+            rewritten = str(response.content or "").strip()
+            return rewritten or source_text
+        except Exception as e:
+            llm_manager.log_event(f"Intent rewriting failed: {e}", level=40)
+            return source_text
+
     def normalize_domain_label(self, value: str) -> str:
         normalized = str(value or "").strip().strip('"').strip("'")
         if normalized in self.domain_tree:

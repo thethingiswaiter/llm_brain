@@ -15,6 +15,27 @@ class SkillManager:
         "请", "请问", "帮我", "一下", "看看", "看下", "查下", "查询一下", "告诉我", "我想", "我要", "有没有", "怎么", "如何",
     }
     TOOL_KEYWORD_HINTS = {
+        "bash": [
+            "终端",
+            "命令",
+            "shell",
+            "bash",
+            "powershell",
+            "搜索文件",
+            "查找文件",
+            "文件位置",
+            "文件路径",
+            "定位路径",
+            "rg",
+            "find",
+            "where",
+            "which",
+            "git",
+            "python",
+            "pytest",
+            "conda",
+            "pip",
+        ],
         "list_directory": [
             "目录",
             "当前目录",
@@ -48,6 +69,21 @@ class SkillManager:
         "查", "查询", "列出", "统计", "读取", "读", "搜索", "查找", "写入", "保存", "删除", "执行",
         "目录", "文件", "路径", "终端", "命令", "workspace", "目录下", "文件夹",
         "list", "count", "read", "write", "search", "grep", "directory", "file", "path",
+    }
+    WRITE_INTENT_MARKERS = {
+        "写", "写入", "保存", "创建", "追加", "覆盖", "修改", "更新", "生成", "输出到文件",
+        "write", "save", "create", "append", "overwrite", "update",
+    }
+    WRITE_TOOL_NAME_MARKERS = ("write", "save", "append", "delete", "remove")
+    TERMINAL_TOOL_NAMES = {"bash"}
+    ALWAYS_APPEND_TOOL_NAMES = {"bash"}
+    TERMINAL_COMMAND_MARKERS = {
+        "终端", "命令", "shell", "bash", "powershell", "cmd",
+        "git", "python", "pytest", "pip", "conda", "rg", "find", "where", "which",
+    }
+    FILE_SEARCH_MARKERS = {
+        "搜索", "查找", "定位", "在哪", "路径", "文件路径", "文件位置", "文件夹", "文件名",
+        "search", "find", "path", "where", "which", "grep", "rg",
     }
 
     def __init__(self, skill_dir: str = None):
@@ -110,6 +146,45 @@ class SkillManager:
             f"with ratio={match_ratio:.2f} for candidate={candidate_name}"
         )
 
+    def _compute_tool_priority_boost(
+        self,
+        tool_name: str,
+        task_terms: set[str],
+        extracted_keywords: List[str],
+        matched_terms: list[str],
+    ) -> tuple[float, list[str]]:
+        normalized_tool_name = str(tool_name or "").strip().lower()
+        boost = 0.0
+        reasons: list[str] = []
+        keyword_terms = set(self._normalize_keywords(extracted_keywords))
+        combined_terms = task_terms | keyword_terms
+
+        if normalized_tool_name in self.TERMINAL_TOOL_NAMES:
+            boost += 0.5
+            reasons.append("builtin_terminal_tool")
+
+            if not self._has_write_intent(" ".join(task_terms), extracted_keywords):
+                if any(marker in combined_terms or any(marker in term for term in combined_terms) for marker in self.TERMINAL_COMMAND_MARKERS):
+                    boost += 2.5
+                    reasons.append("command_execution_bias")
+
+                file_search_hit = any(
+                    marker in combined_terms or any(marker in term for term in combined_terms)
+                    for marker in self.FILE_SEARCH_MARKERS
+                )
+                file_reference_hit = any("." in term and len(term) > 2 for term in combined_terms)
+                if file_search_hit and file_reference_hit:
+                    boost += 3.0
+                    reasons.append("file_search_bias")
+                elif file_search_hit and any(term in {"路径", "文件夹", "目录"} or term.endswith("路径") for term in combined_terms):
+                    boost += 1.5
+                    reasons.append("path_lookup_bias")
+
+            if matched_terms:
+                boost += 0.1
+
+        return boost, reasons
+
     def _is_tool_execution_task(self, task_description: str, extracted_keywords: List[str]) -> bool:
         task_terms = set(self._tokenize_text(task_description))
         keyword_terms = set(self._normalize_keywords(extracted_keywords))
@@ -120,6 +195,43 @@ class SkillManager:
             marker in combined_terms or any(marker in term for term in combined_terms)
             for marker in self.TOOL_EXECUTION_MARKERS
         )
+
+    def _has_write_intent(self, task_description: str, extracted_keywords: List[str]) -> bool:
+        task_terms = set(self._tokenize_text(task_description))
+        keyword_terms = set(self._normalize_keywords(extracted_keywords))
+        combined_terms = task_terms | keyword_terms
+        if not combined_terms:
+            return False
+        return any(
+            marker in combined_terms or any(marker in term for term in combined_terms)
+            for marker in self.WRITE_INTENT_MARKERS
+        )
+
+    def _filter_task_incompatible_tools(
+        self,
+        tool_skills: List[Dict[str, Any]],
+        task_description: str,
+        extracted_keywords: List[str],
+    ) -> List[Dict[str, Any]]:
+        if self._has_write_intent(task_description, extracted_keywords):
+            return tool_skills
+
+        filtered: List[Dict[str, Any]] = []
+        for item in tool_skills:
+            tool_name = str(item.get("name", "")).strip().lower()
+            if any(marker in tool_name for marker in self.WRITE_TOOL_NAME_MARKERS):
+                continue
+            filtered.append(item)
+        return filtered
+
+    def _filter_routing_excluded_tools(self, tool_skills: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        filtered: List[Dict[str, Any]] = []
+        for item in tool_skills:
+            tool_name = str(item.get("name", "")).strip().lower()
+            if tool_name in self.ALWAYS_APPEND_TOOL_NAMES:
+                continue
+            filtered.append(item)
+        return filtered
 
     def _best_term_match(
         self,
@@ -214,8 +326,14 @@ class SkillManager:
             return self.loaded_tool_skills[tool_name]
 
         description = getattr(tool, "description", "") or ""
+        hint_keywords: list[str] = []
+        for hint in self.TOOL_KEYWORD_HINTS.get(tool_name, []):
+            if not isinstance(hint, str):
+                continue
+            hint_keywords.extend(self._tokenize_text(hint))
+            hint_keywords.append(hint)
         keywords = self._normalize_keywords(self._tokenize_text(f"{tool_name} {description}"))
-        keywords = self._normalize_keywords(keywords + self.TOOL_KEYWORD_HINTS.get(tool_name, []))
+        keywords = self._normalize_keywords(keywords + hint_keywords)
         tool_skill = {
             "name": tool_name,
             "description": description,
@@ -276,6 +394,7 @@ class SkillManager:
     def _rank_tools(
         self,
         candidate_term_sets: List[set[str]],
+        extracted_keywords: List[str],
         min_overlap: int,
         min_ratio: float,
         limit: int,
@@ -286,8 +405,20 @@ class SkillManager:
             matched_terms, overlap, match_ratio, task_terms = self._best_term_match(candidate_term_sets, tool_terms)
             if not self._passes_threshold(overlap, task_terms, min_overlap, min_ratio):
                 continue
+            priority_boost, priority_reasons = self._compute_tool_priority_boost(
+                tool_skill.get("name", ""),
+                task_terms,
+                extracted_keywords,
+                matched_terms,
+            )
+            route_reason = self._build_route_reason(
+                tool_skill.get("name", "unknown_tool"), matched_terms, overlap, match_ratio
+            )
+            if priority_reasons:
+                route_reason = f"{route_reason} | priority={'+'.join(priority_reasons)}"
             ranked_tools.append(
                 (
+                    priority_boost,
                     overlap,
                     match_ratio,
                     len(tool_terms),
@@ -296,15 +427,14 @@ class SkillManager:
                         "matched_terms": matched_terms,
                         "overlap_count": overlap,
                         "match_ratio": match_ratio,
-                        "route_reason": self._build_route_reason(
-                            tool_skill.get("name", "unknown_tool"), matched_terms, overlap, match_ratio
-                        ),
+                        "priority_boost": priority_boost,
+                        "route_reason": route_reason,
                     },
                 )
             )
 
-        ranked_tools.sort(key=lambda item: (item[0], item[1], item[2], item[3]["name"]), reverse=True)
-        return [item[3] for item in ranked_tools[:limit]]
+        ranked_tools.sort(key=lambda item: (item[0], item[1], item[2], item[3], item[4]["name"]), reverse=True)
+        return [item[4] for item in ranked_tools[:limit]]
 
     def find_relevant_tools(self, task_description: str, extracted_keywords: List[str], limit: int = 3) -> List[Dict[str, Any]]:
         keyword_terms = set(self._normalize_keywords(extracted_keywords))
@@ -319,25 +449,29 @@ class SkillManager:
             return []
         strict_matches = self._rank_tools(
             candidate_term_sets,
+            extracted_keywords,
             config.tool_skill_min_overlap,
             config.tool_skill_min_match_ratio,
             limit,
         )
         if strict_matches:
-            return strict_matches
+            filtered_matches = self._filter_task_incompatible_tools(strict_matches, task_description, extracted_keywords)
+            return self._filter_routing_excluded_tools(filtered_matches)
 
         if not self._is_tool_execution_task(task_description, extracted_keywords):
             return []
 
         relaxed_matches = self._rank_tools(
             candidate_term_sets,
+            extracted_keywords,
             min_overlap=1,
             min_ratio=0.0,
             limit=limit,
         )
         for item in relaxed_matches:
             item["route_reason"] = f"{item.get('route_reason', '')} | relaxed_tool_threshold"
-        return relaxed_matches
+        filtered_matches = self._filter_task_incompatible_tools(relaxed_matches, task_description, extracted_keywords)
+        return self._filter_routing_excluded_tools(filtered_matches)
 
     def assign_capabilities_to_task(self, task_description: str, extracted_keywords: List[str]) -> Dict[str, Any]:
         prompt_skill = self.find_best_skill(extracted_keywords)

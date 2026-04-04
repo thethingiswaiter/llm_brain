@@ -52,6 +52,15 @@ class AppConfig:
         self.prompt_skill_min_match_ratio = 0.34
         self.tool_skill_min_overlap = 1
         self.tool_skill_min_match_ratio = 0.34
+        self.lite_chat_enabled = True
+        self.lite_chat_persist_memory = False
+        self.lite_chat_patterns = [
+            r"^(你好|您好|嗨|哈喽|hello|hi|hey)[!！。\\s]*$",
+            r"^(早上好|中午好|下午好|晚上好|晚安)[!！。\\s]*$",
+            r"^(在吗|有人吗|忙吗)[?？!！。\\s]*$",
+            r"^(谢谢|感谢|辛苦了|thx|thanks)[!！。\\s]*$",
+        ]
+        self.intent_rewrite_enabled = True
         self.llm_config = LLMConfig()
         self._load_config()
 
@@ -240,6 +249,42 @@ class AppConfig:
                 "routing.skill_match.tool.min_ratio",
                 "tool_skill_min_match_ratio",
                 0.34,
+            )
+            self.lite_chat_enabled = bool(
+                self._read_value(
+                    data,
+                    "conversation.lite_chat.enabled",
+                    "lite_chat_enabled",
+                    True,
+                )
+            )
+            self.lite_chat_persist_memory = bool(
+                self._read_value(
+                    data,
+                    "conversation.lite_chat.persist_memory",
+                    "lite_chat_persist_memory",
+                    False,
+                )
+            )
+            configured_lite_chat_patterns = self._read_value(
+                data,
+                "conversation.lite_chat.patterns",
+                "lite_chat_patterns",
+                self.lite_chat_patterns,
+            )
+            if isinstance(configured_lite_chat_patterns, list):
+                sanitized_patterns = [
+                    str(item).strip() for item in configured_lite_chat_patterns if str(item).strip()
+                ]
+                if sanitized_patterns:
+                    self.lite_chat_patterns = sanitized_patterns
+            self.intent_rewrite_enabled = bool(
+                self._read_value(
+                    data,
+                    "conversation.intent_rewrite.enabled",
+                    "intent_rewrite_enabled",
+                    True,
+                )
             )
             
             # Load default model

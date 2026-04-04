@@ -35,10 +35,17 @@ class Reflector:
         """
         try:
             response = llm_manager.invoke(prompt, source="reflector.verify_and_reflect")
-            data = parse_json_object(
-                response.content,
-                required_fields={"success": bool, "reflection": str, "action": str},
-            )
+            raw_payload = getattr(response, "content", response)
+            try:
+                data = parse_json_object(
+                    raw_payload,
+                    required_fields={"success": bool, "reflection": str, "action": str},
+                )
+            except StructuredOutputError:
+                data = parse_json_object(
+                    llm_manager._stringify_response(response),
+                    required_fields={"success": bool, "reflection": str, "action": str},
+                )
             if data["action"] not in {"continue", "retry", "ask_user"}:
                 raise StructuredOutputSchemaError("Field action must be one of continue/retry/ask_user.")
             return (

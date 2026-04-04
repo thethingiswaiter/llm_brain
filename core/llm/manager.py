@@ -159,6 +159,62 @@ class LLMManager:
         self.log_event(f"LLM model switched | provider={provider} | model={model}")
         return f"Successfully switched to {provider}:{model}"
 
+    def _current_model_matches(self, model_config: dict[str, Any]) -> bool:
+        if not isinstance(model_config, dict):
+            return False
+        if str(model_config.get("provider") or "") != str(config.llm_config.provider or ""):
+            return False
+        if str(model_config.get("model") or "") != str(config.llm_config.model or ""):
+            return False
+
+        configured_base_url = model_config.get("base_url")
+        if configured_base_url is not None and str(configured_base_url) != str(config.llm_config.base_url or ""):
+            return False
+
+        configured_api_key = model_config.get("api_key")
+        if configured_api_key is not None and str(configured_api_key) != str(config.llm_config.api_key or ""):
+            return False
+        return True
+
+    def get_current_model_key(self) -> str:
+        for model_key, model_config in (config.models_config or {}).items():
+            if self._current_model_matches(model_config):
+                return str(model_key)
+        return ""
+
+    def list_available_models(self) -> list[dict[str, Any]]:
+        current_key = self.get_current_model_key()
+        models: list[dict[str, Any]] = []
+        for model_key, model_config in (config.models_config or {}).items():
+            provider = str(model_config.get("provider") or "")
+            model_name = str(model_config.get("model") or "")
+            base_url = str(model_config.get("base_url") or "")
+            models.append(
+                {
+                    "key": str(model_key),
+                    "provider": provider,
+                    "model": model_name,
+                    "base_url": base_url,
+                    "is_default": str(model_key) == str(config.default_model_key or ""),
+                    "is_current": str(model_key) == current_key,
+                }
+            )
+        return models
+
+    def set_model_by_key(self, model_key: str):
+        normalized_key = str(model_key or "").strip()
+        model_config = (config.models_config or {}).get(normalized_key)
+        if not isinstance(model_config, dict):
+            available = ", ".join(sorted(str(item) for item in (config.models_config or {}).keys())) or "none"
+            raise KeyError(f"Unknown model key: {normalized_key}. Available model keys: {available}")
+
+        provider = str(model_config.get("provider") or "").strip()
+        model = str(model_config.get("model") or "").strip()
+        base_url = model_config.get("base_url")
+        api_key = model_config.get("api_key")
+        result = self.set_model(provider, model, base_url=base_url, api_key=api_key)
+        return f"{result} (config={normalized_key})"
+
     def _update_llm(self):
         disable_live_llm = os.getenv("LLM_BRAIN_DISABLE_LIVE_LLM", "").strip().lower()
         if disable_live_llm in {"1", "true", "yes", "on"}:

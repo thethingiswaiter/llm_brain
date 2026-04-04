@@ -152,6 +152,33 @@ class SkillRoutingTests(unittest.TestCase):
         self.assertEqual([item["name"] for item in matched], ["status_lookup"])
         self.assertIn("relaxed_tool_threshold", matched[0]["route_reason"])
 
+    def test_read_only_file_lookup_excludes_write_tools(self):
+        list_tool = FakeTool("list_directory", "列出工作区内目录项（安全边界：仅允许工作区内路径）。")
+        write_tool = FakeTool("write_text_file", "在工作区内写入 UTF-8 文本文件。默认不覆盖已存在文件，可选 append。")
+        self.manager.register_tools([list_tool, write_tool])
+
+        matched = self.manager.find_relevant_tools("查找名为 agent.md 的文件", ["查找", "agent.md", "文件"])
+
+        self.assertEqual([item["name"] for item in matched], ["list_directory"])
+
+    def test_file_search_does_not_route_builtin_terminal_tool(self):
+        bash_tool = FakeTool("bash", "安全执行终端命令，可用于 rg、git、python、pytest 和工作区内文件搜索。")
+        list_tool = FakeTool("list_directory", "列出工作区内目录项（安全边界：仅允许工作区内路径）。")
+        self.manager.register_tools([list_tool, bash_tool])
+
+        matched = self.manager.find_relevant_tools("找下 core.py 文件在哪个文件夹下", ["core.py", "文件", "路径", "查找"])
+
+        self.assertEqual([item["name"] for item in matched], ["list_directory"])
+
+    def test_terminal_command_query_does_not_route_builtin_terminal_tool(self):
+        bash_tool = FakeTool("bash", "安全执行终端命令，可用于 git status、python --version 和 pytest。")
+        grep_tool = FakeTool("grep_text", "在工作区文本文件中搜索关键词。")
+        self.manager.register_tools([grep_tool, bash_tool])
+
+        matched = self.manager.find_relevant_tools("帮我执行 git status 看下当前仓库状态", ["git", "status", "终端", "命令"])
+
+        self.assertEqual(matched, [])
+
 
 if __name__ == "__main__":
     unittest.main()

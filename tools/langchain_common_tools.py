@@ -8,7 +8,7 @@ from typing import Any
 from langchain_core.tools import tool
 
 from core.config import config
-from time_utils import CHINA_TIMEZONE
+from core.time_utils import CHINA_TIMEZONE
 
 MAX_FILE_PREVIEW_CHARS = 12000
 MAX_SEARCH_RESULTS = 100

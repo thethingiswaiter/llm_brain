@@ -4,7 +4,7 @@ import json
 import math
 from typing import Optional
 from core.config import config
-from time_utils import now_china_iso
+from core.time_utils import now_china_iso
 
 class MemoryManager:
     QUALITY_PRIORITY = {

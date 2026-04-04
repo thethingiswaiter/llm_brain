@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from core.config import config
-from time_utils import CHINA_TIMEZONE
+from core.time_utils import CHINA_TIMEZONE
 
 
 class ChinaTimezoneFormatter(logging.Formatter):

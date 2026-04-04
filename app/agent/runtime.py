@@ -17,6 +17,7 @@ class AgentRuntime:
 
     def register_request(self, request_id: str):
         with self.agent._request_lock:
+            self.agent._cancelled_request_ids.discard(request_id)
             cancel_event = self.agent._request_event_factory()
             self.agent._request_cancellations[request_id] = cancel_event
             return cancel_event
@@ -27,6 +28,8 @@ class AgentRuntime:
 
     def is_request_cancelled(self, request_id: str) -> bool:
         with self.agent._request_lock:
+            if request_id in self.agent._cancelled_request_ids:
+                return True
             cancel_event = self.agent._request_cancellations.get(request_id)
             return bool(cancel_event and cancel_event.is_set())
 
@@ -40,6 +43,7 @@ class AgentRuntime:
             if not cancel_event:
                 return f"Request is not active: {request_id}"
             cancel_event.set()
+            self.agent._cancelled_request_ids.add(request_id)
         llm_manager.console_event("agent_cancel_requested", request_id=request_id, level=40)
         llm_manager.log_event("Agent cancellation requested by user.", level=40, request_id=request_id)
         return f"Cancellation requested for {request_id}."
@@ -55,6 +59,11 @@ class AgentRuntime:
             elapsed = time.monotonic() - start
             remaining = timeout_seconds - elapsed
             if remaining <= 0:
+                with self.agent._request_lock:
+                    self.agent._cancelled_request_ids.add(request_id)
+                    cancel_event = self.agent._request_cancellations.get(request_id)
+                    if cancel_event:
+                        cancel_event.set()
                 future.cancel()
                 raise TimeoutError(
                     f"Request timed out after {timeout_seconds} seconds. "
@@ -68,6 +77,7 @@ class AgentRuntime:
     def _build_initial_inputs(self, query: str, request_id: str, session_id: str) -> dict[str, Any]:
         return {
             "messages": [HumanMessage(content=query)],
+            "raw_query": query,
             "plan": [],
             "current_subtask_index": 0,
             "reflections": [],
@@ -83,6 +93,9 @@ class AgentRuntime:
             "replan_counts": {},
             "blocked": False,
             "final_response": "",
+            "lite_mode": False,
+            "normalized_query": query,
+            "subtask_feature_cache": {},
         }
 
     def _execute_graph(self, inputs: dict[str, Any], request_id: str):
@@ -199,24 +212,37 @@ class AgentRuntime:
                     )
                     return dependency_message
 
-                final_output = result["messages"][-1].content
-                self.agent._persist_state_snapshot(
-                    request_id,
-                    "request_completed",
-                    result,
-                    extra={"final_output": final_output},
-                )
+                final_output = result.get("final_response") or result["messages"][-1].content
+                latest_stage = "agent_blocked" if result.get("blocked") else "request_completed"
+                if latest_stage == "request_completed":
+                    self.agent._persist_state_snapshot(
+                        request_id,
+                        "request_completed",
+                        result,
+                        extra={"final_output": final_output},
+                    )
+                    llm_manager.log_structured_event(
+                        "agent_request",
+                        message="Agent request completed",
+                        request_id=request_id,
+                        session_id=active_session_id,
+                        stage="request_completed",
+                        source="agent.invoke",
+                        duration_ms=(time.monotonic() - request_started_at) * 1000,
+                        outcome="completed",
+                    )
+                else:
+                    llm_manager.log_structured_event(
+                        "agent_request",
+                        message="Agent request blocked",
+                        request_id=request_id,
+                        session_id=active_session_id,
+                        stage="agent_blocked",
+                        source="agent.invoke",
+                        duration_ms=(time.monotonic() - request_started_at) * 1000,
+                        outcome="blocked",
+                    )
                 llm_manager.console_event("agent_finished", request_id=request_id)
-                llm_manager.log_structured_event(
-                    "agent_request",
-                    message="Agent request completed",
-                    request_id=request_id,
-                    session_id=active_session_id,
-                    stage="request_completed",
-                    source="agent.invoke",
-                    duration_ms=(time.monotonic() - request_started_at) * 1000,
-                    outcome="completed",
-                )
                 llm_manager.log_event(f"Agent response | session_id={active_session_id}\n{final_output}")
                 return final_output
         except KeyboardInterrupt:
@@ -487,31 +513,46 @@ class AgentRuntime:
                     )
                     return dependency_message
 
-                final_output = result["messages"][-1].content
-                self.agent._persist_state_snapshot(
-                    new_request_id,
-                    "request_completed",
-                    result,
-                    extra={
-                        "source_request_id": request_id,
-                        "source_snapshot_path": payload.get("snapshot_path", ""),
-                        "final_output": final_output,
-                        "resume_mode": resume_mode,
-                    },
-                )
+                final_output = result.get("final_response") or result["messages"][-1].content
+                latest_stage = "agent_blocked" if result.get("blocked") else "request_completed"
+                if latest_stage == "request_completed":
+                    self.agent._persist_state_snapshot(
+                        new_request_id,
+                        "request_completed",
+                        result,
+                        extra={
+                            "source_request_id": request_id,
+                            "source_snapshot_path": payload.get("snapshot_path", ""),
+                            "final_output": final_output,
+                            "resume_mode": resume_mode,
+                        },
+                    )
+                    llm_manager.log_structured_event(
+                        "agent_request",
+                        message="Resumed request completed",
+                        request_id=new_request_id,
+                        session_id=restored_state.get("session_id", self.agent.session_id),
+                        stage="request_completed",
+                        source="agent.resume",
+                        duration_ms=None,
+                        outcome="completed",
+                        source_request_id=request_id,
+                        resume_mode=resume_mode,
+                    )
+                else:
+                    llm_manager.log_structured_event(
+                        "agent_request",
+                        message="Resumed request blocked",
+                        request_id=new_request_id,
+                        session_id=restored_state.get("session_id", self.agent.session_id),
+                        stage="agent_blocked",
+                        source="agent.resume",
+                        duration_ms=None,
+                        outcome="blocked",
+                        source_request_id=request_id,
+                        resume_mode=resume_mode,
+                    )
                 llm_manager.console_event("agent_finished", request_id=new_request_id)
-                llm_manager.log_structured_event(
-                    "agent_request",
-                    message="Resumed request completed",
-                    request_id=new_request_id,
-                    session_id=restored_state.get("session_id", self.agent.session_id),
-                    stage="request_completed",
-                    source="agent.resume",
-                    duration_ms=None,
-                    outcome="completed",
-                    source_request_id=request_id,
-                    resume_mode=resume_mode,
-                )
                 llm_manager.log_event(
                     f"Agent resume response | source_request_id={request_id}\n{final_output}",
                     request_id=new_request_id,
