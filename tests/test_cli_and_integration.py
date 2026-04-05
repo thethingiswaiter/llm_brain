@@ -34,6 +34,22 @@ class FakeCLIManager:
     def __init__(self):
         self.current_key = "ollama_gemma4"
 
+        class _Logging:
+            @staticmethod
+            def _summarize_console_details(stage, details):
+                return str(details or "").strip()
+
+            @staticmethod
+            def _format_console_details(details, max_chars=160):
+                normalized = " ".join(str(details or "").split())
+                return normalized[:max_chars]
+
+            @staticmethod
+            def console_event(stage, request_id=None, level=logging.INFO, details=""):
+                return None
+
+        self.logging = _Logging()
+
     def set_model(self, provider, model, base_url=None, api_key=None):
         return f"switched:{provider}:{model}"
 
@@ -79,6 +95,7 @@ class FakeCLIAgent:
         self.loaded_mcp_refs = []
         self.unloaded_mcp_refs = []
         self.refreshed_mcp_refs = []
+        self.write_roots = [config.resolve_path(".")]
         self._mcp_servers = [
             {
                 "name": "system_mcp_server",
@@ -185,9 +202,9 @@ class FakeCLIAgent:
         }
         self._blocked_summary = {
             "request_id": "req_message_blocked",
-            "status": "blocked",
+            "status": "waiting_user",
             "session_id": "session_cli",
-            "latest_stage": "agent_blocked",
+            "latest_stage": "agent_waiting_user",
             "lite_mode": False,
             "raw_query": "book something for me",
             "normalized_query": "预订某项内容",
@@ -211,7 +228,7 @@ class FakeCLIAgent:
             "triage": {
                 "needs_attention": True,
                 "is_resumed": False,
-                "latest_failure_stage": "agent_blocked",
+                "latest_failure_stage": "agent_waiting_user",
                 "latest_failure_details": "index=1 | action=ask_user | tool=booking_tool | error_type=missing_parameter",
                 "latest_failure_source": "reflection",
                 "latest_reroute_mode": "",
@@ -570,6 +587,22 @@ class FakeCLIAgent:
         self.refreshed_mcp_refs.append(server_ref)
         return True, f"refreshed_mcp:{server_ref}"
 
+    def grant_write_access(self, path):
+        normalized = config.resolve_path(path)
+        if normalized not in self.write_roots:
+            self.write_roots.append(normalized)
+        return f"Granted write access: {normalized}"
+
+    def revoke_write_access(self, path):
+        normalized = config.resolve_path(path)
+        if normalized in self.write_roots[1:]:
+            self.write_roots.remove(normalized)
+            return f"Revoked write access: {normalized}"
+        return f"Write access not found: {normalized}"
+
+    def list_write_access_roots(self):
+        return list(self.write_roots)
+
 
 class CLITestCases(unittest.TestCase):
     def test_textual_app_builds_status_line(self):
@@ -661,6 +694,47 @@ class CLITestCases(unittest.TestCase):
         self.assertTrue(renderable.plain.endswith("> agent_started"))
         self.assertFalse(response_block_active)
 
+    def test_textual_app_builds_stage_log_line_with_details(self):
+        from app.cli.textual_app import AgentTextualApp
+
+        app = AgentTextualApp(agent_instance=FakeCLIAgent(), llm_manager_instance=FakeCLIManager())
+        renderable, response_block_active = app._build_log_line_renderable("> subtask_started | 子任务1: query hostname", False)
+
+        self.assertTrue(renderable.plain.endswith("> subtask_started | 子任务1: query hostname"))
+        self.assertFalse(response_block_active)
+
+    def test_textual_app_formats_stage_event_line_compactly(self):
+        from app.cli.textual_app import AgentTextualApp
+
+        app = AgentTextualApp(agent_instance=FakeCLIAgent(), llm_manager_instance=FakeCLIManager())
+        first = app._format_stage_event_line("planning_started", request_id="req_demo", details="会话=session_demo")
+        second = app._format_stage_event_line("planning_completed", request_id="req_demo", details="计划=1步 | 领域=综合")
+
+        self.assertEqual("> planning | request=req_demo | 会话=session_demo", first)
+        self.assertEqual("> plan ready | 计划=1步 | 领域=综合", second)
+
+    def test_textual_app_formats_multiline_stage_details(self):
+        from app.cli.textual_app import AgentTextualApp
+
+        app = AgentTextualApp(agent_instance=FakeCLIAgent(), llm_manager_instance=FakeCLIManager())
+        rendered = app._format_stage_event_line(
+            "planning_completed",
+            request_id="req_demo",
+            details="计划=2步 | 领域=综合\n- 1. 读取文件 => 得到内容\n- 2. 输出结果 => 返回给用户",
+        )
+
+        self.assertIn("> plan ready | request=req_demo | 计划=2步 | 领域=综合", rendered)
+        self.assertIn("  - 1. 读取文件 => 得到内容", rendered)
+        self.assertIn("  - 2. 输出结果 => 返回给用户", rendered)
+
+    def test_textual_app_marks_blocked_stage_as_alert(self):
+        from app.cli.textual_app import AgentTextualApp
+
+        app = AgentTextualApp(agent_instance=FakeCLIAgent(), llm_manager_instance=FakeCLIManager())
+        rendered = app._format_stage_event_line("agent_blocked", request_id="req_demo", details="阻塞于子任务1 | 动作=ask_user")
+
+        self.assertEqual("! blocked | request=req_demo | 阻塞于子任务1 | 动作=ask_user", rendered)
+
     def test_textual_app_builds_highlighted_response_line_renderable(self):
         from app.cli.textual_app import AgentTextualApp
 
@@ -668,10 +742,19 @@ class CLITestCases(unittest.TestCase):
         heading_renderable, heading_active = app._build_log_line_renderable("Response:", False)
         body_renderable, body_active = app._build_log_line_renderable("echo:hello", heading_active)
 
-        self.assertTrue(heading_renderable.plain.endswith("Response:"))
+        self.assertTrue(heading_renderable.plain.endswith("Agent>"))
         self.assertTrue(heading_active)
         self.assertTrue(body_renderable.plain.endswith("echo:hello"))
         self.assertTrue(body_active)
+
+    def test_textual_app_renders_divider_line_without_response_state(self):
+        from app.cli.textual_app import AgentTextualApp
+
+        app = AgentTextualApp(agent_instance=FakeCLIAgent(), llm_manager_instance=FakeCLIManager())
+        renderable, response_block_active = app._build_log_line_renderable("----------------------------------------", True)
+
+        self.assertTrue(renderable.plain.endswith("----------------------------------------"))
+        self.assertFalse(response_block_active)
 
     def test_textual_app_autocomplete_suggestions_include_recent_request_ids(self):
         from app.cli.textual_app import AgentTextualApp
@@ -694,6 +777,46 @@ class CLITestCases(unittest.TestCase):
         self.assertEqual("request_completed", overview["stage"])
         self.assertEqual(0, overview["active_tool_count"])
         self.assertEqual(1, overview["detached_tool_count"])
+
+    def test_terminal_ui_formats_stage_event_without_repeating_request_id(self):
+        from app.cli.terminal_ui import TerminalUI
+
+        output = FakeCLIOutput()
+        ui = TerminalUI(output_func=output, input_func=lambda prompt="": "")
+
+        ui.render_stage_event("planning_started", request_id="req_demo", details="会话=session_demo")
+        ui.render_stage_event("planning_completed", request_id="req_demo", details="计划=1步")
+
+        rendered = output.joined()
+        self.assertIn("> planning | request=req_demo | 会话=session_demo", rendered)
+        self.assertIn("> plan ready | 计划=1步", rendered)
+
+    def test_terminal_ui_formats_multiline_stage_details(self):
+        from app.cli.terminal_ui import TerminalUI
+
+        output = FakeCLIOutput()
+        ui = TerminalUI(output_func=output, input_func=lambda prompt="": "")
+
+        ui.render_stage_event(
+            "planning_completed",
+            request_id="req_demo",
+            details="计划=2步 | 领域=综合\n- 1. 读取文件 => 得到内容\n- 2. 输出结果 => 返回给用户",
+        )
+
+        rendered = output.joined()
+        self.assertIn("> plan ready | request=req_demo | 计划=2步 | 领域=综合", rendered)
+        self.assertIn("  - 1. 读取文件 => 得到内容", rendered)
+        self.assertIn("  - 2. 输出结果 => 返回给用户", rendered)
+
+    def test_terminal_ui_marks_failed_stage_as_alert(self):
+        from app.cli.terminal_ui import TerminalUI
+
+        output = FakeCLIOutput()
+        ui = TerminalUI(output_func=output, input_func=lambda prompt="": "")
+
+        ui.render_stage_event("tool_failed", request_id="req_demo", details="工具=get_hostname | 错误=no_output")
+
+        self.assertIn("! tool failed | request=req_demo | 工具=get_hostname | 错误=no_output", output.joined())
 
     def test_build_input_suggestions_includes_recent_requests_and_commands(self):
         from app.cli.commands import build_input_suggestions
@@ -745,14 +868,14 @@ class CLITestCases(unittest.TestCase):
         self.assertIn("/request_summary [request_id]", rendered)
         self.assertIn("/summary [request_id]", rendered)
         self.assertIn("/history [limit] - Show a compact view of recent user inputs, rewritten intents, and replies", rendered)
-        self.assertIn("/recent_requests [limit] [status=failed,blocked,...] [resumed] [attention] [since=30m]", rendered)
-        self.assertIn("/recent [limit] [status=failed,blocked,...] [resumed] [attention] [since=30m]", rendered)
-        self.assertIn("/request_rollup [limit] [status=failed,blocked,...] [resumed] [attention] [since=30m]", rendered)
-        self.assertIn("/rollup [limit] [status=failed,blocked,...] [resumed] [attention] [since=30m]", rendered)
-        self.assertIn("/failed_requests [limit] [status=failed,blocked,timed_out,cancelled,...] [resumed] [attention] [since=30m]", rendered)
-        self.assertIn("/latest_failure [summary|snapshots|resume] - Open the most recent failed or blocked request with a preset action", rendered)
-        self.assertIn("/resumed_requests [limit] [status=failed,blocked,...] [attention] [since=30m]", rendered)
-        self.assertIn("/resume_last_blocked - Reroute resume the most recent blocked request", rendered)
+        self.assertIn("/recent_requests [limit] [status=failed,waiting_user,blocked,...] [resumed] [attention] [since=30m]", rendered)
+        self.assertIn("/recent [limit] [status=failed,waiting_user,blocked,...] [resumed] [attention] [since=30m]", rendered)
+        self.assertIn("/request_rollup [limit] [status=failed,waiting_user,blocked,...] [resumed] [attention] [since=30m]", rendered)
+        self.assertIn("/rollup [limit] [status=failed,waiting_user,blocked,...] [resumed] [attention] [since=30m]", rendered)
+        self.assertIn("/failed_requests [limit] [status=failed,waiting_user,blocked,timed_out,cancelled,...] [resumed] [attention] [since=30m]", rendered)
+        self.assertIn("/latest_failure [summary|snapshots|resume] - Open the most recent failed, waiting, or blocked request with a preset action", rendered)
+        self.assertIn("/resumed_requests [limit] [status=failed,waiting_user,blocked,...] [attention] [since=30m]", rendered)
+        self.assertIn("/resume_last_blocked - Reroute resume the most recent waiting-user or blocked request", rendered)
         self.assertIn("/snapshots [request_id]", rendered)
         self.assertIn("/resume <request_id> [snapshot_file]", rendered)
         self.assertIn("/suggest [prefix] - Suggest commands, request ids, snapshots, and recent inputs for the given prefix", rendered)
@@ -859,7 +982,7 @@ class CLITestCases(unittest.TestCase):
         self.assertIn("Mode: task", rendered)
         self.assertIn("Status: completed", rendered)
         self.assertIn("Subtasks:", rendered)
-        self.assertIn("[completed] Query the Beijing weather | outcome=Get the current weather result", rendered)
+        self.assertIn("[completed] Query the Beijing weather | outcome=mode=leaf", rendered)
         self.assertIn("Tool Feedback:", rendered)
         self.assertIn("[detached] slow_tool | summary=reason=timeout | source=checkpoint | run_id=toolrun_000001", rendered)
         self.assertIn("Request Assets:", rendered)
@@ -892,6 +1015,7 @@ class CLITestCases(unittest.TestCase):
         self.assertIn("Conversation Context:", rendered)
         self.assertIn("Input: hello agent", rendered)
         self.assertIn("Mode: task | Status: completed", rendered)
+        self.assertIn("----------------------------------------", rendered)
         self.assertIn("Response:", rendered)
         self.assertIn("echo:hello agent:session_cli", rendered)
 
@@ -908,13 +1032,14 @@ class CLITestCases(unittest.TestCase):
         rendered = output.joined()
         self.assertIn("Request ID: req_message_blocked", rendered)
         self.assertIn("Summary:", rendered)
-        self.assertIn("request=req_message_blocked | stage=agent_blocked | mode=task | progress=0/1 | tool_calls=0 | total_ms=18.0", rendered)
+        self.assertIn("request=req_message_blocked | stage=agent_waiting_user | mode=task | progress=0/1 | tool_calls=0 | total_ms=18.0", rendered)
         self.assertIn("Conversation Context:", rendered)
         self.assertIn("Input: book something for me", rendered)
         self.assertIn("Intent: 预订某项内容", rendered)
-        self.assertIn("Mode: task | Status: blocked", rendered)
+        self.assertIn("Mode: task | Status: waiting_user", rendered)
         self.assertIn("Risk:", rendered)
         self.assertIn("Blocked Reason: 当前请求需要补充信息后才能继续，相关工具: booking_tool。", rendered)
+        self.assertIn("----------------------------------------", rendered)
         self.assertIn("Response:", rendered)
         self.assertIn("Please confirm whether to query local or remote host.", rendered)
 
@@ -931,7 +1056,7 @@ class CLITestCases(unittest.TestCase):
         rendered = output.joined()
         self.assertIn("Request ID: req_message_blocked", rendered)
         self.assertIn("Subtasks:", rendered)
-        self.assertIn("[blocked] Collect missing booking details | outcome=Obtain required parameters for the booking tool", rendered)
+        self.assertIn("[blocked] Collect missing booking details | outcome=mode=leaf", rendered)
         self.assertIn("Tool Feedback:", rendered)
         self.assertIn("[blocked] booking_tool | summary=error_type=missing_parameter | action=ask_user | source=reflection | run_id=-", rendered)
 
@@ -1231,8 +1356,8 @@ class CLITestCases(unittest.TestCase):
         )
 
         rendered = output.joined()
-        self.assertIn("Recent failed or blocked requests:", rendered)
-        self.assertIn("Filters: statuses=failed,blocked,timed_out,cancelled", rendered)
+        self.assertIn("Recent failed, waiting, or blocked requests:", rendered)
+        self.assertIn("Filters: statuses=failed,waiting_user,blocked,timed_out,cancelled", rendered)
         self.assertIn("req_recent_3 | status=failed", rendered)
         self.assertIn("req_recent_2 | status=blocked", rendered)
         self.assertNotIn("req_recent_1 | status=completed", rendered)
@@ -1488,6 +1613,52 @@ class CLITestCases(unittest.TestCase):
         self.assertIn("refreshed_mcp:system_mcp_server", rendered)
         self.assertEqual(fake_agent.refreshed_mcp_refs, ["system_mcp_server"])
 
+    def test_grant_write_command_passes_folder_and_lists_roots(self):
+        from app.cli import main as cli
+
+        output = FakeCLIOutput()
+        fake_agent = FakeCLIAgent()
+        cli.start_cli(
+            input_func=FakeCLIInput([
+                "/grant_write runtime_state",
+                "/list_write_roots",
+                "quit",
+            ]),
+            output_func=output,
+            agent_instance=fake_agent,
+            llm_manager_instance=FakeCLIManager(),
+        )
+
+        rendered = output.joined()
+        self.assertIn(f"Granted write access: {config.resolve_path('runtime_state')}", rendered)
+        self.assertIn("Writable roots:", rendered)
+        self.assertIn(config.resolve_path("."), rendered)
+        self.assertIn(config.resolve_path("runtime_state"), rendered)
+
+    def test_revoke_write_command_removes_granted_root(self):
+        from app.cli import main as cli
+
+        output = FakeCLIOutput()
+        fake_agent = FakeCLIAgent()
+        cli.start_cli(
+            input_func=FakeCLIInput([
+                "/grant_write runtime_state",
+                "/revoke_write runtime_state",
+                "/list_write_roots",
+                "quit",
+            ]),
+            output_func=output,
+            agent_instance=fake_agent,
+            llm_manager_instance=FakeCLIManager(),
+        )
+
+        rendered = output.joined()
+        self.assertIn(f"Revoked write access: {config.resolve_path('runtime_state')}", rendered)
+        self.assertIn("Writable roots:", rendered)
+        rendered_after_list = rendered.split("Writable roots:")[-1]
+        self.assertIn(config.resolve_path("."), rendered_after_list)
+        self.assertNotIn(config.resolve_path("runtime_state"), rendered_after_list)
+
     def test_new_session_command_updates_session_for_following_message(self):
         from app.cli import main as cli
         output = FakeCLIOutput()
@@ -1525,6 +1696,7 @@ class AgentIntegrationFlowTests(unittest.TestCase):
         self.llm_manager_module = importlib.reload(llm_manager)
         self.agent_core_module = importlib.reload(agent_core)
         self.agent = self.agent_core_module.AgentCore()
+        self.agent.cognitive.extract_keywords = lambda text, limit=5: [f"kw{i}" for i in range(1, min(limit, 5) + 1)]
 
     def tearDown(self):
         logger = logging.getLogger("llm_brain.llm")
@@ -1577,7 +1749,7 @@ class AgentIntegrationFlowTests(unittest.TestCase):
         self.assertEqual(summary["status"], "completed")
         self.assertEqual(summary["latest_stage"], "request_completed")
         self.assertGreaterEqual(summary["snapshot_count"], 5)
-        self.assertGreaterEqual(summary["memory_count"], 2)
+        self.assertGreaterEqual(summary["memory_count"], 1)
         self.assertEqual(summary["final_response"], "weather is sunny")
         self.assertEqual(summary["metrics"]["llm_call_count"], 1)
         self.assertEqual(summary["metrics"]["tool_call_count"], 0)
@@ -1635,12 +1807,12 @@ class AgentIntegrationFlowTests(unittest.TestCase):
 
         self.assertEqual(result, "Please confirm whether to query local or remote host.")
         self.assertIsNotNone(summary)
-        self.assertEqual(summary["status"], "blocked")
-        self.assertTrue(summary["blocked"])
-        self.assertEqual(summary["latest_stage"], "agent_blocked")
+        self.assertEqual(summary["status"], "waiting_user")
+        self.assertFalse(summary["blocked"])
+        self.assertEqual(summary["latest_stage"], "agent_waiting_user")
         self.assertEqual(summary["final_response"], "Please confirm whether to query local or remote host.")
         self.assertEqual(summary["metrics"]["reflection_failure_count"], 1)
-        self.assertEqual(summary["metrics"]["blocked_rate"], 1.0)
+        self.assertEqual(summary["metrics"]["waiting_user_rate"], 1.0)
 
     def test_invoke_blocked_path_rewrites_tool_capability_error_into_user_fallback(self):
         class ToolLimitedLLM:
@@ -1678,7 +1850,7 @@ class AgentIntegrationFlowTests(unittest.TestCase):
         self.assertNotIn("<function-call>", result)
         self.assertNotIn('/workspace', result)
         self.assertIsNotNone(summary)
-        self.assertEqual(summary["status"], "blocked")
+        self.assertEqual(summary["status"], "waiting_user")
         self.assertEqual(summary["final_response"], result)
 
     def test_recent_request_summaries_returns_latest_requests_first(self):
@@ -1702,7 +1874,7 @@ class AgentIntegrationFlowTests(unittest.TestCase):
         recent = self.agent.get_recent_request_summaries(limit=2)
 
         self.assertEqual(len(recent), 2)
-        self.assertEqual(recent[0]["status"], "blocked")
+        self.assertEqual(recent[0]["status"], "waiting_user")
         self.assertEqual(recent[1]["status"], "completed")
 
     def test_command_like_input_bypasses_intent_rewrite(self):
@@ -1721,7 +1893,7 @@ class AgentIntegrationFlowTests(unittest.TestCase):
         self.agent.cognitive.determine_domain = lambda text: "general"
         observed_queries = []
 
-        def fake_split_task(text, thinking_mode=False):
+        def fake_split_task(text, thinking_mode=False, capability_context=None):
             observed_queries.append(text)
             return [{"id": 1, "description": text, "expected_outcome": "return a direct answer"}]
 
@@ -1741,7 +1913,8 @@ class AgentIntegrationFlowTests(unittest.TestCase):
         summary = self.agent.get_request_summary(request_id)
 
         self.assertEqual(result, "command passthrough")
-        self.assertEqual(observed_queries, ["/exit"])
+        self.assertTrue(observed_queries)
+        self.assertTrue(all(item == "/exit" for item in observed_queries))
         self.assertEqual(summary["status"], "completed")
 
     def test_intent_rewrite_replaces_execution_input(self):
@@ -1782,6 +1955,217 @@ class AgentIntegrationFlowTests(unittest.TestCase):
 
         self.assertEqual(result, "找到了")
 
+    def test_initial_planning_passes_registered_capabilities_to_planner(self):
+        @tool
+        def get_hostname() -> str:
+            """Get the local hostname."""
+            return "thething"
+
+        class FakeLLM:
+            def bind_tools(self, tools):
+                return self
+
+            def invoke(self, payload):
+                return AIMessage(content="hostname is thething")
+
+        captured = {}
+        self.agent.add_tool(get_hostname)
+        self.agent.cognitive.rewrite_intent = lambda text: text
+        self.agent.cognitive.extract_features = lambda text, domain_hint="": (["主机", "名称"], "hostname summary")
+        self.agent.cognitive.determine_domain = lambda text: "计算机"
+
+        def fake_split_task(text, thinking_mode=False, capability_context=None):
+            captured["text"] = text
+            captured["thinking_mode"] = thinking_mode
+            captured["capability_context"] = capability_context
+            return [{"id": 1, "description": "query hostname", "expected_outcome": "return hostname"}]
+
+        self.agent.planner.split_task = fake_split_task
+        self.agent.reflector.verify_and_reflect = lambda desc, expected, actual: (True, "verified", "continue")
+        self.agent.skills.assign_capabilities_to_task = lambda desc, kws: {
+            "prompt_skill": None,
+            "prompt_skill_reason": "",
+            "tool_skills": [],
+            "tool_reasons": [],
+            "tools": [],
+        }
+        self.llm_manager_module.llm_manager.get_llm = lambda: FakeLLM()
+
+        result = self.agent.invoke("查询一下主机名称")
+
+        self.assertEqual(result, "hostname is thething")
+        self.assertEqual(captured["text"], "查询一下主机名称")
+        self.assertFalse(captured["thinking_mode"])
+        self.assertIsInstance(captured["capability_context"], dict)
+        self.assertTrue(any(item.get("name") == "get_hostname" for item in captured["capability_context"].get("tools", [])))
+        self.assertIn("planning_policy", captured["capability_context"])
+
+    def test_intent_rewrite_prompt_preserves_scope_constraints(self):
+        from cognitive import feature_extractor as feature_extractor_module
+
+        captured = {}
+        original_invoke = feature_extractor_module.llm_manager.invoke
+
+        def fake_invoke(prompt, source=""):
+            captured["prompt"] = prompt
+            captured["source"] = source
+            return type("Response", (), {"content": "当前工作目录下查找 core.py 文件的位置"})()
+
+        try:
+            feature_extractor_module.llm_manager.invoke = fake_invoke
+            system = feature_extractor_module.CognitiveSystem()
+            rewritten = system.rewrite_intent("当前工作目录下找一下 core.py 文件的位置")
+        finally:
+            feature_extractor_module.llm_manager.invoke = original_invoke
+
+        self.assertEqual(rewritten, "当前工作目录下查找 core.py 文件的位置")
+        self.assertEqual(captured["source"], "feature_extractor.rewrite_intent")
+        self.assertIn("前置条件", captured["prompt"])
+        self.assertIn("作用域限定", captured["prompt"])
+        self.assertIn("当前目录/当前工作区/当前文件/当前分支/当前环境/已选中内容", captured["prompt"])
+
+    def test_keyword_extraction_prompt_allows_semantic_phrases(self):
+        from cognitive import feature_extractor as feature_extractor_module
+
+        captured = {}
+        original_invoke = feature_extractor_module.llm_manager.invoke
+
+        def fake_invoke(prompt, source=""):
+            captured["prompt"] = prompt
+            captured["source"] = source
+            return type("Response", (), {"content": '{"keywords": ["获取", "完整路径", "当前目录", "core.py"]}'})()
+
+        try:
+            feature_extractor_module.llm_manager.invoke = fake_invoke
+            system = feature_extractor_module.CognitiveSystem()
+            keywords = system.extract_keywords("获取当前目录下core.py文件的完整路径", limit=5)
+        finally:
+            feature_extractor_module.llm_manager.invoke = original_invoke
+
+        self.assertEqual(keywords[:4], ["获取", "完整路径", "当前目录", "core.py"])
+        self.assertEqual(captured["source"], "feature_extractor.extract_keywords")
+        self.assertIn("有语义的词或短语", captured["prompt"])
+        self.assertIn("允许使用更精炼但不改变原意的表达", captured["prompt"])
+        self.assertIn("文件名、路径范围、环境范围", captured["prompt"])
+
+    def test_blocked_request_skips_global_feature_and_domain_extraction(self):
+        class ClarifyingLLM:
+            def bind_tools(self, tools):
+                return self
+
+            def invoke(self, payload):
+                return AIMessage(content="Need more details.")
+
+        def should_not_extract(*args, **kwargs):
+            raise AssertionError("blocked request should not run deferred metadata extraction")
+
+        self.agent.cognitive.rewrite_intent = lambda text: text
+        self.agent.cognitive.extract_features = should_not_extract
+        self.agent.cognitive.determine_domain = should_not_extract
+        self.agent.planner.split_task = lambda text, thinking_mode=False: [
+            {"id": 1, "description": "collect booking details", "expected_outcome": "booking details collected"}
+        ]
+        self.agent.reflector.verify_and_reflect = lambda desc, expected, actual: (False, "missing inputs", "ask_user")
+        self.agent.skills.assign_capabilities_to_task = lambda desc, kws: {
+            "prompt_skill": None,
+            "prompt_skill_reason": "",
+            "tool_skills": [],
+            "tool_reasons": [],
+            "tools": [],
+        }
+        self.llm_manager_module.llm_manager.get_llm = lambda: ClarifyingLLM()
+
+        result = self.agent.invoke("book something for me")
+        request_id = self.agent.get_last_request_id()
+        summary = self.agent.get_request_summary(request_id)
+
+        self.assertEqual(result, "Need more details.")
+        self.assertIsNotNone(summary)
+        self.assertEqual(summary["status"], "waiting_user")
+
+    def test_successful_request_extracts_metadata_only_after_completion(self):
+        class FakeLLM:
+            def bind_tools(self, tools):
+                return self
+
+            def invoke(self, payload):
+                return AIMessage(content="weather is sunny")
+
+        feature_calls = []
+        domain_calls = []
+
+        def fake_extract_features(text, domain_hint=""):
+            feature_calls.append((text, domain_hint))
+            return ["天气", "北京"], "北京天气查询"
+
+        def fake_determine_domain(text):
+            domain_calls.append(text)
+            return "科学"
+
+        self.agent.cognitive.rewrite_intent = lambda text: "查询北京天气"
+        self.agent.cognitive.extract_features = fake_extract_features
+        self.agent.cognitive.determine_domain = fake_determine_domain
+        self.agent.planner.split_task = lambda text, thinking_mode=False: [
+            {"id": 1, "description": "check weather in beijing", "expected_outcome": "provide the weather"}
+        ]
+        self.agent.reflector.verify_and_reflect = lambda desc, expected, actual: (True, "verified", "continue")
+        self.agent.skills.assign_capabilities_to_task = lambda desc, kws: {
+            "prompt_skill": None,
+            "prompt_skill_reason": "",
+            "tool_skills": [],
+            "tool_reasons": [],
+            "tools": [],
+        }
+        self.llm_manager_module.llm_manager.get_llm = lambda: FakeLLM()
+
+        result = self.agent.invoke("帮我看下北京天气")
+        request_id = self.agent.get_last_request_id()
+        summary = self.agent.get_request_summary(request_id)
+
+        self.assertEqual(result, "weather is sunny")
+        self.assertEqual(domain_calls, ["查询北京天气"])
+        self.assertEqual(feature_calls, [("查询北京天气", "科学")])
+        self.assertIsNotNone(summary)
+        self.assertEqual(summary["status"], "completed")
+        self.assertEqual(summary["memories"][0]["summary"], "北京天气查询")
+        self.assertEqual(summary["memories"][0]["keywords"], ["天气", "北京"])
+
+    def test_bash_prompt_includes_windows_powershell_environment_guidance(self):
+        class InspectingLLM:
+            def __init__(self, test_case):
+                self.test_case = test_case
+
+            def bind_tools(self, tools):
+                return self
+
+            def invoke(self, payload):
+                self.test_case.assertIsInstance(payload[-1], HumanMessage)
+                self.test_case.assertIn("OS: Windows", payload[-1].content)
+                self.test_case.assertIn("终端: PowerShell", payload[-1].content)
+                self.test_case.assertIn("Get-ChildItem、dir /s、where、findstr", payload[-1].content)
+                self.test_case.assertIn("不要生成 powershell -Command、pwsh -Command、cmd /c", payload[-1].content)
+                return AIMessage(content="done")
+
+        self.agent.cognitive.rewrite_intent = lambda text: text
+        self.agent.cognitive.extract_features = lambda text, domain_hint="": (["文件", "搜索"], "文件搜索")
+        self.agent.cognitive.determine_domain = lambda text: "计算机"
+        self.agent.planner.split_task = lambda text, thinking_mode=False: [
+            {"id": 1, "description": "查找 core.py 文件", "expected_outcome": "返回路径"}
+        ]
+        self.agent.reflector.verify_and_reflect = lambda desc, expected, actual: (True, "verified", "continue")
+        self.agent.skills.assign_capabilities_to_task = lambda desc, kws: {
+            "prompt_skill": None,
+            "prompt_skill_reason": "",
+            "tool_skills": [],
+            "tool_reasons": [],
+            "tools": [],
+        }
+        self.llm_manager_module.llm_manager.get_llm = lambda: InspectingLLM(self)
+
+        result = self.agent.invoke("当前工作目录下找 core.py")
+
+        self.assertEqual(result, "done")
+
     def test_replanned_subtask_resets_execution_history_before_new_dispatch(self):
         class InspectingLLM:
             def __init__(self, test_case):
@@ -1805,7 +2189,7 @@ class AgentIntegrationFlowTests(unittest.TestCase):
                     return AIMessage(content="found core.py")
                 return AIMessage(content="done")
 
-        def fake_split_task(text, thinking_mode=False):
+        def fake_split_task(text, thinking_mode=False, capability_context=None):
             if "失败的子任务" in text or "规划目标" in text or "replan" in text.lower():
                 return [{"id": 1, "description": "使用更安全的方式查找 core.py 文件", "expected_outcome": "返回完整路径"}]
             return [{"id": 1, "description": "先走失败路径查找 core.py 文件", "expected_outcome": "返回完整路径"}]
@@ -1885,7 +2269,7 @@ class AgentIntegrationFlowTests(unittest.TestCase):
         result = self.agent.invoke("query hostname")
 
         self.assertEqual(result, "hostname is thething")
-        self.assertEqual(feature_calls.count("resolve hostname"), 1)
+        self.assertEqual(feature_calls.count("resolve hostname"), 0)
 
     def test_retry_path_can_replan_subtask_and_complete(self):
         class SequencedLLM:
@@ -1902,15 +2286,15 @@ class AgentIntegrationFlowTests(unittest.TestCase):
             def invoke(self, payload):
                 return AIMessage(content=next(self.responses))
 
-        def fake_split_task(text, thinking_mode=False):
+        def fake_split_task(text, thinking_mode=False, capability_context=None):
             lowered = text.lower()
             if "replan the failed subtask" in lowered or "replan" in lowered or "重新规划" in text:
                 return [
-                    {"id": 1, "description": "collect missing input", "expected_outcome": "required input collected"},
-                    {"id": 2, "description": "execute safer action", "expected_outcome": "stable result produced"},
+                    {"id": 1, "description": "collect missing input", "execution_mode": "leaf"},
+                    {"id": 2, "description": "execute safer action", "execution_mode": "leaf"},
                 ]
             return [
-                {"id": 1, "description": "perform unstable action", "expected_outcome": "stable result produced"}
+                {"id": 1, "description": "perform unstable action", "execution_mode": "leaf"}
             ]
 
         def fake_reflect(desc, expected, actual):
@@ -1940,9 +2324,10 @@ class AgentIntegrationFlowTests(unittest.TestCase):
         self.assertIsNotNone(summary)
         self.assertEqual(summary["status"], "completed")
         self.assertEqual(summary["metrics"]["reflection_failure_count"], 1)
-        self.assertTrue(any(item.get("stage") == "subtask_replanned" for item in summary["checkpoints"]))
+        replanned_events = [item for item in summary["checkpoints"] if item.get("stage") == "subtask_replanned"]
+        self.assertEqual(len(replanned_events), 2)
 
-    def test_tool_call_continuation_does_not_append_human_message_after_tool_result(self):
+    def test_tool_call_continuation_appends_chinese_guidance_after_tool_result(self):
         @tool
         def get_hostname() -> str:
             """Get the local hostname."""
@@ -1964,8 +2349,10 @@ class AgentIntegrationFlowTests(unittest.TestCase):
                         tool_calls=[{"name": "get_hostname", "args": {}, "id": "call_1", "type": "tool_call"}],
                     )
 
-                self.test_case.assertIsInstance(payload[-1], ToolMessage)
-                self.test_case.assertNotIsInstance(payload[-1], HumanMessage)
+                self.test_case.assertIsInstance(payload[-2], ToolMessage)
+                self.test_case.assertIsInstance(payload[-1], HumanMessage)
+                self.test_case.assertIn("必须使用中文", payload[-1].content)
+                self.test_case.assertIn("不要无依据切换到英文", payload[-1].content)
                 return AIMessage(content="hostname is thething")
 
         self.agent.add_tool(get_hostname)
@@ -1989,6 +2376,63 @@ class AgentIntegrationFlowTests(unittest.TestCase):
         result = self.agent.invoke("query hostname")
 
         self.assertEqual(result, "hostname is thething")
+        self.assertEqual(len(llm.calls), 2)
+
+    def test_tool_call_continuation_appends_retry_guidance_after_no_output_failure(self):
+        @tool
+        def get_hostname() -> str:
+            """Get the local hostname."""
+            return {
+                "ok": False,
+                "tool": "get_hostname",
+                "error_type": "no_output",
+                "retryable": True,
+                "message": "command succeeded but produced no output",
+            }
+
+        class ToolCallingLLM:
+            def __init__(self):
+                self.calls = []
+
+            def bind_tools(self, tools):
+                return self
+
+            def invoke(self, payload):
+                self.calls.append(payload)
+                if len(self.calls) == 1:
+                    self.test_case.assertIsInstance(payload[-1], HumanMessage)
+                    return AIMessage(
+                        content="",
+                        tool_calls=[{"name": "get_hostname", "args": {}, "id": "call_1", "type": "tool_call"}],
+                    )
+
+                self.test_case.assertIsInstance(payload[-2], ToolMessage)
+                self.test_case.assertIsInstance(payload[-1], HumanMessage)
+                self.test_case.assertIn("重新选择一个能直接输出证据的命令", payload[-1].content)
+                self.test_case.assertIn("不要根据退出码或上下文臆测结果", payload[-1].content)
+                return AIMessage(content="未找到可验证结果")
+
+        self.agent.add_tool(get_hostname)
+        llm = ToolCallingLLM()
+        llm.test_case = self
+        self.agent.cognitive.extract_features = lambda text: (["hostname", "name"], "hostname summary")
+        self.agent.cognitive.determine_domain = lambda text: "computer"
+        self.agent.planner.split_task = lambda text, thinking_mode=False: [
+            {"id": 1, "description": "query hostname", "expected_outcome": "return hostname"}
+        ]
+        self.agent.reflector.verify_and_reflect = lambda desc, expected, actual: (True, "verified", "continue")
+        self.agent.skills.assign_capabilities_to_task = lambda desc, kws: {
+            "prompt_skill": None,
+            "prompt_skill_reason": "",
+            "tool_skills": [{"name": "get_hostname", "tool": next(tool for tool in self.agent.tools if getattr(tool, "name", "") == "get_hostname"), "description": "Get the local hostname.", "route_reason": "matched hostname", "overlap_count": 2, "match_ratio": 1.0}],
+            "tool_reasons": ["matched hostname"],
+            "tools": [next(tool for tool in self.agent.tools if getattr(tool, "name", "") == "get_hostname")],
+        }
+        self.llm_manager_module.llm_manager.get_llm = lambda: llm
+
+        result = self.agent.invoke("query hostname")
+
+        self.assertEqual(result, "未找到可验证结果")
         self.assertEqual(len(llm.calls), 2)
 
     def test_builtin_terminal_tool_is_appended_to_bound_tools_but_not_routed_tool_skills(self):
@@ -2075,13 +2519,13 @@ class AgentIntegrationFlowTests(unittest.TestCase):
         finally:
             config.request_timeout_seconds = original_request_timeout
 
-    def test_empty_llm_response_with_single_selected_tool_synthesizes_tool_call(self):
+    def test_empty_llm_response_surfaces_explicit_diagnostic_instead_of_synthesizing_tool_call(self):
         @tool
         def get_hostname() -> str:
             """Get the local hostname."""
             return "thething"
 
-        class EmptyThenAnswerLLM:
+        class EmptyLLM:
             def __init__(self):
                 self.calls = []
 
@@ -2090,15 +2534,11 @@ class AgentIntegrationFlowTests(unittest.TestCase):
 
             def invoke(self, payload):
                 self.calls.append(payload)
-                if len(self.calls) == 1:
-                    self.test_case.assertIsInstance(payload[-1], HumanMessage)
-                    return AIMessage(content="")
-
-                self.test_case.assertIsInstance(payload[-1], ToolMessage)
-                return AIMessage(content="hostname is thething")
+                self.test_case.assertIsInstance(payload[-1], HumanMessage)
+                return AIMessage(content="")
 
         self.agent.add_tool(get_hostname)
-        llm = EmptyThenAnswerLLM()
+        llm = EmptyLLM()
         llm.test_case = self
         selected_tool = next(tool for tool in self.agent.tools if getattr(tool, "name", "") == "get_hostname")
         self.agent.cognitive.extract_features = lambda text: (["hostname", "name"], "hostname summary")
@@ -2118,8 +2558,8 @@ class AgentIntegrationFlowTests(unittest.TestCase):
 
         result = self.agent.invoke("query hostname")
 
-        self.assertEqual(result, "hostname is thething")
-        self.assertEqual(len(llm.calls), 2)
+        self.assertIn("模型本轮没有返回任何可执行内容", result)
+        self.assertEqual(len(llm.calls), 1)
 
 
 if __name__ == "__main__":

@@ -202,6 +202,194 @@ class LLMLogging:
             return events[-limit:]
         return events
 
+    def _format_console_details(self, details: str, max_chars: int = 160) -> str:
+        raw = str(details or "").strip()
+        if not raw:
+            return ""
+        if "\n" in raw:
+            lines = []
+            for index, line in enumerate(raw.splitlines()):
+                normalized_line = re.sub(r"\s+", " ", str(line or "").strip())
+                if not normalized_line:
+                    continue
+                if len(normalized_line) > max_chars:
+                    normalized_line = normalized_line[: max(1, max_chars - 3)].rstrip() + "..."
+                lines.append(normalized_line if index == 0 else f"  {normalized_line}")
+            return "\n".join(lines)
+        normalized = re.sub(r"\s+", " ", raw)
+        if len(normalized) <= max_chars:
+            return normalized
+        return normalized[: max(1, max_chars - 3)].rstrip() + "..."
+
+    def _parse_detail_fields(self, details: str) -> dict[str, str]:
+        fields: dict[str, str] = {}
+        for part in str(details or "").split("|"):
+            item = str(part or "").strip()
+            if not item or "=" not in item:
+                continue
+            key, value = item.split("=", 1)
+            normalized_key = str(key or "").strip()
+            normalized_value = str(value or "").strip()
+            if normalized_key:
+                fields[normalized_key] = normalized_value
+        return fields
+
+    def _summarize_console_details(self, stage: str, details: str) -> str:
+        normalized_stage = str(stage or "").strip().lower()
+        fields = self._parse_detail_fields(details)
+
+        if normalized_stage == "planning_started":
+            session_id = fields.get("session_id", "")
+            return f"会话={session_id}" if session_id else details
+
+        if normalized_stage == "planning_completed":
+            parts = []
+            if fields.get("subtask_count"):
+                parts.append(f"计划={fields['subtask_count']}步")
+            if fields.get("domain"):
+                parts.append(f"领域={fields['domain']}")
+            if fields.get("mode"):
+                parts.append(f"模式={fields['mode']}")
+            summary_line = " | ".join(parts) or details
+            plan_preview = fields.get("plan_preview", "")
+            if plan_preview:
+                plan_lines = [item.strip() for item in plan_preview.split("||") if item.strip()]
+                if plan_lines:
+                    return summary_line + "\n" + "\n".join(f"- {item}" for item in plan_lines)
+            return summary_line
+
+        if normalized_stage == "subtask_started":
+            index = fields.get("index", "")
+            description = fields.get("description", "")
+            mode = fields.get("mode", "")
+            mode = fields.get("mode", "")
+            parts = []
+            if index and description:
+                parts.append(f"子任务{index}: {description}")
+            elif index:
+                parts.append(f"子任务{index}")
+            elif description:
+                parts.append(description)
+            if mode:
+                parts.append(f"模式={mode}")
+            summary_line = " | ".join(parts) or details
+            return summary_line
+
+        if normalized_stage == "subtask_llm_dispatch":
+            parts = []
+            if fields.get("index"):
+                parts.append(f"子任务{fields['index']}")
+            if fields.get("tool_count"):
+                parts.append(f"工具数={fields['tool_count']}")
+            after_tool = fields.get("after_tool", "")
+            if after_tool:
+                parts.append("工具续轮" if after_tool.lower() == "true" else "初次调度")
+            if fields.get("mode"):
+                parts.append(f"模式={fields['mode']}")
+            return " | ".join(parts) or details
+
+        if normalized_stage in {"tool_started", "tool_succeeded", "tool_cancelled"}:
+            tool_name = fields.get("tool", "")
+            error_type = fields.get("error_type", "")
+            summary = fields.get("summary", "")
+            parts = [f"工具={tool_name}"] if tool_name else []
+            if error_type:
+                parts.append(f"错误={error_type}")
+            summary_line = " | ".join(parts) or details
+            if summary:
+                return summary_line + f"\n- 结果: {summary}"
+            return summary_line
+
+        if normalized_stage in {"tool_failed", "tool_rejected"}:
+            tool_name = fields.get("tool", "")
+            error_type = fields.get("error_type", "")
+            summary = fields.get("summary", "")
+            parts = []
+            if tool_name:
+                parts.append(f"工具={tool_name}")
+            if error_type:
+                parts.append(f"错误={error_type}")
+            summary_line = " | ".join(parts) or details
+            if summary:
+                return summary_line + f"\n- 详情: {summary}"
+            return summary_line
+
+        if normalized_stage == "tool_detached":
+            parts = []
+            if fields.get("tool"):
+                parts.append(f"工具={fields['tool']}")
+            if fields.get("reason"):
+                parts.append(f"原因={fields['reason']}")
+            if fields.get("tool_run_id"):
+                parts.append(f"run_id={fields['tool_run_id']}")
+            return " | ".join(parts) or details
+
+        if normalized_stage == "tool_reroute_applied":
+            parts = []
+            if fields.get("index"):
+                parts.append(f"子任务{fields['index']}")
+            if fields.get("mode"):
+                parts.append(f"重试策略={fields['mode']}")
+            if fields.get("failed_tools"):
+                parts.append(f"失败工具={fields['failed_tools']}")
+            return " | ".join(parts) or details
+
+        if normalized_stage == "reflection_completed":
+            parts = []
+            if fields.get("index"):
+                parts.append(f"子任务{fields['index']}")
+            if fields.get("success"):
+                parts.append("校验通过" if fields["success"].lower() == "true" else "校验失败")
+            if fields.get("action"):
+                parts.append(f"动作={fields['action']}")
+            summary_line = " | ".join(parts) or details
+            reflection_note = fields.get("reflection", "")
+            if reflection_note:
+                return summary_line + f"\n- 分析: {reflection_note}"
+            return summary_line
+
+        if normalized_stage == "subtask_replanned":
+            parts = []
+            if fields.get("index"):
+                parts.append(f"子任务{fields['index']}")
+            if fields.get("new_subtask_count"):
+                parts.append(f"重规划为{fields['new_subtask_count']}步")
+            return " | ".join(parts) or details
+
+        if normalized_stage == "subtask_advanced":
+            next_index = fields.get("next_index", "")
+            mode = fields.get("mode", "")
+            parts = [f"进入子任务{next_index}"] if next_index else []
+            if mode:
+                parts.append(f"模式={mode}")
+            return " | ".join(parts) or details
+
+        if normalized_stage == "agent_completed":
+            subtask_count = fields.get("subtask_count", "")
+            mode = fields.get("mode", "")
+            parts = [f"完成{subtask_count}个子任务"] if subtask_count else []
+            if mode:
+                parts.append(f"模式={mode}")
+            return " | ".join(parts) or details
+
+        if normalized_stage == "agent_blocked":
+            parts = []
+            if fields.get("index"):
+                parts.append(f"阻塞于子任务{fields['index']}")
+            if fields.get("action"):
+                parts.append(f"动作={fields['action']}")
+            return " | ".join(parts) or details
+
+        if normalized_stage == "agent_waiting_user":
+            parts = []
+            if fields.get("index"):
+                parts.append(f"等待用户于子任务{fields['index']}")
+            if fields.get("action"):
+                parts.append(f"动作={fields['action']}")
+            return " | ".join(parts) or details
+
+        return details
+
     def log_event(self, message: str, level: int = logging.INFO, request_id: str | None = None, **fields) -> None:
         self.log_structured_event(
             "text_event",
@@ -213,8 +401,18 @@ class LLMLogging:
             **fields,
         )
 
-    def console_event(self, stage: str, request_id: str | None = None, level: int = logging.INFO) -> None:
-        self._console_logger.log(level, self.runtime.with_request_id(f"stage={stage}", request_id=request_id))
+    def console_event(
+        self,
+        stage: str,
+        request_id: str | None = None,
+        level: int = logging.INFO,
+        details: str = "",
+    ) -> None:
+        message = f"stage={stage}"
+        formatted_details = self._format_console_details(self._summarize_console_details(stage, details))
+        if formatted_details:
+            message += f" | {formatted_details}"
+        self._console_logger.log(level, self.runtime.with_request_id(message, request_id=request_id))
 
     def log_checkpoint(
         self,
@@ -243,4 +441,4 @@ class LLMLogging:
             **fields,
         )
         if console:
-            self.console_event(stage, request_id=request_id, level=level)
+            self.console_event(stage, request_id=request_id, level=level, details=details)

@@ -49,14 +49,25 @@ def _workspace_root() -> Path:
     return Path(config.resolve_path(".")).resolve()
 
 
-def _resolve_workspace_path(path_value: str | None) -> Path:
+def _resolve_read_path(path_value: str | None) -> Path:
+    candidate = Path(path_value or ".")
+    root = _workspace_root()
+    resolved = candidate if candidate.is_absolute() else (root / candidate)
+    return resolved.resolve()
+
+
+def _resolve_write_path(path_value: str | None) -> Path:
     candidate = Path(path_value or ".")
     root = _workspace_root()
     resolved = candidate if candidate.is_absolute() else (root / candidate)
     resolved = resolved.resolve()
-    if resolved == root or root in resolved.parents:
-        return resolved
-    raise ValueError(f"Path is outside workspace root: {resolved}")
+    for allowed_root in [Path(item).resolve() for item in config.list_write_roots()]:
+        if resolved == allowed_root or allowed_root in resolved.parents:
+            return resolved
+    raise ValueError(
+        "Path is outside writable roots: "
+        f"{resolved}. Allowed write roots: {config.list_write_roots()}"
+    )
 
 
 def _safe_eval_node(node: ast.AST) -> float:
@@ -106,9 +117,9 @@ def calculator(expression: str) -> dict[str, Any]:
 
 @tool
 def list_directory(path: str = ".") -> dict[str, Any]:
-    """列出工作区内目录项（安全边界：仅允许工作区内路径）。"""
+    """列出任意本地目录项。相对路径默认相对于工作区；只读，无写副作用。"""
     try:
-        resolved = _resolve_workspace_path(path)
+        resolved = _resolve_read_path(path)
     except Exception as exc:
         return {"ok": False, "path": path, "error": str(exc)}
 
@@ -136,9 +147,9 @@ def list_directory(path: str = ".") -> dict[str, Any]:
 
 @tool
 def read_text_file(path: str, start_line: int = 1, end_line: int = 200) -> dict[str, Any]:
-    """读取工作区内 UTF-8 文本文件的指定行范围。"""
+    """读取任意本地 UTF-8 文本文件的指定行范围。相对路径默认相对于工作区。"""
     try:
-        resolved = _resolve_workspace_path(path)
+        resolved = _resolve_read_path(path)
     except Exception as exc:
         return {"ok": False, "path": path, "error": str(exc)}
 
@@ -175,12 +186,12 @@ def read_text_file(path: str, start_line: int = 1, end_line: int = 200) -> dict[
 
 @tool
 def grep_text(query: str, path: str = ".", max_results: int = 20) -> dict[str, Any]:
-    """在工作区内递归搜索文本，返回匹配文件与行号。"""
+    """在任意本地路径递归搜索文本，返回匹配文件与行号。相对路径默认相对于工作区。"""
     if not query:
         return {"ok": False, "error": "query must be non-empty"}
 
     try:
-        resolved_root = _resolve_workspace_path(path)
+        resolved_root = _resolve_read_path(path)
     except Exception as exc:
         return {"ok": False, "path": path, "error": str(exc)}
 
@@ -217,9 +228,9 @@ def grep_text(query: str, path: str = ".", max_results: int = 20) -> dict[str, A
 
 @tool
 def write_text_file(path: str, content: str, overwrite: bool = False, append: bool = False) -> dict[str, Any]:
-    """在工作区内写入 UTF-8 文本文件。默认不覆盖已存在文件，可选 append。"""
+    """写入 UTF-8 文本文件。默认允许工作区内写入；可通过 CLI 临时授权额外目录。"""
     try:
-        resolved = _resolve_workspace_path(path)
+        resolved = _resolve_write_path(path)
     except Exception as exc:
         return {"ok": False, "path": path, "error": str(exc)}
 
@@ -251,9 +262,9 @@ def write_text_file(path: str, content: str, overwrite: bool = False, append: bo
 
 @tool
 def json_query(path: str, key_path: str = "") -> dict[str, Any]:
-    """读取工作区内 JSON 文件并按 key_path 提取字段（例如: user.profile.name 或 items.0.id）。"""
+    """读取任意本地 JSON 文件并按 key_path 提取字段（例如: user.profile.name 或 items.0.id）。"""
     try:
-        resolved = _resolve_workspace_path(path)
+        resolved = _resolve_read_path(path)
     except Exception as exc:
         return {"ok": False, "path": path, "error": str(exc)}
 

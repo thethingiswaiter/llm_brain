@@ -61,6 +61,7 @@ class AppConfig:
             r"^(谢谢|感谢|辛苦了|thx|thanks)[!！。\\s]*$",
         ]
         self.intent_rewrite_enabled = True
+        self.extra_write_roots: list[str] = []
         self.llm_config = LLMConfig()
         self._load_config()
 
@@ -68,6 +69,36 @@ class AppConfig:
         if os.path.isabs(path):
             return path
         return os.path.abspath(os.path.join(self.base_dir, path))
+
+    def _normalize_root_path(self, path: str) -> str:
+        resolved = self.resolve_path(path)
+        return os.path.abspath(resolved)
+
+    def list_write_roots(self) -> list[str]:
+        roots = [self.resolve_path(".")]
+        for item in self.extra_write_roots:
+            normalized = self._normalize_root_path(str(item))
+            if normalized not in roots:
+                roots.append(normalized)
+        return roots
+
+    def grant_write_root(self, path: str) -> str:
+        normalized = self._normalize_root_path(path)
+        if normalized == self.resolve_path("."):
+            return normalized
+        if normalized not in self.extra_write_roots:
+            self.extra_write_roots.append(normalized)
+        return normalized
+
+    def revoke_write_root(self, path: str) -> bool:
+        normalized = self._normalize_root_path(path)
+        if normalized in self.extra_write_roots:
+            self.extra_write_roots.remove(normalized)
+            return True
+        return False
+
+    def clear_write_roots(self) -> None:
+        self.extra_write_roots = []
 
     @staticmethod
     def _get_nested(data: Dict, path: str, default=None):
@@ -286,6 +317,21 @@ class AppConfig:
                     True,
                 )
             )
+            configured_write_roots = self._read_value(
+                data,
+                "tools.write.extra_roots",
+                "extra_write_roots",
+                [],
+            )
+            if isinstance(configured_write_roots, list):
+                self.extra_write_roots = []
+                for item in configured_write_roots:
+                    value = str(item or "").strip()
+                    if not value:
+                        continue
+                    normalized = self._normalize_root_path(value)
+                    if normalized not in self.extra_write_roots and normalized != self.resolve_path("."):
+                        self.extra_write_roots.append(normalized)
             
             # Load default model
             if self.default_model_key in self.models_config:

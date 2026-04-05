@@ -1,5 +1,6 @@
 import sys
 from pathlib import Path
+import logging
 
 # Keep direct-file execution working, but prefer the root-level main.py entry.
 if __package__ is None or __package__ == "":
@@ -86,6 +87,37 @@ def _remember_cli_input(session_state: dict[str, object], user_input: str) -> No
     session_state["recent_inputs"] = history[-20:]
 
 
+def _install_terminal_stage_bridge(ui: TerminalUI, llm_manager_instance) -> None:
+    logging_facade = getattr(llm_manager_instance, "logging", None)
+    if logging_facade is None:
+        return
+    if getattr(logging_facade, "_terminal_cli_bridge_installed", False):
+        return
+
+    original_console_event = logging_facade.console_event
+
+    def bridged_console_event(
+        stage: str,
+        request_id: str | None = None,
+        level: int = logging.INFO,
+        details: str = "",
+    ) -> None:
+        if str(stage or "").strip().lower() == "tool_started":
+            return
+        normalized_details = str(details or "")
+        summarize = getattr(logging_facade, "_summarize_console_details", None)
+        format_details = getattr(logging_facade, "_format_console_details", None)
+        if callable(summarize):
+            normalized_details = summarize(stage, normalized_details)
+        if callable(format_details):
+            normalized_details = format_details(normalized_details)
+        ui.render_stage_event(stage, request_id=request_id or "", level=level, details=normalized_details)
+
+    logging_facade._original_terminal_console_event = original_console_event
+    logging_facade.console_event = bridged_console_event
+    logging_facade._terminal_cli_bridge_installed = True
+
+
 def start_cli(input_func=input, output_func=print, agent_instance=agent, llm_manager_instance=llm_manager):
     session_state = {"session_id": agent_instance.start_session(), "recent_inputs": []}
     commands, command_order = build_commands()
@@ -99,6 +131,7 @@ def start_cli(input_func=input, output_func=print, agent_instance=agent, llm_man
         "commands": commands,
         "command_order": command_order,
     }
+    _install_terminal_stage_bridge(ui, llm_manager_instance)
     ui.render_welcome(session_state["session_id"])
     while True:
         try:

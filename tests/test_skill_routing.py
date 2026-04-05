@@ -179,6 +179,17 @@ class SkillRoutingTests(unittest.TestCase):
 
         self.assertEqual(matched, [])
 
+    def test_planning_capability_context_exposes_tool_constraints(self):
+        list_tool = FakeTool("list_directory", "列出工作区内目录项（安全边界：仅允许工作区内路径）。")
+        self.manager.register_tool(list_tool)
+
+        context = self.manager.get_planning_capability_context()
+        tool_map = {item["name"]: item for item in context["tools"]}
+
+        self.assertIn("list_directory", tool_map)
+        self.assertTrue(tool_map["list_directory"]["constraints"])
+        self.assertIn("仅允许工作区内路径", " ".join(tool_map["list_directory"]["constraints"]))
+
 
 if __name__ == "__main__":
     unittest.main()

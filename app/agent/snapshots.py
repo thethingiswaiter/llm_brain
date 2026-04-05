@@ -12,8 +12,8 @@ from cognitive.feature_extractor import DEFAULT_DOMAIN_LABEL
 from core.llm.manager import llm_manager
 
 
-SNAPSHOT_SCHEMA_VERSION = 1
-SUPPORTED_SNAPSHOT_SCHEMA_VERSIONS = {0, SNAPSHOT_SCHEMA_VERSION}
+SNAPSHOT_SCHEMA_VERSION = 2
+SUPPORTED_SNAPSHOT_SCHEMA_VERSIONS = {0, 1, SNAPSHOT_SCHEMA_VERSION}
 
 
 class AgentSnapshotStore:
@@ -67,6 +67,7 @@ class AgentSnapshotStore:
             "retry_counts": state.get("retry_counts", {}),
             "replan_counts": state.get("replan_counts", {}),
             "blocked": state.get("blocked", False),
+            "waiting_for_user": state.get("waiting_for_user", False),
             "final_response": state.get("final_response", ""),
             "messages": [self.serialize_message(message) for message in messages],
         }
@@ -83,7 +84,7 @@ class AgentSnapshotStore:
                 {
                     "id": item.get("id", index),
                     "description": str(item.get("description", "")).strip(),
-                    "expected_outcome": str(item.get("expected_outcome", "")).strip(),
+                    "execution_mode": str(item.get("execution_mode", "leaf") or "leaf").strip() or "leaf",
                 }
             )
         return normalized_plan
@@ -182,10 +183,11 @@ class AgentSnapshotStore:
         state["domain_label"] = str(state.get("domain_label", DEFAULT_DOMAIN_LABEL) or DEFAULT_DOMAIN_LABEL)
         state["final_response"] = str(state.get("final_response", "") or "")
         state["blocked"] = bool(state.get("blocked", False))
+        state["waiting_for_user"] = bool(state.get("waiting_for_user", False))
 
-        if schema_version == 0:
+        if schema_version in {0, 1}:
             migrated["schema_version"] = SNAPSHOT_SCHEMA_VERSION
-            migrated["migrated_from_version"] = 0
+            migrated["migrated_from_version"] = schema_version
             if migration_notes:
                 migrated["migration_notes"] = migration_notes
 
@@ -336,6 +338,7 @@ class AgentSnapshotStore:
             "session_memory_id": int,
             "domain_label": str,
             "blocked": bool,
+            "waiting_for_user": bool,
             "final_response": str,
         }
         for field_name, expected_type in scalar_expectations.items():
@@ -357,21 +360,24 @@ class AgentSnapshotStore:
             if not isinstance(plan_item, dict):
                 return False, "Snapshot plan entries must be JSON objects."
             description = plan_item.get("description", "")
-            expected_outcome = plan_item.get("expected_outcome", "")
+            execution_mode = str(plan_item.get("execution_mode", "leaf") or "leaf").strip().lower()
             if not isinstance(description, str) or not description.strip():
                 return False, "Snapshot plan entry description is missing or invalid."
-            if not isinstance(expected_outcome, str):
-                return False, "Snapshot plan entry expected_outcome must be a string."
+            if execution_mode not in {"leaf", "decomposable"}:
+                return False, "Snapshot plan entry execution_mode must be leaf or decomposable."
 
         plan = state.get("plan", [])
         final_response = state.get("final_response", "")
         blocked = state.get("blocked", False)
+        waiting_for_user = state.get("waiting_for_user", False)
         is_terminal_completed = bool(final_response) and current_subtask_index >= len(plan)
-        is_resumable = not blocked and not is_terminal_completed
+        is_resumable = not blocked and not waiting_for_user and not is_terminal_completed
         if is_resumable and not state.get("messages", []):
             return False, "Snapshot does not contain resumable message history."
         if blocked and not final_response:
             return False, "Blocked snapshot must include final_response for terminal state."
+        if waiting_for_user and not final_response:
+            return False, "Waiting-user snapshot must include final_response for terminal state."
         if is_resumable and state.get("messages"):
             first_message_type = str(state["messages"][0].get("type", "")).lower()
             if first_message_type not in {"human", "system"}:
@@ -423,6 +429,7 @@ class AgentSnapshotStore:
             "retry_counts": stored_state.get("retry_counts", {}),
             "replan_counts": stored_state.get("replan_counts", {}),
             "blocked": stored_state.get("blocked", False),
+            "waiting_for_user": stored_state.get("waiting_for_user", False),
             "final_response": stored_state.get("final_response", ""),
         }
 
@@ -545,5 +552,10 @@ class AgentSnapshotStore:
             "retry_counts": {},
             "replan_counts": {},
             "blocked": False,
+            "waiting_for_user": False,
             "final_response": "",
+            "lite_mode": False,
+            "normalized_query": self._extract_resume_query(payload),
+            "subtask_feature_cache": {},
+            "agent_action": "",
         }

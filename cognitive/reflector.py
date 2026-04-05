@@ -1,8 +1,38 @@
 from typing import Dict, Any, Tuple
+import re
 from core.llm.manager import llm_manager
 from cognitive.structured_output import parse_json_object, StructuredOutputError, StructuredOutputSchemaError
 
 class Reflector:
+    def _looks_like_observation_task(self, subtask: str, expected_outcome: str = "") -> bool:
+        combined = f"{subtask}\n{expected_outcome}".lower()
+        markers = [
+            "查看", "读取", "列出", "查询", "显示", "检查", "获取", "内容", "路径", "文件", "目录",
+            "read", "show", "list", "inspect", "query", "content", "path", "file", "directory",
+        ]
+        return any(marker in combined for marker in markers)
+
+    def _looks_like_user_input_is_still_required(self, actual_result: str) -> bool:
+        normalized = str(actual_result or "").lower()
+        markers = [
+            "请补充", "请确认", "请提供", "缺少", "未提供", "参数不足", "需要你", "missing", "need user",
+            "need confirmation", "please provide", "please confirm",
+        ]
+        return any(marker in normalized for marker in markers)
+
+    def _has_concrete_observation(self, actual_result: str) -> bool:
+        normalized = str(actual_result or "").strip()
+        if not normalized:
+            return False
+        if self._looks_like_user_input_is_still_required(normalized):
+            return False
+        evidence_markers = ["如下", "内容", "结果", "显示", "找到", "未找到", "路径", "文件"]
+        if any(marker in normalized for marker in evidence_markers):
+            return True
+        if re.search(r'".+"|`.+`', normalized):
+            return True
+        return len(normalized) >= 12
+
     def verify_and_reflect(self, subtask: str, expected_outcome: str, actual_result: str) -> Tuple[bool, str, str]:
         """
         根据核心需求规范，验证“预测结果”与“实际结果”。
@@ -12,13 +42,19 @@ class Reflector:
             - reflection_note: str (分析原因：特征不足？外部缺失？推演错乱？)
             - action: 'continue', 'retry', 'ask_user'
         """
+        if self._looks_like_observation_task(subtask, expected_outcome) and self._has_concrete_observation(actual_result):
+            return True, "已基于现有工具结果获得可直接返回的观测结果。", "continue"
+
+        expected_section = f"预期结果: {expected_outcome}\n" if str(expected_outcome or "").strip() else ""
         prompt = f"""
         你是一个中文优先的反思与校验代理，负责分析当前子任务是否完成。
         子任务: {subtask}
-        预期结果: {expected_outcome}
-        实际结果: {actual_result}
+        {expected_section}实际结果: {actual_result}
 
-        请判断实际结果是否满足预期结果。
+        请判断实际结果是否已经完成当前子任务。
+        如果提供了预期结果，可以把它作为辅助参考；如果没有预期结果，就直接围绕子任务本身做判断。
+        如果任务本质上只是查看、读取、列出、查询现有信息，只要已经拿到可直接返回给用户的观测结果，就应判定为 success=true、action=continue；
+        即使结果显示目标内容是占位符、为空、未找到或与主观预期不一致，也不要因此改成 ask_user，除非确实缺少用户必须补充的外部信息。
         如果失败，请分析原因，例如信息缺失、参数不足、逻辑错误、工具受限等。
         然后决定下一步动作:
         - "continue" if success or failure is trivial and doesn't block progress.

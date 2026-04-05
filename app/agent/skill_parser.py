@@ -334,10 +334,14 @@ class SkillManager:
             hint_keywords.append(hint)
         keywords = self._normalize_keywords(self._tokenize_text(f"{tool_name} {description}"))
         keywords = self._normalize_keywords(keywords + hint_keywords)
+        argument_schema = self._extract_tool_argument_schema(tool)
+        constraints = self._extract_tool_constraints(description, argument_schema)
         tool_skill = {
             "name": tool_name,
             "description": description,
             "keywords": keywords,
+            "argument_schema": argument_schema,
+            "constraints": constraints,
             "tool": tool,
             "source_type": source_type,
             "source_file": source_file,
@@ -486,4 +490,127 @@ class SkillManager:
             "tool_skills": tool_skills,
             "tools": [item["tool"] for item in tool_skills],
             "tool_reasons": [item.get("route_reason", "") for item in tool_skills],
+        }
+
+    def _serialize_capability_keywords(self, keywords: List[str], limit: int = 8) -> List[str]:
+        serialized: List[str] = []
+        for keyword in keywords:
+            if not isinstance(keyword, str):
+                continue
+            value = keyword.strip()
+            if not value:
+                continue
+            serialized.append(value)
+            if len(serialized) >= limit:
+                break
+        return serialized
+
+    def _extract_tool_argument_schema(self, tool: Any) -> List[Dict[str, Any]]:
+        args_schema = getattr(tool, "args_schema", None)
+        if not args_schema or not hasattr(args_schema, "model_json_schema"):
+            return []
+
+        try:
+            schema = args_schema.model_json_schema()
+        except Exception:
+            return []
+
+        properties = schema.get("properties", {}) or {}
+        required_fields = set(schema.get("required", []) or [])
+        serialized: List[Dict[str, Any]] = []
+        for field_name, field_schema in properties.items():
+            if not isinstance(field_schema, dict):
+                field_schema = {}
+            serialized.append({
+                "name": str(field_name),
+                "type": str(field_schema.get("type", "any") or "any"),
+                "required": field_name in required_fields,
+                "description": str(field_schema.get("description", "") or "").strip(),
+            })
+        return serialized
+
+    def _extract_tool_constraints(self, description: str, argument_schema: List[Dict[str, Any]]) -> List[str]:
+        constraints: List[str] = []
+        seen: set[str] = set()
+
+        description_text = str(description or "").strip()
+        if description_text:
+            fragments = re.split(r"[。；;\n]", description_text)
+            for fragment in fragments:
+                value = str(fragment or "").strip()
+                if not value:
+                    continue
+                lowered = value.lower()
+                if any(marker in lowered for marker in [
+                    "安全边界",
+                    "仅允许",
+                    "只支持",
+                    "默认",
+                    "不可",
+                    "不能",
+                    "must",
+                    "only",
+                    "allow",
+                    "required",
+                    "workspace",
+                ]):
+                    if value not in seen:
+                        seen.add(value)
+                        constraints.append(value)
+
+        required_arguments = [item.get("name", "") for item in argument_schema if item.get("required")]
+        if required_arguments:
+            required_text = "required args: " + ", ".join(str(item) for item in required_arguments if str(item).strip())
+            if required_text not in seen:
+                seen.add(required_text)
+                constraints.append(required_text)
+
+        return constraints[:8]
+
+    def _serialize_capability_args(self, argument_schema: List[Dict[str, Any]], limit: int = 6) -> List[str]:
+        serialized: List[str] = []
+        for item in argument_schema[:limit]:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", "") or "").strip()
+            if not name:
+                continue
+            type_name = str(item.get("type", "any") or "any").strip()
+            requirement = "required" if bool(item.get("required", False)) else "optional"
+            description = str(item.get("description", "") or "").strip()
+            line = f"{name}<{type_name}> {requirement}"
+            if description:
+                line += f": {description}"
+            serialized.append(line)
+        return serialized
+
+    def get_planning_capability_context(self) -> Dict[str, Any]:
+        prompt_skills = []
+        for skill in sorted(self.loaded_skills, key=lambda item: item.get("name", "")):
+            prompt_skills.append({
+                "name": skill.get("name", ""),
+                "description": skill.get("description", ""),
+                "keywords": self._serialize_capability_keywords(skill.get("keywords", [])),
+                "source_file": skill.get("source_file", ""),
+            })
+
+        tools = []
+        for tool_skill in sorted(self.loaded_tool_skills.values(), key=lambda item: item.get("name", "")):
+            tools.append({
+                "name": tool_skill.get("name", ""),
+                "description": tool_skill.get("description", ""),
+                "keywords": self._serialize_capability_keywords(tool_skill.get("keywords", [])),
+                "constraints": self._serialize_capability_keywords(tool_skill.get("constraints", [])),
+                "arguments": self._serialize_capability_args(tool_skill.get("argument_schema", [])),
+                "source_type": tool_skill.get("source_type", ""),
+                "source_file": tool_skill.get("source_file", ""),
+            })
+
+        return {
+            "prompt_skills": prompt_skills,
+            "tools": tools,
+            "planning_policy": (
+                "Plan only against the currently registered prompt skills and tools. "
+                "Task-specific workflows must come from skill/tool descriptions instead of hidden planner heuristics."
+            ),
         }

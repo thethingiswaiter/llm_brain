@@ -44,10 +44,12 @@ class AgentState(TypedDict):
     retry_counts: Dict[str, int]
     replan_counts: Dict[str, int]
     blocked: bool
+    waiting_for_user: bool
     final_response: str
     lite_mode: bool
     normalized_query: str
     subtask_feature_cache: Dict[str, Dict[str, Any]]
+    agent_action: str
 
 class AgentCore:
     def __init__(self, *, auto_load_tools: bool = True, auto_load_mcp: bool = False, build_graph: bool = True):
@@ -219,6 +221,12 @@ class AgentCore:
     def _restore_state_from_snapshot(self, payload: Dict[str, Any], request_id: str) -> Dict[str, Any]:
         return self.snapshot_store.restore_state_from_snapshot(payload, request_id)
 
+    def _normalize_execution_mode(self, value: Any) -> str:
+        normalized = str(value or "").strip().lower()
+        if normalized == "decomposable":
+            return "decomposable"
+        return "leaf"
+
     def _plans_are_meaningfully_different(self, original_plan: List[Dict[str, Any]], candidate_plan: List[Dict[str, Any]]) -> bool:
         if not candidate_plan:
             return False
@@ -231,43 +239,48 @@ class AgentCore:
                 normalized.append(
                     (
                         str(item.get("description", "")).strip().lower(),
-                        str(item.get("expected_outcome", "")).strip().lower(),
+                        self._normalize_execution_mode(item.get("execution_mode", "leaf")),
                     )
                 )
             return normalized
 
         return normalize(original_plan) != normalize(candidate_plan)
 
-    def _replan_subtask_after_failure(
+    def _promote_retry_to_decomposable_subtask(
         self,
         original_request: str,
         current_subtask: Dict[str, Any],
         actual_output: str,
         reflection_note: str,
         recent_tool_failures: List[Dict[str, Any]] | None = None,
-    ) -> List[Dict[str, Any]]:
+    ) -> Dict[str, Any] | None:
         failure_lines = []
         for item in recent_tool_failures or []:
             failure_lines.append(
                 f"- tool={item.get('tool')} | error_type={item.get('error_type')} | retryable={item.get('retryable')} | message={item.get('message')}"
             )
 
-        replan_prompt_sections = [
-            "请将失败的子任务重新规划为更安全、更小粒度的一组子任务。",
+        wrapper_sections = [
+            "请重新规划并完成下面这个失败的子任务，优先补充缺失信息、调整执行顺序，避免重复失败路径。",
             f"原始用户请求: {original_request}",
             f"失败子任务: {current_subtask.get('description', '')}",
-            f"预期结果: {current_subtask.get('expected_outcome', '')}",
+            f"当前执行模式: {self._normalize_execution_mode(current_subtask.get('execution_mode', 'leaf'))}",
             f"实际观察到的输出: {actual_output}",
             f"反思说明: {reflection_note}",
-            "规划目标: 避免重复同样的失败路径，优先考虑补充缺失信息、进一步拆分任务，或切换到更安全的执行顺序。",
+            "规划目标: 先分析失败原因，再拆成更安全、更小粒度的步骤继续执行。",
         ]
         if failure_lines:
-            replan_prompt_sections.append("最近的工具失败记录:\n" + "\n".join(failure_lines))
+            wrapper_sections.append("最近的工具失败记录:\n" + "\n".join(failure_lines))
 
-        replanned = self.planner.split_task("\n\n".join(replan_prompt_sections))
-        if not self._plans_are_meaningfully_different([current_subtask], replanned):
-            return []
-        return replanned
+        wrapper_description = "\n\n".join(wrapper_sections)
+        promoted_subtask = {
+            "id": current_subtask.get("id", 1),
+            "description": wrapper_description,
+            "execution_mode": "decomposable",
+        }
+        if not self._plans_are_meaningfully_different([current_subtask], [promoted_subtask]):
+            return None
+        return promoted_subtask
 
     def _tokenize_text(self, text: str) -> set[str]:
         normalized = text.replace("_", " ").replace("-", " ").lower()
@@ -283,6 +296,275 @@ class AgentCore:
                     for index in range(len(token) - size + 1):
                         expanded_tokens.add(token[index:index + size])
         return expanded_tokens
+
+    def _derive_routing_keywords(self, text: str, limit: int = 5) -> List[str]:
+        source_text = str(text or "").strip()
+        if not source_text or limit <= 0:
+            return []
+
+        try:
+            extracted_keywords = self.cognitive.extract_keywords(source_text, limit=limit)
+        except TypeError:
+            extracted_keywords = self.cognitive.extract_keywords(source_text)
+
+        normalized_keywords = []
+        seen = set()
+        for item in extracted_keywords or []:
+            value = str(item).strip()
+            marker = value.lower()
+            if not value or marker in seen:
+                continue
+            seen.add(marker)
+            normalized_keywords.append(value)
+            if len(normalized_keywords) >= limit:
+                break
+
+        if normalized_keywords:
+            return normalized_keywords[:limit]
+        return []
+
+    def _build_compact_summary(self, text: str, max_chars: int = 80) -> str:
+        normalized = re.sub(r"\s+", " ", str(text or "").strip())
+        if not normalized:
+            return ""
+        if len(normalized) <= max_chars:
+            return normalized
+        return normalized[: max(1, max_chars - 3)].rstrip() + "..."
+
+    def _build_execution_environment_context(self, selected_tools: List[Any]) -> str:
+        selected_tool_names = {
+            str(getattr(tool, "name", "") or "").strip().lower()
+            for tool in (selected_tools or [])
+            if str(getattr(tool, "name", "") or "").strip()
+        }
+        if "bash" not in selected_tool_names:
+            return ""
+        if os.name == "nt":
+            return (
+                "当前运行环境:\n"
+                "- OS: Windows\n"
+                "- 终端: PowerShell\n"
+                "- 生成 bash 工具命令时，优先使用 PowerShell 或 cmd 兼容语法，不要使用仅适用于 Linux/macOS/bash 的命令。\n"
+                "- 不要生成 powershell -Command、pwsh -Command、cmd /c 这类再包一层 shell 的前缀；请直接输出 allowlist 中允许的命令本体。\n"
+                "- 文件搜索优先使用 Windows 兼容命令，例如 Get-ChildItem、dir /s、where、findstr。\n"
+                "- bash 命令必须直接输出可验证结果，不能只依赖 exit code。优先输出完整路径、匹配数量，或明确的未找到标记。\n"
+                "- 例如查找文件时，优先让命令输出 FullName、Resolve-Path 结果，或输出 count=0 这类可验证信号。"
+            )
+        return (
+            "当前运行环境:\n"
+            f"- OS: {os.name}\n"
+            "- 生成终端命令时，请与当前运行环境兼容，不要假设是其他操作系统。\n"
+            "- 终端命令必须输出可验证结果，不要只依赖成功退出码。"
+        )
+
+    def _build_tool_retry_guidance(self, failure_payload: Dict[str, Any]) -> str:
+        tool_name = str(failure_payload.get("tool", "工具") or "工具").strip()
+        error_type = str(failure_payload.get("error_type", "execution_error") or "execution_error").strip()
+        failure_message = str(failure_payload.get("message", "") or "").strip()
+        failure_suffix = f" 失败信息: {failure_message}" if failure_message else ""
+
+        if error_type == "no_output":
+            return (
+                f"上一个 {tool_name} 调用执行成功但没有产生可验证输出。"
+                "不要根据退出码或上下文臆测结果。"
+                "请先判断是命令范围过窄、命令本身没有打印结果，还是目标确实不存在。"
+                "然后重新选择一个能直接输出证据的命令。"
+                "如果继续使用 bash，命令本身必须打印完整路径、匹配数量，或明确的未找到标记。"
+                + failure_suffix
+            )
+
+        if bool(failure_payload.get("retryable", False)):
+            return (
+                f"上一个 {tool_name} 调用失败，但该失败可重试。"
+                "请根据失败原因排查问题，并重新选择更稳妥的命令或工具调用。"
+                "不要重复同一个明显无效的调用。"
+                + failure_suffix
+            )
+
+        return (
+            f"上一个 {tool_name} 调用失败，且当前失败不适合盲目重试。"
+            "请根据错误信息调整方案；如果仍缺少必要输入，就明确向用户询问。"
+            + failure_suffix
+        )
+
+    def _build_tool_success_guidance(self) -> str:
+        return (
+            "请严格基于最新工具结果继续处理当前子任务。"
+            "如果工具结果已经足够支持结论，请直接给出最终答复，并且必须使用中文。"
+            "如果工具结果仍不足以支持结论，请继续调用合适的工具或明确说明缺失信息。"
+            "如果上一个工具已经成功且返回了完整结果，不要重复调用同一个工具和相同目的的参数。"
+            "不要无依据切换到英文，也不要输出与工具结果不一致的结论。"
+        )
+
+    def _summarize_console_text(self, text: str, max_chars: int = 120) -> str:
+        normalized = re.sub(r"\s+", " ", str(text or "").strip())
+        if len(normalized) <= max_chars:
+            return normalized
+        return normalized[: max(1, max_chars - 3)].rstrip() + "..."
+
+    def _build_plan_console_preview(self, plan: List[Dict[str, Any]], max_items: int = 3) -> str:
+        lines: list[str] = []
+        for item in list(plan or [])[:max_items]:
+            description = self._summarize_console_text(str(item.get("description", "") or ""), max_chars=72)
+            execution_mode = self._normalize_execution_mode(item.get("execution_mode", "leaf"))
+            if description:
+                lines.append(f"{item.get('id', len(lines) + 1)}. [{execution_mode}] {description}")
+        if len(plan or []) > max_items:
+            lines.append(f"... 其余 {len(plan) - max_items} 步省略")
+        return " || ".join(lines)
+
+    def _build_leaf_routing_keywords(self, state: AgentState, subtask_desc: str, limit: int = 5) -> List[str]:
+        seen: set[str] = set()
+        normalized_keywords: list[str] = []
+        for item in list(state.get("global_keywords", []) or []) + sorted(self._tokenize_text(subtask_desc)):
+            value = str(item).strip()
+            marker = value.lower()
+            if not value or marker in seen:
+                continue
+            seen.add(marker)
+            normalized_keywords.append(value)
+            if len(normalized_keywords) >= limit:
+                break
+        return normalized_keywords
+
+    def _expand_decomposable_subtask(
+        self,
+        original_request: str,
+        current_subtask: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        subtask_description = str(current_subtask.get("description", "") or "").strip()
+        if not subtask_description:
+            return []
+
+        nested_query = (
+            "请继续拆解下面这个复杂子任务，并保持与原始请求一致。\n\n"
+            f"原始用户请求: {original_request}\n"
+            f"当前复杂子任务: {subtask_description}"
+        )
+        candidate_plan = self._split_task_with_capabilities(nested_query)
+        if not candidate_plan:
+            return []
+
+        normalized_candidate_plan: list[dict[str, Any]] = []
+        for index, item in enumerate(candidate_plan, start=1):
+            if not isinstance(item, dict):
+                continue
+            description = str(item.get("description", "") or "").strip()
+            if not description:
+                continue
+            normalized_candidate_plan.append(
+                {
+                    "id": item.get("id", index),
+                    "description": description,
+                    "execution_mode": self._normalize_execution_mode(item.get("execution_mode", "leaf")),
+                }
+            )
+
+        if not normalized_candidate_plan:
+            return []
+
+        if len(normalized_candidate_plan) == 1:
+            only_item = normalized_candidate_plan[0]
+            if only_item["description"].strip().lower() == subtask_description.lower():
+                only_item["execution_mode"] = "leaf"
+
+        if not self._plans_are_meaningfully_different([current_subtask], normalized_candidate_plan):
+            return []
+        return normalized_candidate_plan
+
+    def _parse_tool_message_payload(self, message: BaseMessage) -> Dict[str, Any] | None:
+        if not isinstance(message, ToolMessage):
+            return None
+        content = getattr(message, "content", "")
+        if not isinstance(content, str):
+            return None
+        try:
+            payload = json.loads(content)
+        except Exception:
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def _get_latest_successful_tool_name_to_pause(self, messages: List[BaseMessage]) -> str:
+        if len(messages) < 2 or not isinstance(messages[-1], ToolMessage):
+            return ""
+        payload = self._parse_tool_message_payload(messages[-1])
+        if not payload or not bool(payload.get("ok", False)):
+            return ""
+        if bool(payload.get("truncated", False)):
+            return ""
+        previous_ai = None
+        for item in reversed(messages[:-1]):
+            if isinstance(item, AIMessage) and getattr(item, "tool_calls", None):
+                previous_ai = item
+                break
+        if previous_ai is None:
+            return ""
+        tool_calls = list(getattr(previous_ai, "tool_calls", None) or [])
+        if len(tool_calls) != 1:
+            return ""
+        return str(tool_calls[0].get("name") or "").strip()
+
+    def _should_downgrade_ask_user_to_continue(
+        self,
+        subtask_desc: str,
+        actual: str,
+        reflection_note: str,
+        recent_failures: List[Dict[str, Any]] | None = None,
+    ) -> bool:
+        sanitized_actual = self._strip_internal_response_markup(actual)
+        if not sanitized_actual:
+            return False
+        if recent_failures:
+            return False
+        if self._looks_like_missing_information_block(actual, reflection_note):
+            return False
+        if self._looks_like_tool_capability_block(actual, reflection_note):
+            return False
+        observation_markers = ["查看", "读取", "列出", "查询", "显示", "检查", "内容", "路径", "文件", "目录"]
+        return any(marker in str(subtask_desc or "") for marker in observation_markers)
+
+    def _enrich_successful_request_metadata(
+        self,
+        state: AgentState,
+        final_output: str,
+        request_id: str,
+    ) -> Dict[str, Any]:
+        if state.get("lite_mode", False):
+            return {}
+
+        normalized_query = str(state.get("normalized_query", "") or state.get("raw_query", "") or "").strip()
+        if not normalized_query:
+            normalized_query = self._build_compact_summary(final_output, max_chars=120)
+        if not normalized_query:
+            return {}
+
+        domain = self.cognitive.determine_domain(normalized_query)
+        self._raise_if_request_cancelled(request_id)
+        try:
+            extracted_keywords, summary = self.cognitive.extract_features(normalized_query, domain_hint=domain)
+        except TypeError:
+            extracted_keywords, summary = self.cognitive.extract_features(normalized_query)
+        self._raise_if_request_cancelled(request_id)
+
+        normalized_keywords = [str(item).strip() for item in extracted_keywords if str(item).strip()][:30]
+        if not normalized_keywords:
+            normalized_keywords = self._derive_routing_keywords(normalized_query, limit=10)
+        normalized_summary = str(summary or "").strip() or self._build_compact_summary(normalized_query)
+
+        session_memory_id = state.get("session_memory_id")
+        if session_memory_id:
+            self.memory.update_memory(
+                session_memory_id,
+                summary=normalized_summary,
+                keywords=normalized_keywords,
+                request_id=request_id,
+                domain_label=domain,
+            )
+
+        return {
+            "domain_label": domain,
+            "global_keywords": normalized_keywords,
+        }
 
     def _is_non_explicit_chat(self, text: str) -> bool:
         if not bool(getattr(config, "lite_chat_enabled", True)):
@@ -316,6 +598,28 @@ class AgentCore:
     def _wrap_tool_for_runtime(self, tool):
         return self.tool_runtime.wrap_tool_for_runtime(tool)
 
+    def _get_planning_capability_context(self) -> Dict[str, Any]:
+        return self.skills.get_planning_capability_context()
+
+    def _split_task_with_capabilities(
+        self,
+        user_query: str,
+        thinking_mode: bool = False,
+        capability_context: Dict[str, Any] | None = None,
+    ) -> List[Dict[str, Any]]:
+        effective_context = capability_context if capability_context is not None else self._get_planning_capability_context()
+        split_task = getattr(self.planner, "split_task")
+        try:
+            return split_task(
+                user_query,
+                thinking_mode=thinking_mode,
+                capability_context=effective_context,
+            )
+        except TypeError as exc:
+            if "capability_context" not in str(exc):
+                raise
+            return split_task(user_query, thinking_mode=thinking_mode)
+
     def _append_builtin_fallback_tools(self, selected_tools: List[Any] | None) -> List[Any]:
         merged_tools: List[Any] = []
         seen_names: set[str] = set()
@@ -337,16 +641,6 @@ class AgentCore:
             seen_names.add(tool_name)
 
         return merged_tools
-
-    def _get_non_builtin_fallback_tools(self, selected_tools: List[Any] | None) -> List[Any]:
-        fallback_names = getattr(self.skills, "ALWAYS_APPEND_TOOL_NAMES", {"bash"})
-        filtered_tools: List[Any] = []
-        for tool in list(selected_tools or []):
-            tool_name = str(getattr(tool, "name", "") or "").strip()
-            if tool_name in fallback_names:
-                continue
-            filtered_tools.append(tool)
-        return filtered_tools
 
     def _select_relevant_memories(self, memories: List[Dict[str, Any]], keywords: List[str], limit: int = 3):
         keyword_set = {kw.strip().lower() for kw in keywords if isinstance(kw, str) and kw.strip()}
@@ -388,83 +682,25 @@ class AgentCore:
             return not content.strip()
         return not str(content or "").strip()
 
-    def _infer_path_argument(self, user_query: str, subtask_desc: str) -> str | None:
-        combined = "\n".join(part for part in [user_query, subtask_desc] if part)
-        windows_match = re.search(r"([a-zA-Z]:(?:\\[^\\/:*?\"<>|\r\n]+)+)", combined)
-        if windows_match:
-            return windows_match.group(1)
-
-        workspace_root = config.resolve_path(".")
-        workspace_name = os.path.basename(workspace_root).lower()
-        lowered = combined.lower()
-        if workspace_name and workspace_name in lowered and any(marker in combined for marker in ["当前项目", "workspace", "项目目录"]):
-            return workspace_root
-        return None
-
-    def _build_tool_fallback_args(self, tool: Any, user_query: str, subtask_desc: str) -> Dict[str, Any] | None:
-        args_schema = getattr(tool, "args_schema", None)
-        if not args_schema:
-            return {}
-
-        if hasattr(args_schema, "model_json_schema"):
-            schema = args_schema.model_json_schema()
-        else:
-            return None
-
-        properties = schema.get("properties", {}) or {}
-        required_fields = set(schema.get("required", []) or [])
-        if not properties:
-            return {}
-        if len(properties) != 1:
-            return None
-
-        field_name = next(iter(properties.keys()))
-        normalized_field_name = field_name.strip().lower()
-        if normalized_field_name not in {"path", "file_path", "filepath", "dir_path", "directory", "directory_path"}:
-            return None
-
-        inferred_path = self._infer_path_argument(user_query, subtask_desc)
-        if field_name in required_fields and not inferred_path:
-            return None
-        if inferred_path:
-            return {field_name: inferred_path}
-        return {}
-
-    def _maybe_synthesize_tool_call(
+    def _normalize_empty_model_response(
         self,
         response: BaseMessage,
-        selected_tools: List[Any],
-        user_query: str,
-        subtask_desc: str,
         request_id: str,
+        subtask_desc: str,
     ) -> BaseMessage:
         if not self._response_needs_tool_fallback(response):
             return response
-        synthesis_candidates = self._get_non_builtin_fallback_tools(selected_tools)
-        if len(synthesis_candidates) != 1:
-            return response
-
-        tool = synthesis_candidates[0]
-        tool_name = getattr(tool, "name", "")
-        fallback_args = self._build_tool_fallback_args(tool, user_query, subtask_desc)
-        if fallback_args is None:
-            return response
-
         llm_manager.log_checkpoint(
-            "tool_call_synthesized",
-            details=f"tool={tool_name} | reason=empty_llm_response",
+            "empty_model_response",
+            details=f"subtask={subtask_desc[:120]}",
             request_id=request_id,
             console=False,
-            tool_name=tool_name,
         )
         return AIMessage(
-            content="",
-            tool_calls=[{
-                "name": tool_name,
-                "args": fallback_args,
-                "id": f"call_{uuid.uuid4().hex[:8]}",
-                "type": "tool_call",
-            }],
+            content=(
+                "模型本轮没有返回任何可执行内容、工具调用或最终答案。"
+                "请重新选择合适的技能/工具，或直接给出可验证的答复。"
+            )
         )
 
     def _merge_failed_tools(
@@ -587,17 +823,10 @@ class AgentCore:
         capability_markers = [
             "当前工具",
             "工具调用限制",
-            "无法直接搜索文件名",
             "无法使用工具",
-            "支持文件名搜索的工具",
-            "请提供当前工作区",
-            "工作区的具体路径",
             "工具受限",
             "工具能力",
             "tool limitations",
-            "cannot directly search file",
-            "support file-name search",
-            "current workspace path",
         ]
         return any(marker in combined for marker in capability_markers)
 
@@ -689,8 +918,12 @@ class AgentCore:
     def _record_step_memory(self, session_id: str, request_id: str, domain: str, subtask_desc: str,
                             actual: str, reflection_note: str, quality_tags: List[str] | None = None,
                             step_keywords: List[str] | None = None, step_summary: str = ""):
-        if step_keywords is None or not step_summary:
-            step_keywords, step_summary = self.cognitive.extract_features(subtask_desc)
+        normalized_keywords = [
+            str(item).strip() for item in (step_keywords or []) if str(item).strip()
+        ]
+        if not normalized_keywords:
+            normalized_keywords = self._derive_routing_keywords(subtask_desc, limit=10)
+        normalized_summary = str(step_summary or "").strip() or self._build_compact_summary(subtask_desc)
         memory_output = actual.strip()
         if reflection_note:
             memory_output = f"{memory_output}\n\nReflection: {reflection_note}".strip()
@@ -699,8 +932,8 @@ class AgentCore:
         self.memory.add_memory(
             session_id,
             domain,
-            list(step_keywords)[:10],
-            f"Step: {step_summary}",
+            normalized_keywords[:10],
+            f"Step: {normalized_summary}",
             subtask_desc,
             memory_output,
             "",
@@ -733,9 +966,8 @@ class AgentCore:
             cached_summary = str(cached_entry.get("summary", "")).strip()
             return cached_keywords[:5], cached_summary, cache
 
-        subtask_keywords, subtask_summary = self.cognitive.extract_features(subtask_desc)
-        self._raise_if_request_cancelled(request_id)
-        normalized_keywords = list(subtask_keywords)[:5]
+        normalized_keywords = self._derive_routing_keywords(subtask_desc, limit=5)
+        subtask_summary = self._build_compact_summary(subtask_desc)
         cache[cache_key] = {
             "description": subtask_desc,
             "keywords": normalized_keywords,
@@ -907,6 +1139,25 @@ class AgentCore:
 
         return f"Skill not found: {skill_name}"
 
+    def grant_write_access(self, path: str) -> str:
+        normalized = str(path or "").strip()
+        if not normalized:
+            return "Usage: /grant_write <folder_path>"
+        granted_root = config.grant_write_root(normalized)
+        return f"Granted write access: {granted_root}"
+
+    def revoke_write_access(self, path: str) -> str:
+        normalized = str(path or "").strip()
+        if not normalized:
+            return "Usage: /revoke_write <folder_path>"
+        revoked = config.revoke_write_root(normalized)
+        if revoked:
+            return f"Revoked write access: {config.resolve_path(normalized)}"
+        return f"Write access not found: {config.resolve_path(normalized)}"
+
+    def list_write_access_roots(self) -> List[str]:
+        return list(config.list_write_roots())
+
     def load_mcp_server(self, server_ref: str, rebuild_graph: bool = True):
         normalized_ref = server_ref.strip()
         if not normalized_ref:
@@ -1068,11 +1319,14 @@ class AgentCore:
                 plan = [{
                     "id": 1,
                     "description": "对用户的日常交流进行简洁回复",
-                    "expected_outcome": "给出礼貌、简洁且自然的回应。",
+                    "execution_mode": "leaf",
                 }]
                 llm_manager.log_checkpoint(
                     "planning_completed",
-                    details=f"subtask_count=1 | domain={domain} | mode=lite_chat",
+                    details=(
+                        f"subtask_count=1 | domain={domain} | mode=lite_chat | "
+                        f"plan_preview={self._build_plan_console_preview(plan)}"
+                    ),
                     request_id=request_id,
                     console=True,
                     session_id=session_id,
@@ -1097,10 +1351,12 @@ class AgentCore:
                     "retry_counts": {},
                     "replan_counts": {},
                     "blocked": False,
+                    "waiting_for_user": False,
                     "final_response": "",
                     "lite_mode": True,
                     "normalized_query": last_message_content,
                     "subtask_feature_cache": {},
+                    "agent_action": "",
                 }
                 self._persist_state_snapshot(
                     request_id,
@@ -1114,13 +1370,9 @@ class AgentCore:
             if bool(getattr(config, "intent_rewrite_enabled", True)) and not self._should_bypass_intent_rewrite(last_message_content):
                 normalized_query = self.cognitive.rewrite_intent(last_message_content)
                 self._raise_if_request_cancelled(request_id)
-            
-            # 1. Feature Extraction (Global task constraints: max 30 keywords)
-            keywords, summary = self.cognitive.extract_features(normalized_query)
-            self._raise_if_request_cancelled(request_id)
-            normalized_keywords = list(keywords)[:30]
-            domain = self.cognitive.determine_domain(normalized_query)
-            self._raise_if_request_cancelled(request_id)
+
+            normalized_keywords = self._derive_routing_keywords(normalized_query, limit=10)
+            domain = DEFAULT_DOMAIN_LABEL
             memory_summaries = self.memory.retrieve_memory(
                 match_keywords=normalized_keywords,
                 limit=5,
@@ -1131,7 +1383,7 @@ class AgentCore:
                 session_id,
                 domain,
                 normalized_keywords,
-                summary,
+                "待处理请求，成功后补全摘要。",
                 last_message_content,
                 "",
                 "",
@@ -1141,17 +1393,29 @@ class AgentCore:
             )
             
             # 2. Planning (Decompose complex tasks into granular subtasks)
-            plan = self.planner.split_task(normalized_query, thinking_mode=False)
+            planning_capability_context = self._get_planning_capability_context()
+            plan = self._split_task_with_capabilities(
+                normalized_query,
+                thinking_mode=False,
+                capability_context=planning_capability_context,
+            )
             self._raise_if_request_cancelled(request_id)
             llm_manager.log_checkpoint(
                 "planning_completed",
-                details=f"subtask_count={len(plan)} | domain={domain}",
+                details=(
+                    f"subtask_count={len(plan)} | domain={domain} | "
+                    f"prompt_skill_count={len(planning_capability_context.get('prompt_skills', []))} | "
+                    f"tool_count={len(planning_capability_context.get('tools', []))} | "
+                    f"plan_preview={self._build_plan_console_preview(plan)}"
+                ),
                 request_id=request_id,
                 console=True,
                 session_id=session_id,
                 duration_ms=(time.monotonic() - planning_started_at) * 1000,
                 subtask_count=len(plan),
                 domain=domain,
+                prompt_skill_count=len(planning_capability_context.get("prompt_skills", [])),
+                tool_count=len(planning_capability_context.get("tools", [])),
             )
             
             next_state = {
@@ -1170,16 +1434,23 @@ class AgentCore:
                 "retry_counts": {},
                 "replan_counts": {},
                 "blocked": False,
+                "waiting_for_user": False,
                 "final_response": "",
                 "lite_mode": False,
                 "normalized_query": normalized_query,
                 "subtask_feature_cache": {},
+                "agent_action": "",
             }
             self._persist_state_snapshot(
                 request_id,
                 "planning_completed",
                 next_state,
-                extra={"subtask_count": len(plan), "domain": domain},
+                extra={
+                    "subtask_count": len(plan),
+                    "domain": domain,
+                    "prompt_skill_count": len(planning_capability_context.get("prompt_skills", [])),
+                    "tool_count": len(planning_capability_context.get("tools", [])),
+                },
             )
             return next_state
         
@@ -1245,9 +1516,52 @@ class AgentCore:
                 
             current_subtask = plan[idx]
             subtask_desc = current_subtask.get("description", "")
+            execution_mode = self._normalize_execution_mode(current_subtask.get("execution_mode", "leaf"))
+
+            if execution_mode == "decomposable":
+                expanded_subtasks = self._expand_decomposable_subtask(
+                    state.get("raw_query", ""),
+                    current_subtask,
+                )
+                if expanded_subtasks:
+                    updated_plan = list(plan[:idx]) + expanded_subtasks + list(plan[idx + 1:])
+                    llm_manager.log_checkpoint(
+                        "subtask_replanned",
+                        details=f"index={idx + 1} | new_subtask_count={len(expanded_subtasks)}",
+                        request_id=request_id,
+                        console=False,
+                        session_id=state.get("session_id", ""),
+                        subtask_index=idx + 1,
+                        new_subtask_count=len(expanded_subtasks),
+                    )
+                    self._persist_state_snapshot(
+                        request_id,
+                        "subtask_replanned",
+                        {
+                            **state,
+                            "plan": updated_plan,
+                            "subtask_feature_cache": {},
+                        },
+                        extra={
+                            "subtask_index": idx + 1,
+                            "replacement_count": len(expanded_subtasks),
+                            "reason": "decomposable_subtask_expanded",
+                        },
+                    )
+                    return {
+                        "plan": updated_plan,
+                        "subtask_feature_cache": {},
+                        "agent_action": "reenter",
+                        "failed_tools": merged_failed_tools,
+                        "failed_tool_signals": merged_failed_tool_signals,
+                    }
+
             llm_manager.log_checkpoint(
                 "subtask_started",
-                details=f"index={idx + 1} | description={subtask_desc[:120]}",
+                details=(
+                    f"index={idx + 1} | description={self._summarize_console_text(subtask_desc, max_chars=120)} | "
+                    f"mode={execution_mode}"
+                ),
                 request_id=request_id,
                 console=True,
                 session_id=state.get("session_id", ""),
@@ -1256,29 +1570,16 @@ class AgentCore:
             )
             
             continuing_after_tool = isinstance(state["messages"][-1], ToolMessage)
-            sub_kws, _, updated_subtask_feature_cache = self._get_subtask_features(
-                state,
-                idx,
-                subtask_desc,
-                request_id,
-            )
-
-            relevant_memories = self._select_relevant_memories(state.get("memory_summaries", []), sub_kws)
-            if not relevant_memories:
-                relevant_memories = self.memory.retrieve_memory(
-                    match_keywords=sub_kws,
-                    limit=3,
-                    exclude_conv_id=state.get("session_id"),
-                    exclude_ids=[state.get("session_memory_id", 0)],
+            updated_subtask_feature_cache = dict(state.get("subtask_feature_cache", {}))
+            if execution_mode == "leaf":
+                sub_kws = self._build_leaf_routing_keywords(state, subtask_desc, limit=5)
+            else:
+                sub_kws, _, updated_subtask_feature_cache = self._get_subtask_features(
+                    state,
+                    idx,
+                    subtask_desc,
+                    request_id,
                 )
-
-            memory_sections = []
-            summary_context = self._format_memory_context(relevant_memories)
-            if summary_context:
-                memory_sections.append(summary_context)
-            detailed_context = self._load_detailed_memory_context(relevant_memories)
-            if detailed_context:
-                memory_sections.append(detailed_context)
             
             # Assign Skill
             capability_bundle = self.skills.assign_capabilities_to_task(subtask_desc, sub_kws)
@@ -1355,14 +1656,16 @@ class AgentCore:
                 reset_history=not continuing_after_tool,
             )
             if continuing_after_tool:
-                messages = execution_messages
+                trailing_tool_failure = self._parse_tool_error_payload(getattr(state["messages"][-1], "content", ""))
+                if trailing_tool_failure:
+                    messages = execution_messages + [HumanMessage(content=self._build_tool_retry_guidance(trailing_tool_failure))]
+                else:
+                    messages = execution_messages + [HumanMessage(content=self._build_tool_success_guidance())]
             else:
                 # Generate local prompt for LLM only for the initial subtask dispatch.
                 prompt_sections = [
                     f"正在执行子任务 {idx+1}: {subtask_desc}",
                 ]
-                if memory_sections:
-                    prompt_sections.append("\n\n".join(memory_sections))
                 if skill_context:
                     prompt_sections.append(skill_context.strip())
                 if tool_skills:
@@ -1370,6 +1673,9 @@ class AgentCore:
                         f"- {item['name']}: {item.get('description', '')} | reason: {item.get('route_reason', '')}" for item in tool_skills
                     )
                     prompt_sections.append(tool_context)
+                environment_context = self._build_execution_environment_context(selected_tools)
+                if environment_context:
+                    prompt_sections.append(environment_context)
                 if recent_tool_failures:
                     failure_context_lines = [
                         f"- {item.get('tool')}: {item.get('error_type')} | retryable={item.get('retryable')} | {item.get('message')}"
@@ -1395,6 +1701,11 @@ class AgentCore:
                     )
                 prompt = "\n\n".join(prompt_sections)
                 messages = execution_messages + [HumanMessage(content=prompt)]
+
+            paused_tool_name = self._get_latest_successful_tool_name_to_pause(state["messages"]) if continuing_after_tool else ""
+            if paused_tool_name:
+                selected_tools = [tool for tool in selected_tools if str(getattr(tool, "name", "") or "").strip() != paused_tool_name]
+                tool_skills = [item for item in tool_skills if str(item.get("name", "") or "").strip() != paused_tool_name]
 
             llm = llm_manager.get_llm()
             if selected_tools:
@@ -1424,12 +1735,10 @@ class AgentCore:
                 
             response = llm_manager.invoke(messages, source="agent.execute_subtask", llm=llm)
             self._raise_if_request_cancelled(request_id)
-            response = self._maybe_synthesize_tool_call(
+            response = self._normalize_empty_model_response(
                 response,
-                selected_tools,
-                state["messages"][0].content if state.get("messages") else "",
-                subtask_desc,
                 request_id,
+                subtask_desc,
             )
             self._raise_if_request_cancelled(request_id)
             return {
@@ -1437,6 +1746,7 @@ class AgentCore:
                 "failed_tools": merged_failed_tools,
                 "failed_tool_signals": merged_failed_tool_signals,
                 "subtask_feature_cache": updated_subtask_feature_cache,
+                "agent_action": "",
             }
 
         def reflect_and_advance(state: AgentState):
@@ -1450,7 +1760,6 @@ class AgentCore:
                 return {}
                 
             current_subtask = plan[idx]
-            expected = current_subtask.get("expected_outcome", "")
             actual = messages[-1].content
 
             if state.get("lite_mode", False):
@@ -1495,6 +1804,7 @@ class AgentCore:
                     "failed_tools": failed_tools_state,
                     "failed_tool_signals": failed_tool_signals_state,
                     "blocked": False,
+                    "waiting_for_user": False,
                     "final_response": actual if next_index >= len(plan) else state.get("final_response", ""),
                     "retry_counts": dict(state.get("retry_counts", {})),
                     "replan_counts": dict(state.get("replan_counts", {})),
@@ -1502,12 +1812,27 @@ class AgentCore:
             
             # 3. Verification & Reflection
             success, reflection_note, action = self.reflector.verify_and_reflect(
-                current_subtask.get("description", ""), expected, actual
+                current_subtask.get("description", ""), "", actual
             )
+            recent_tool_failures = self._collect_recent_tool_failures(messages)
+            if not success and action == "ask_user" and self._should_downgrade_ask_user_to_continue(
+                current_subtask.get("description", ""),
+                actual if isinstance(actual, str) else str(actual or ""),
+                reflection_note,
+                recent_failures=recent_tool_failures,
+            ):
+                success = True
+                action = "continue"
+                reflection_note = (
+                    (str(reflection_note or "").strip() + " ").strip() + "已经拿到可直接返回给用户的观测结果，因此不应阻塞并追问用户。"
+                ).strip()
             self._raise_if_request_cancelled(request_id)
             llm_manager.log_checkpoint(
                 "reflection_completed",
-                details=f"index={idx + 1} | success={success} | action={action}",
+                details=(
+                    f"index={idx + 1} | success={success} | action={action} | "
+                    f"reflection={self._summarize_console_text(reflection_note, max_chars=160)}"
+                ),
                 request_id=request_id,
                 console=True,
                 session_id=state.get("session_id", ""),
@@ -1522,17 +1847,19 @@ class AgentCore:
             failed_tool_signals_state = dict(state.get("failed_tool_signals", {}))
             subtask_feature_cache = dict(state.get("subtask_feature_cache", {}))
             cached_subtask_features = subtask_feature_cache.get(str(idx), {})
-            self._record_step_memory(
-                state.get("session_id", self.session_id),
-                request_id,
-                state.get("domain_label", DEFAULT_DOMAIN_LABEL),
-                current_subtask.get("description", ""),
-                actual,
-                reflection_note,
-                quality_tags=["success"] if (success or action == "continue") else (["ask_user", "blocked"] if action == "ask_user" else ["retry"]),
-                step_keywords=list(cached_subtask_features.get("keywords", [])),
-                step_summary=str(cached_subtask_features.get("summary", "") or ""),
-            )
+            execution_mode = self._normalize_execution_mode(current_subtask.get("execution_mode", "leaf"))
+            if execution_mode != "leaf" or action in {"retry", "ask_user"}:
+                self._record_step_memory(
+                    state.get("session_id", self.session_id),
+                    request_id,
+                    state.get("domain_label", DEFAULT_DOMAIN_LABEL),
+                    current_subtask.get("description", ""),
+                    actual,
+                    reflection_note,
+                    quality_tags=["success"] if (success or action == "continue") else (["ask_user", "waiting_user"] if action == "ask_user" else ["retry"]),
+                    step_keywords=list(cached_subtask_features.get("keywords", [])),
+                    step_summary=str(cached_subtask_features.get("summary", "") or ""),
+                )
 
             retry_counts = dict(state.get("retry_counts", {}))
             replan_counts = dict(state.get("replan_counts", {}))
@@ -1544,10 +1871,10 @@ class AgentCore:
                     current_subtask.get("description", "当前子任务"),
                     actual if isinstance(actual, str) else str(actual or ""),
                     reflection_note,
-                    recent_failures=self._collect_recent_tool_failures(messages),
+                    recent_failures=recent_tool_failures,
                 )
                 llm_manager.log_checkpoint(
-                    "agent_blocked",
+                    "agent_waiting_user",
                     details=f"index={idx + 1} | action=ask_user",
                     request_id=request_id,
                     level=40,
@@ -1555,11 +1882,12 @@ class AgentCore:
                 )
                 self._persist_state_snapshot(
                     request_id,
-                    "agent_blocked",
+                    "agent_waiting_user",
                     {
                         **state,
                         "reflections": reflections,
-                        "blocked": True,
+                        "blocked": False,
+                        "waiting_for_user": True,
                         "final_response": blocked_message,
                         "retry_counts": retry_counts,
                         "replan_counts": replan_counts,
@@ -1567,11 +1895,12 @@ class AgentCore:
                     },
                     extra={"subtask_index": idx + 1, "action": action, "reflection_note": reflection_note},
                 )
-                self._finalize_session_memory(state, blocked_message, quality_tags=["ask_user", "blocked"])
+                self._finalize_session_memory(state, blocked_message, quality_tags=["ask_user", "waiting_user"])
                 return {
                     "messages": [AIMessage(content=blocked_message)],
                     "reflections": reflections,
-                    "blocked": True,
+                    "blocked": False,
+                    "waiting_for_user": True,
                     "final_response": blocked_message,
                     "failed_tool_signals": failed_tool_signals_state,
                     "retry_counts": retry_counts,
@@ -1583,18 +1912,21 @@ class AgentCore:
                 next_index = idx + 1
                 failed_tools_state.pop(str(idx), None)
                 failed_tool_signals_state.pop(str(idx), None)
+                completion_metadata: Dict[str, Any] = {}
                 if next_index >= len(plan):
+                    completion_metadata = self._enrich_successful_request_metadata(state, actual, request_id)
+                    completed_state = {**state, **completion_metadata}
                     llm_manager.log_checkpoint(
                         "agent_completed",
                         details=f"subtask_count={len(plan)}",
                         request_id=request_id,
                         console=True,
                     )
-                    self._finalize_session_memory(state, actual, quality_tags=["success"])
+                    self._finalize_session_memory(completed_state, actual, quality_tags=["success"])
                     self._persist_state_snapshot(
                         request_id,
                         "agent_completed",
-                        state,
+                        completed_state,
                         extra={"subtask_count": len(plan), "final_output": actual},
                     )
                 else:
@@ -1615,39 +1947,41 @@ class AgentCore:
                     "failed_tools": failed_tools_state,
                     "failed_tool_signals": failed_tool_signals_state,
                     "blocked": False,
+                    "waiting_for_user": False,
                     "final_response": actual if next_index >= len(plan) else state.get("final_response", ""),
                     "retry_counts": retry_counts,
                     "replan_counts": replan_counts,
+                    **completion_metadata,
                 }
             
             retry_count += 1
             retry_counts[retry_key] = retry_count
             replan_key = str(idx)
             replan_count = replan_counts.get(replan_key, 0)
-            recent_tool_failures = self._collect_recent_tool_failures(messages)
 
             if retry_count == 1 and replan_count < 1:
-                replanned_subtasks = self._replan_subtask_after_failure(
+                promoted_subtask = self._promote_retry_to_decomposable_subtask(
                     state["messages"][0].content,
                     current_subtask,
                     actual,
                     reflection_note,
                     recent_tool_failures=recent_tool_failures,
                 )
-                if replanned_subtasks:
-                    updated_plan = list(plan[:idx]) + replanned_subtasks + list(plan[idx + 1:])
+                if promoted_subtask:
+                    updated_plan = list(plan[:idx]) + [promoted_subtask] + list(plan[idx + 1:])
                     replan_counts[replan_key] = replan_count + 1
                     retry_counts.pop(retry_key, None)
                     failed_tools_state.pop(str(idx), None)
                     failed_tool_signals_state.pop(str(idx), None)
                     llm_manager.log_checkpoint(
                         "subtask_replanned",
-                        details=f"index={idx + 1} | new_subtask_count={len(replanned_subtasks)}",
+                        details=f"index={idx + 1} | new_subtask_count=1 | mode=decomposable_reflection",
                         request_id=request_id,
                         console=True,
                         session_id=state.get("session_id", ""),
                         subtask_index=idx + 1,
-                        new_subtask_count=len(replanned_subtasks),
+                        new_subtask_count=1,
+                        mode="decomposable_reflection",
                     )
                     self._persist_state_snapshot(
                         request_id,
@@ -1663,7 +1997,7 @@ class AgentCore:
                         },
                         extra={
                             "subtask_index": idx + 1,
-                            "replacement_count": len(replanned_subtasks),
+                            "replacement_count": 1,
                             "reflection_note": reflection_note,
                         },
                     )
@@ -1675,7 +2009,9 @@ class AgentCore:
                         "retry_counts": retry_counts,
                         "replan_counts": replan_counts,
                         "subtask_feature_cache": {},
+                        "agent_action": "",
                         "blocked": False,
+                        "waiting_for_user": False,
                     }
 
             if retry_count >= 2:
@@ -1700,6 +2036,7 @@ class AgentCore:
                         **state,
                         "reflections": reflections,
                         "blocked": True,
+                        "waiting_for_user": False,
                         "final_response": blocked_message,
                         "retry_counts": retry_counts,
                         "replan_counts": replan_counts,
@@ -1712,6 +2049,7 @@ class AgentCore:
                     "messages": [AIMessage(content=blocked_message)],
                     "reflections": reflections,
                     "blocked": True,
+                    "waiting_for_user": False,
                     "final_response": blocked_message,
                     "failed_tool_signals": failed_tool_signals_state,
                     "retry_counts": retry_counts,
@@ -1724,10 +2062,14 @@ class AgentCore:
                 "failed_tool_signals": failed_tool_signals_state,
                 "retry_counts": retry_counts,
                 "replan_counts": replan_counts,
+                "agent_action": "",
                 "blocked": False,
+                "waiting_for_user": False,
             }
 
-        def should_continue(state: AgentState) -> Literal["tools", "reflect_and_advance", "__end__"]:
+        def should_continue(state: AgentState) -> Literal["agent", "tools", "reflect_and_advance", "__end__"]:
+            if state.get("agent_action") == "reenter":
+                return "agent"
             messages = state["messages"]
             last_message = messages[-1]
             
@@ -1737,7 +2079,7 @@ class AgentCore:
             return "reflect_and_advance"
 
         def should_continue_after_reflection(state: AgentState) -> Literal["agent", "__end__"]:
-            if state.get("blocked"):
+            if state.get("blocked") or state.get("waiting_for_user"):
                 return "__end__"
 
             plan = state.get("plan", [])
@@ -1761,6 +2103,7 @@ class AgentCore:
         })
         graph_builder.add_edge("planner", "agent")
         agent_routes = {
+            "agent": "agent",
             "reflect_and_advance": "reflect_and_advance",
             "__end__": END,
         }

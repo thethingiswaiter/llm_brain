@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import pathlib
+import io
 import tempfile
 import time
 import unittest
@@ -81,9 +82,28 @@ class StructuredOutputParserTests(unittest.TestCase):
         self.assertEqual(reflection, "ok")
         self.assertEqual(action, "continue")
 
+    def test_reflector_short_circuits_observation_task_with_concrete_result(self):
+        import cognitive.reflector as reflector_module
+
+        original_invoke = reflector_module.llm_manager.invoke
+        reflector = reflector_module.Reflector()
+        reflector_module.llm_manager.invoke = lambda prompt, source="": (_ for _ in ()).throw(AssertionError("LLM should not be called"))
+        try:
+            success, reflection, action = reflector.verify_and_reflect(
+                "查看 nginx.conf 文件内容",
+                "直接给出用户需要的结果。只有在关键信息确实缺失时，才提出简洁的澄清问题。",
+                "文件内容如下：\n`hello world`",
+            )
+        finally:
+            reflector_module.llm_manager.invoke = original_invoke
+
+        self.assertTrue(success)
+        self.assertIn("可直接返回", reflection)
+        self.assertEqual(action, "continue")
+
 
 class TaskPlannerTests(unittest.TestCase):
-    def test_split_task_collapses_over_decomposed_direct_lookup_request(self):
+    def test_split_task_preserves_llm_output_without_direct_lookup_collapse(self):
         import cognitive.planner as planner_module
         from cognitive.planner import TaskPlanner
 
@@ -109,10 +129,81 @@ class TaskPlannerTests(unittest.TestCase):
         finally:
             planner_module.llm_manager.invoke = original_invoke
 
-        self.assertEqual(len(result), 1)
-        self.assertEqual(result[0]["description"], "查询一下主机名称")
+        self.assertEqual(len(result), 5)
+        self.assertEqual(result[0]["description"], "Identify the system or environment where the hostname is to be queried.")
 
-    def test_split_task_collapses_direct_lookup_count_request_in_default_mode(self):
+    def test_split_task_includes_planning_capability_context_in_prompt(self):
+        import cognitive.planner as planner_module
+        from cognitive.planner import TaskPlanner
+
+        class FakeResponse:
+            def __init__(self, content):
+                self.content = content
+
+        captured = {}
+        planner = TaskPlanner()
+        original_invoke = planner_module.llm_manager.invoke
+
+        def fake_invoke(prompt, source=""):
+            captured["prompt"] = prompt
+            captured["source"] = source
+            return FakeResponse(
+                """[
+                  {"id": 1, "description": "使用 list_directory 工具列出目录项", "expected_outcome": "得到目录项列表"}
+                ]"""
+            )
+
+        planner_module.llm_manager.invoke = fake_invoke
+        try:
+            result = planner.split_task(
+                "找到当前目录下core.py文件的完整路径",
+                capability_context={
+                    "planning_policy": "Plan only against registered capabilities.",
+                    "prompt_skills": [
+                        {
+                            "name": "filesystem_helper",
+                            "description": "处理工作区文件定位与阅读。",
+                            "keywords": ["文件", "路径", "目录"],
+                            "source_file": "filesystem.md",
+                        }
+                    ],
+                    "tools": [
+                        {
+                            "name": "list_directory",
+                            "description": "列出工作区内目录项。",
+                            "keywords": ["目录", "文件", "路径"],
+                            "arguments": ["path<string> optional: 工作区内路径"],
+                            "constraints": ["安全边界：仅允许工作区内路径"],
+                            "source_type": "runtime",
+                        },
+                        {
+                            "name": "bash",
+                            "description": "安全执行终端命令。",
+                            "keywords": ["终端", "命令", "搜索文件"],
+                            "arguments": ["command<string> required: shell command"],
+                            "constraints": ["仅允许 allowlist 前缀", "禁止 shell operator"],
+                            "source_type": "runtime",
+                        },
+                    ],
+                },
+            )
+        finally:
+            planner_module.llm_manager.invoke = original_invoke
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(captured["source"], "planner.split_task")
+        self.assertIn("当前能力清单", captured["prompt"])
+        self.assertIn("filesystem_helper", captured["prompt"])
+        self.assertIn("list_directory", captured["prompt"])
+        self.assertIn("bash", captured["prompt"])
+        self.assertIn("args:", captured["prompt"])
+        self.assertIn("constraints:", captured["prompt"])
+        self.assertIn("仅允许工作区内路径", captured["prompt"])
+        self.assertIn("禁止输出", captured["prompt"])
+        self.assertIn("手动操作 / 人工检查 / 让用户自己做", captured["prompt"])
+        self.assertIn("依赖人类或外部 GUI 手动完成", captured["prompt"])
+
+    def test_split_task_preserves_multi_step_plan_in_default_mode(self):
         import cognitive.planner as planner_module
         from cognitive.planner import TaskPlanner
 
@@ -124,18 +215,41 @@ class TaskPlannerTests(unittest.TestCase):
         original_invoke = planner_module.llm_manager.invoke
         planner_module.llm_manager.invoke = lambda prompt, source="": FakeResponse(
             """[
-              {"id": 1, "description": "打开 VSCode 项目目录", "expected_outcome": "定位到目录"},
-              {"id": 2, "description": "列出当前目录下的所有文件和文件夹", "expected_outcome": "得到目录项列表"},
-              {"id": 3, "description": "统计列表中文件和文件夹的总数", "expected_outcome": "得到总数"}
+              {"id": 1, "description": "使用Python的os模块查找当前工作目录", "expected_outcome": "得到当前目录"},
+              {"id": 2, "description": "拼接core.py路径", "expected_outcome": "得到候选路径"},
+              {"id": 3, "description": "验证文件是否存在", "expected_outcome": "确认路径有效"}
             ]"""
         )
         try:
-            result = planner.split_task(r"D:\file\vscode\llm_brain 当前项目下有多少个文件")
+            result = planner.split_task("找到当前目录下core.py文件的完整路径")
+        finally:
+            planner_module.llm_manager.invoke = original_invoke
+
+        self.assertEqual(len(result), 3)
+        self.assertEqual(result[0]["description"], "使用Python的os模块查找当前工作目录")
+
+    def test_split_task_forces_decomposable_for_obviously_complex_step(self):
+        import cognitive.planner as planner_module
+        from cognitive.planner import TaskPlanner
+
+        class FakeResponse:
+            def __init__(self, content):
+                self.content = content
+
+        planner = TaskPlanner()
+        original_invoke = planner_module.llm_manager.invoke
+        planner_module.llm_manager.invoke = lambda prompt, source="": FakeResponse(
+            """[
+              {"id": 1, "description": "分析失败原因并规划后续执行路径", "execution_mode": "leaf"}
+            ]"""
+        )
+        try:
+            result = planner.split_task("分析失败原因并规划后续执行路径")
         finally:
             planner_module.llm_manager.invoke = original_invoke
 
         self.assertEqual(len(result), 1)
-        self.assertEqual(result[0]["description"], r"D:\file\vscode\llm_brain 当前项目下有多少个文件")
+        self.assertEqual(result[0]["execution_mode"], "decomposable")
 
     def test_split_task_preserves_validation_style_subtasks_in_thinking_mode(self):
         import cognitive.planner as planner_module
@@ -149,7 +263,7 @@ class TaskPlannerTests(unittest.TestCase):
         original_invoke = planner_module.llm_manager.invoke
         planner_module.llm_manager.invoke = lambda prompt, source="": FakeResponse(
             """[
-              {"id": 1, "description": "打开 VSCode 项目目录", "expected_outcome": "定位到目录"},
+                            {"id": 1, "description": "列出当前项目根目录下的文件和文件夹", "expected_outcome": "得到目录项列表"},
               {"id": 2, "description": "列出当前目录下的所有文件和文件夹", "expected_outcome": "得到目录项列表"},
               {"id": 3, "description": "统计列表中文件和文件夹的总数", "expected_outcome": "得到总数"}
             ]"""
@@ -160,7 +274,31 @@ class TaskPlannerTests(unittest.TestCase):
             planner_module.llm_manager.invoke = original_invoke
 
         self.assertEqual(len(result), 3)
-        self.assertEqual(result[0]["description"], "打开 VSCode 项目目录")
+        self.assertEqual(result[0]["description"], "列出当前项目根目录下的文件和文件夹")
+
+    def test_split_task_rejects_manual_editor_steps_and_falls_back_to_single_task(self):
+        import cognitive.planner as planner_module
+        from cognitive.planner import TaskPlanner
+
+        class FakeResponse:
+            def __init__(self, content):
+                self.content = content
+
+        planner = TaskPlanner()
+        original_invoke = planner_module.llm_manager.invoke
+        planner_module.llm_manager.invoke = lambda prompt, source="": FakeResponse(
+            """[
+              {"id": 1, "description": "打开 VS Code 项目目录", "expected_outcome": "定位到目录"},
+              {"id": 2, "description": "使用文本编辑器查看 nginx.conf", "expected_outcome": "读到文件内容"}
+            ]"""
+        )
+        try:
+            result = planner.split_task("查看 nginx.conf 文件内容")
+        finally:
+            planner_module.llm_manager.invoke = original_invoke
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["description"], "查看 nginx.conf 文件内容")
 
 
 class DomainClassificationTests(unittest.TestCase):
@@ -267,7 +405,7 @@ class AgentStateSnapshotTests(unittest.TestCase):
         with open(snapshot_path, "r", encoding="utf-8") as file_handle:
             payload = json.load(file_handle)
 
-        self.assertEqual(payload["schema_version"], 1)
+        self.assertEqual(payload["schema_version"], 2)
         self.assertEqual(payload["request_id"], "req_unit_test")
         self.assertEqual(payload["stage"], "request_received")
         self.assertEqual(payload["state"]["session_id"], "session_unit_test")
@@ -1133,7 +1271,7 @@ class SnapshotResumeTests(unittest.TestCase):
 
         payload = self.agent._load_snapshot_payload("req_legacy_snapshot")
 
-        self.assertEqual(payload["schema_version"], 1)
+        self.assertEqual(payload["schema_version"], 2)
         self.assertEqual(payload["migrated_from_version"], 0)
         self.assertEqual(payload["state"]["messages"][0]["type"], "human")
         self.assertEqual(payload["state"]["messages"][0]["content"], "resume this legacy request")
@@ -1357,6 +1495,44 @@ class ToolRerouteTests(unittest.TestCase):
         self.assertEqual(failures[0]["tool"], "get_mock_weather")
         self.assertEqual(failures[0]["error_type"], "timeout")
 
+    def test_get_latest_successful_tool_name_to_pause_skips_non_truncated_success(self):
+        messages = [
+            HumanMessage(content="question"),
+            AIMessage(content="", tool_calls=[{"name": "read_text_file", "args": {"path": "demo.txt"}, "id": "call-1", "type": "tool_call"}]),
+            ToolMessage(
+                content=json.dumps({"ok": True, "path": "demo.txt", "content": "hello", "truncated": False}, ensure_ascii=False),
+                tool_call_id="call-1",
+            ),
+        ]
+
+        paused = self.agent._get_latest_successful_tool_name_to_pause(messages)
+
+        self.assertEqual(paused, "read_text_file")
+
+    def test_get_latest_successful_tool_name_to_pause_keeps_truncated_reads_available(self):
+        messages = [
+            HumanMessage(content="question"),
+            AIMessage(content="", tool_calls=[{"name": "read_text_file", "args": {"path": "demo.txt"}, "id": "call-1", "type": "tool_call"}]),
+            ToolMessage(
+                content=json.dumps({"ok": True, "path": "demo.txt", "content": "hello", "truncated": True}, ensure_ascii=False),
+                tool_call_id="call-1",
+            ),
+        ]
+
+        paused = self.agent._get_latest_successful_tool_name_to_pause(messages)
+
+        self.assertEqual(paused, "")
+
+    def test_should_downgrade_ask_user_to_continue_for_observation_answer(self):
+        should_downgrade = self.agent._should_downgrade_ask_user_to_continue(
+            "查看 nginx.conf 文件内容",
+            "文件内容如下：\n`hello world`",
+            "结果与预期不完全一致。",
+            recent_failures=[],
+        )
+
+        self.assertTrue(should_downgrade)
+
     def test_filter_failed_tools_for_subtask_excludes_failed_candidates(self):
         @tool
         def first_tool() -> str:
@@ -1384,6 +1560,15 @@ class ToolRerouteTests(unittest.TestCase):
         self.assertEqual([tool.name for tool in filtered_tools], [tools[1].name])
         self.assertEqual([item["name"] for item in filtered_skills], [tools[1].name])
         self.assertEqual(failed_names, [tools[0].name])
+
+    def test_merge_failed_tools_ignores_retryable_no_output_failures(self):
+        merged = self.agent._merge_failed_tools(
+            {},
+            0,
+            [{"tool": "bash", "error_type": "no_output", "retryable": True, "message": "empty output"}],
+        )
+
+        self.assertEqual(merged, {"0": []})
 
     def test_summarize_historical_failed_tools_counts_prior_subtasks(self):
         counts = self.agent.tool_runtime.summarize_historical_failed_tools(
@@ -1529,6 +1714,27 @@ class ToolRerouteTests(unittest.TestCase):
         self.assertEqual(reroute_plan["mode"], "alternative_tools")
         self.assertEqual([tool.name for tool in reroute_plan["selected_tools"]], [backup.name])
         self.assertEqual(reroute_plan["alternatives"], [backup.name])
+
+    def test_build_tool_reroute_plan_keeps_same_tool_for_retryable_no_output(self):
+        @tool
+        def bash(command: str) -> str:
+            """Run a shell command."""
+            return command
+
+        wrapped_bash = self.agent._wrap_tool_for_runtime(bash)
+
+        reroute_plan = self.agent._build_tool_reroute_plan(
+            "find core.py under current directory",
+            ["core.py", "当前目录"],
+            [wrapped_bash],
+            [{"name": wrapped_bash.name, "tool": wrapped_bash, "description": "Run a shell command."}],
+            [{"tool": wrapped_bash.name, "error_type": "no_output", "retryable": True, "message": "empty output"}],
+            [],
+        )
+
+        self.assertEqual(reroute_plan["mode"], "retry_same_tool_with_diagnostics")
+        self.assertEqual([tool.name for tool in reroute_plan["selected_tools"]], [wrapped_bash.name])
+        self.assertEqual(reroute_plan["alternatives"], [wrapped_bash.name])
 
     def test_build_tool_reroute_plan_falls_back_for_invalid_arguments(self):
         @tool
@@ -1967,6 +2173,61 @@ class ObservabilityTests(unittest.TestCase):
         self.assertEqual(payload["request_id"], request_id)
         self.assertEqual(payload["stage"], "subtask_started")
         self.assertEqual(payload["details"], "index=1")
+
+    def test_console_checkpoint_output_includes_details(self):
+        request_id = "req_console_details"
+        console_logger = logging.getLogger("llm_brain.console")
+        original_handlers = list(console_logger.handlers)
+        original_propagate = console_logger.propagate
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        console_logger.handlers = [handler]
+        console_logger.propagate = False
+        try:
+            self.llm_manager_module.llm_manager.log_checkpoint(
+                "subtask_started",
+                details="index=1 | description=获取当前目录下core.py文件的完整路径",
+                request_id=request_id,
+                console=True,
+            )
+        finally:
+            handler.flush()
+            console_logger.handlers = original_handlers
+            console_logger.propagate = original_propagate
+
+        rendered = stream.getvalue().strip()
+        self.assertIn(f"request_id={request_id}", rendered)
+        self.assertIn("stage=subtask_started", rendered)
+        self.assertIn("子任务1", rendered)
+        self.assertIn("获取当前目录下core.py文件的完整路径", rendered)
+
+    def test_retryable_no_output_tool_failure_is_logged_as_warning(self):
+        @tool
+        def bash(command: str) -> dict:
+            """Run a shell command."""
+            return {
+                "ok": True,
+                "command": command,
+                "stdout": "",
+                "stderr": "",
+                "exit_code": 0,
+                "shell": "powershell",
+            }
+
+        safe_tool = self.agent._wrap_tool_for_runtime(bash)
+        payload = safe_tool.invoke({"command": "Get-ChildItem -Path . -Filter core.py"})
+
+        self.assertEqual(payload["error_type"], "no_output")
+        events = self.llm_manager_module.llm_manager.get_request_events("-")
+        relevant_events = [
+            event for event in events
+            if event.get("stage") == "tool_failed" and event.get("tool_name") == "bash"
+        ]
+
+        self.assertTrue(relevant_events)
+        self.assertEqual(relevant_events[-1]["level"], "WARNING")
+        self.assertEqual(relevant_events[-1]["outcome"], "retryable")
 
     def test_request_summary_triage_surfaces_failure_context(self):
         request_id = "req_triage_failure"
@@ -2432,12 +2693,11 @@ class ObservabilityTests(unittest.TestCase):
         rollup = self.agent.get_request_rollup(limit=10, attention_only=True)
 
         self.assertEqual(rollup["request_count"], 4)
-        self.assertEqual(rollup["source_bucket_trends"][0]["source"], "tool_runtime")
-        self.assertEqual(rollup["source_bucket_trends"][0]["direction"], "up")
-        self.assertEqual(rollup["source_bucket_trends"][0]["delta_share"], 0.5)
-        self.assertEqual(rollup["source_bucket_trends"][1]["source"], "agent_invoke")
-        self.assertEqual(rollup["source_bucket_trends"][1]["direction"], "down")
-        self.assertEqual(rollup["source_bucket_trends"][1]["delta_share"], -0.5)
+        trend_map = {item["source"]: item for item in rollup["source_bucket_trends"]}
+        self.assertEqual(abs(trend_map["tool_runtime"]["delta_share"]), 0.5)
+        self.assertEqual(abs(trend_map["agent_invoke"]["delta_share"]), 0.5)
+        self.assertNotEqual(trend_map["tool_runtime"]["direction"], trend_map["agent_invoke"]["direction"])
+        self.assertEqual(trend_map["tool_runtime"]["delta_share"], -trend_map["agent_invoke"]["delta_share"])
 
     def test_request_rollup_supports_status_and_attention_filters(self):
         base_state = {

@@ -72,6 +72,49 @@ class CognitiveSystem:
     def __init__(self):
         self.domain_tree = list(DOMAIN_TREE)
 
+    def extract_keywords(self, text: str, limit: int = 5) -> List[str]:
+        source_text = str(text or "").strip()
+        if not source_text:
+            return []
+
+        normalized_limit = max(1, min(int(limit or 5), 10))
+        prompt = f"""
+        你是一个中文优先的关键词提取助手。
+        请从下面这句话里提取最重要的 {normalized_limit} 个关键词或关键短语，并按重要性排序。
+
+        要求:
+        1. 优先返回有语义的词或短语，不要拆成无意义的字片段。
+        2. 可以不完全照抄原句，允许使用更精炼但不改变原意的表达。
+        3. 如果文件名、路径范围、环境范围是关键信息，可以保留。
+        4. 只返回 JSON，不要解释。
+
+        返回格式:
+        {{
+            "keywords": ["词1", "词2", "词3"]
+        }}
+
+        文本:
+        {source_text}
+        """
+        try:
+            response = llm_manager.invoke(prompt, source="feature_extractor.extract_keywords")
+            data = parse_json_object(response.content, required_fields={"keywords": list})
+            keywords = []
+            seen = set()
+            for item in data.get("keywords", []):
+                value = str(item).strip()
+                marker = value.lower()
+                if not value or marker in seen:
+                    continue
+                seen.add(marker)
+                keywords.append(value)
+            return keywords[:normalized_limit]
+        except StructuredOutputError as e:
+            llm_manager.log_event(f"Keyword extraction structured parsing failed: {e}", level=40)
+        except Exception as e:
+            llm_manager.log_event(f"Keyword extraction failed: {e}", level=40)
+        return []
+
     def rewrite_intent(self, text: str) -> str:
         """Rewrite user intent into a concise, style-normalized expression without adding new facts."""
         source_text = str(text or "").strip()
@@ -84,7 +127,9 @@ class CognitiveSystem:
         1. 去掉语气助词、口头禅和风格噪声。
         2. 消除不同用户语言习惯差异，保留核心意图不变。
         3. 不添加原文没有的新信息。
-        4. 只返回重写后的单行文本，不要解释。
+        4. 原文中的前置条件、作用域限定、环境约束必须保留，不能省略或泛化。
+        5. 像“当前目录/当前工作区/当前文件/当前分支/当前环境/已选中内容”这类条件属于核心意图的一部分，必须明确保留。
+        6. 只返回重写后的单行文本，不要解释。
         用户输入:
         {source_text}
         """

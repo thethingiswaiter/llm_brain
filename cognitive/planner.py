@@ -3,113 +3,157 @@ from core.llm.manager import llm_manager
 from cognitive.structured_output import parse_json_array, StructuredOutputError, StructuredOutputSchemaError
 
 class TaskPlanner:
-    DIRECT_LOOKUP_MARKERS = (
-        "查询",
-        "查看",
-        "获取",
-        "显示",
-        "多少",
-        "几个",
-        "数量",
-        "总数",
-        "统计",
-        "告诉我",
-        "show me",
-        "how many",
-        "count",
-        "total",
-        "what is",
-        "what's",
-        "lookup",
-        "look up",
-        "get ",
-        "find ",
-    )
-    SEQUENTIAL_MARKERS = (
-        "然后",
+    COMPLEX_TASK_MARKERS = [
+        "分析",
+        "排查",
+        "规划",
+        "重构",
+        "修复",
+        "迁移",
+        "整理",
+        "汇总",
+        "设计",
+        "实现",
         "再",
-        "并且",
-        "同时",
-        "先",
-        "after",
-        "before",
-        "then",
-        "and then",
-    )
-    META_SUBTASK_MARKERS = (
-        "identify",
-        "determine",
-        "use",
-        "run",
-        "parse",
-        "extract",
-        "verify",
-        "validate",
-        "return",
-        "display",
+        "继续拆",
+        "逐步",
+        "多步",
+        "分阶段",
         "collect",
-        "识别",
-        "确定",
-        "使用",
-        "运行",
-        "解析",
-        "提取",
-        "验证",
-        "返回",
-        "显示",
-        "收集",
-    )
+        "analyze",
+        "investigate",
+        "replan",
+        "refactor",
+        "migrate",
+        "design",
+        "implement",
+        "step by step",
+        "multi-step",
+    ]
 
     def _single_task_plan(self, user_query: str) -> List[Dict[str, Any]]:
         description = str(user_query).strip() or "完成用户请求。"
         return [{
             "id": 1,
             "description": description,
-            "expected_outcome": (
-                "直接给出用户需要的结果。"
-                "只有在关键信息确实缺失时，才提出简洁的澄清问题。"
-            ),
+            "execution_mode": "leaf",
         }]
 
-    def _looks_like_direct_lookup(self, user_query: str) -> bool:
-        text = " ".join(str(user_query or "").strip().lower().split())
-        if not text:
-            return False
-        if any(marker in text for marker in self.SEQUENTIAL_MARKERS):
-            return False
-        if len(text) > 80 and len(text.split()) > 12:
-            return False
-        return any(marker in text for marker in self.DIRECT_LOOKUP_MARKERS)
+    def _contains_non_executable_manual_step(self, description: str) -> bool:
+        combined = str(description or "").lower()
+        markers = [
+            "vscode",
+            "visual studio code",
+            "notepad",
+            "notepad++",
+            "文本编辑器",
+            "编辑器",
+            "手动",
+            "人工",
+            "人类",
+            "请用户",
+            "让用户",
+            "用户手动",
+            "open in editor",
+            "manual",
+            "manually",
+            "ask the user to",
+        ]
+        return any(marker in combined for marker in markers)
 
-    def _looks_over_decomposed(self, subtasks: List[Dict[str, Any]]) -> bool:
-        if len(subtasks) <= 1:
-            return False
+    def _format_planning_capability_context(self, capability_context: Dict[str, Any] | None) -> str:
+        if not isinstance(capability_context, dict):
+            return ""
 
-        descriptions = [str(item.get("description", "")).strip().lower() for item in subtasks]
-        if not all(descriptions):
-            return False
-        return all(any(marker in description for marker in self.META_SUBTASK_MARKERS) for description in descriptions)
+        lines: list[str] = []
+        planning_policy = str(capability_context.get("planning_policy", "")).strip()
+        if planning_policy:
+            lines.append(f"规划原则: {planning_policy}")
 
-    def split_task(self, user_query: str, thinking_mode: bool = False) -> List[Dict[str, Any]]:
+        prompt_skills = capability_context.get("prompt_skills", [])
+        if isinstance(prompt_skills, list) and prompt_skills:
+            lines.append("当前可用 Prompt 技能:")
+            for item in prompt_skills:
+                if not isinstance(item, dict):
+                    continue
+                keywords = ", ".join(item.get("keywords", [])[:8])
+                lines.append(
+                    f"- {item.get('name', '')}: {item.get('description', '')}"
+                    f" | keywords: {keywords} | source: {item.get('source_file', '')}"
+                )
+
+        tools = capability_context.get("tools", [])
+        if isinstance(tools, list) and tools:
+            lines.append("当前可用工具:")
+            for item in tools:
+                if not isinstance(item, dict):
+                    continue
+                keywords = ", ".join(item.get("keywords", [])[:8])
+                constraints = "; ".join(item.get("constraints", [])[:4])
+                arguments = "; ".join(item.get("arguments", [])[:4])
+                tool_line = (
+                    f"- {item.get('name', '')}: {item.get('description', '')}"
+                    f" | keywords: {keywords} | source_type: {item.get('source_type', '')}"
+                )
+                if arguments:
+                    tool_line += f" | args: {arguments}"
+                if constraints:
+                    tool_line += f" | constraints: {constraints}"
+                lines.append(tool_line)
+
+        if not lines:
+            return ""
+        return "\n".join(lines)
+
+    def _normalize_execution_mode(self, value: Any) -> str:
+        normalized = str(value or "").strip().lower()
+        if normalized in {"leaf", "single_step", "single-step", "atomic"}:
+            return "leaf"
+        if normalized in {"decomposable", "complex", "multi_step", "multi-step", "compound"}:
+            return "decomposable"
+        return "leaf"
+
+    def _should_force_decomposable(self, description: str) -> bool:
+        normalized = str(description or "").strip().lower()
+        if not normalized:
+            return False
+        if any(marker in normalized for marker in self.COMPLEX_TASK_MARKERS):
+            return True
+        if normalized.count("并") >= 2 or normalized.count("然后") >= 1:
+            return True
+        return False
+
+    def split_task(
+        self,
+        user_query: str,
+        thinking_mode: bool = False,
+        capability_context: Dict[str, Any] | None = None,
+    ) -> List[Dict[str, Any]]:
         """
         根据核心需求规范，将复杂任务拆解成细粒度的“子任务”。
         要求：输出为JSON数组，每个子任务包含描述、预期结果等。
         """
+        capability_block = self._format_planning_capability_context(capability_context)
+        capability_section = f"\n\n当前能力清单:\n{capability_block}" if capability_block else ""
         prompt = f"""
         你是一个中文优先的任务规划代理。请把下面的用户任务拆解成一组可执行、细粒度的子任务。
         要求:
         1. 每个子任务都应尽量独立，并且最好只需要一个工具或一种技能即可完成。
-        2. 为每个子任务给出预期结果，用于后续校验。
-        3. 如果用户请求本身就是直接查询、单条命令或单个事实问题，必须保持为恰好一个子任务，并保留原始意图。
-        4. 除非用户明确要求多步骤流程，否则不要把简单请求拆成“识别/使用/解析/验证/返回”这类元步骤。
-        5. 只返回 JSON，不要输出解释或 Markdown 代码块。
+          2. 为每个子任务标注 execution_mode，只能是 "leaf" 或 "decomposable"。
+              - "leaf": 这是单步可执行子任务，应直接进入执行与校验。
+              - "decomposable": 这是仍需继续拆解的复杂子任务，应在执行前再次规划。
+        3. 规划时只能依赖当前已经注册的技能和工具，不要假设存在未列出的专用能力。
+        4. 如果某个技能或工具已经足以直接完成请求，应优先保持计划简洁，避免拆成没有独立价值的元步骤。
+        5. 针对具体问题的处理方式应该来自技能正文、工具描述和能力边界，而不是凭空发明隐藏流程。
+        6. 子任务必须是 agent 自己可执行的动作，禁止输出“手动操作 / 人工检查 / 让用户自己做”这类依赖人类或外部 GUI 手动完成的步骤。
+        7. 只返回 JSON，不要输出解释或 Markdown 代码块。{capability_section}
         
         请严格按以下 JSON 数组格式返回:
         [
             {{
                 "id": 1,
                 "description": "要执行的具体动作",
-                "expected_outcome": "成功后应得到的结果"
+                "execution_mode": "leaf"
             }}
         ]
         
@@ -128,22 +172,18 @@ class TaskPlanner:
                 if not description:
                     raise StructuredOutputSchemaError(f"Subtask {index} missing description.")
 
-                expected_outcome = str(item.get("expected_outcome", "User request fulfilled.")).strip()
+                execution_mode = self._normalize_execution_mode(item.get("execution_mode", "leaf"))
+                if self._should_force_decomposable(description):
+                    execution_mode = "decomposable"
+                if self._contains_non_executable_manual_step(description):
+                    raise StructuredOutputSchemaError(
+                        f"Subtask {index} contains manual or editor-dependent action: {description}"
+                    )
                 normalized_subtasks.append({
                     "id": item.get("id", index),
                     "description": description,
-                    "expected_outcome": expected_outcome or "User request fulfilled.",
+                    "execution_mode": execution_mode,
                 })
-            if not thinking_mode and self._looks_like_direct_lookup(user_query) and len(normalized_subtasks) > 1:
-                llm_manager.log_event(
-                    "Task splitting collapsed to single-step plan | reason=direct_lookup_default_mode"
-                )
-                return self._single_task_plan(user_query)
-            if self._looks_like_direct_lookup(user_query) and self._looks_over_decomposed(normalized_subtasks):
-                llm_manager.log_event(
-                    "Task splitting collapsed to single-step plan | reason=direct_lookup_over_decomposed"
-                )
-                return self._single_task_plan(user_query)
             return normalized_subtasks
         except StructuredOutputError as e:
             llm_manager.log_event(f"Task splitting structured parsing failed: {e}", level=40)

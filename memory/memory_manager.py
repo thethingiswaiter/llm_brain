@@ -201,7 +201,8 @@ class MemoryManager:
     def update_memory(self, memory_id: int, raw_output: Optional[str] = None,
                       summary: Optional[str] = None, keywords: Optional[list] = None,
                       raw_input: Optional[str] = None, request_id: Optional[str] = None,
-                      memory_type: Optional[str] = None, quality_tags = None):
+                      memory_type: Optional[str] = None, quality_tags = None,
+                      domain_label: Optional[str] = None):
         updates = []
         values = []
 
@@ -213,13 +214,16 @@ class MemoryManager:
             values.append(summary)
         if keywords is not None:
             updates.append("keywords = ?")
-            values.append(json.dumps(keywords))
+            values.append(json.dumps(keywords, ensure_ascii=False))
         if raw_input is not None:
             updates.append("raw_input = ?")
             values.append(raw_input)
         if request_id is not None:
             updates.append("request_id = ?")
             values.append(request_id)
+        if domain_label is not None:
+            updates.append("domain_label = ?")
+            values.append(domain_label)
         if memory_type is not None:
             updates.append("memory_type = ?")
             values.append((memory_type or "general").strip().lower())

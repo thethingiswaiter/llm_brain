@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 
 from tools import langchain_common_tools as tools_mod
+from core.config import config
 
 
 class LangchainCommonToolsTests(unittest.TestCase):
@@ -65,8 +66,9 @@ class LangchainCommonToolsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
 
-            original = tools_mod._workspace_root
-            tools_mod._workspace_root = lambda: root
+            original_extra_roots = list(config.extra_write_roots)
+            config.clear_write_roots()
+            config.grant_write_root(str(root))
             try:
                 created = tools_mod.write_text_file.invoke(
                     {"path": "out.txt", "content": "hello", "overwrite": False, "append": False}
@@ -75,10 +77,59 @@ class LangchainCommonToolsTests(unittest.TestCase):
                     {"path": "out.txt", "content": "world", "overwrite": False, "append": False}
                 )
             finally:
-                tools_mod._workspace_root = original
+                config.extra_write_roots = original_extra_roots
 
         self.assertTrue(created["ok"])
         self.assertFalse(blocked["ok"])
+
+    def test_read_text_file_allows_absolute_path_outside_workspace(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            outside_dir = root / "outside"
+            outside_dir.mkdir()
+            file_path = outside_dir / "demo.txt"
+            file_path.write_text("x\ny\nz\n", encoding="utf-8")
+
+            original = tools_mod._workspace_root
+            tools_mod._workspace_root = lambda: root / "workspace"
+            try:
+                result = tools_mod.read_text_file.invoke(
+                    {"path": str(file_path), "start_line": 1, "end_line": 2}
+                )
+            finally:
+                tools_mod._workspace_root = original
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["content"], "x\ny")
+
+    def test_write_text_file_blocks_outside_workspace_until_root_is_granted(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            target_dir = root / "shared"
+            target_dir.mkdir()
+            target_path = target_dir / "note.txt"
+
+            original = tools_mod._workspace_root
+            original_extra_roots = list(config.extra_write_roots)
+            tools_mod._workspace_root = lambda: workspace
+            config.clear_write_roots()
+            try:
+                blocked = tools_mod.write_text_file.invoke(
+                    {"path": str(target_path), "content": "hello", "overwrite": False, "append": False}
+                )
+                config.grant_write_root(str(target_dir))
+                allowed = tools_mod.write_text_file.invoke(
+                    {"path": str(target_path), "content": "hello", "overwrite": False, "append": False}
+                )
+            finally:
+                tools_mod._workspace_root = original
+                config.extra_write_roots = original_extra_roots
+
+        self.assertFalse(blocked["ok"])
+        self.assertIn("Allowed write roots", blocked["error"])
+        self.assertTrue(allowed["ok"])
 
     def test_json_query_reads_nested_key_path(self):
         with tempfile.TemporaryDirectory() as tempdir:

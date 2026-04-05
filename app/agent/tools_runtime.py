@@ -1,4 +1,5 @@
 import json
+import logging
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
@@ -22,6 +23,7 @@ class AgentToolRuntime:
         "invalid_arguments": 4,
         "dependency_unavailable": 3,
         "timeout": 3,
+        "no_output": 2,
         "execution_error": 2,
         "cancelled": 1,
     }
@@ -186,9 +188,21 @@ class AgentToolRuntime:
                 return result, None
             if isinstance(decoded, dict) and decoded.get("ok") is False:
                 payload = dict(decoded)
+            elif isinstance(decoded, dict):
+                synthesized_payload = self._build_empty_output_payload(tool_name, decoded)
+                if synthesized_payload:
+                    payload = synthesized_payload
+                    result = decoded
         elif isinstance(result, dict) and result.get("ok") is False:
             payload = dict(result)
+        elif isinstance(result, dict):
+            synthesized_payload = self._build_empty_output_payload(tool_name, result)
+            if synthesized_payload:
+                payload = synthesized_payload
         else:
+            return result, None
+
+        if payload is None:
             return result, None
 
         payload.setdefault("tool", tool_name)
@@ -201,6 +215,32 @@ class AgentToolRuntime:
 
         normalized_result = json.dumps(payload, ensure_ascii=False) if isinstance(result, str) else payload
         return normalized_result, payload
+
+    def _build_empty_output_payload(self, tool_name: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+        normalized_tool_name = str(tool_name or "").strip().lower()
+        if normalized_tool_name != "bash":
+            return None
+        if payload.get("ok") is not True:
+            return None
+
+        stdout = str(payload.get("stdout", "") or "").strip()
+        stderr = str(payload.get("stderr", "") or "").strip()
+        if stdout or stderr:
+            return None
+
+        return {
+            "ok": False,
+            "tool": tool_name,
+            "error_type": "no_output",
+            "retryable": True,
+            "message": (
+                "Command executed successfully but produced no output. "
+                "Do not assume success from exit_code alone. Verify whether the command scope is too narrow, "
+                "the target truly has no matches, or the command needs to explicitly print a verifiable result "
+                "such as full paths, counts, or an explicit not-found marker."
+            ),
+            "original_payload": payload,
+        }
 
     def validate_named_argument_heuristics(self, field_name: str, value: Any) -> str:
         normalized_name = field_name.strip().lower()
@@ -240,6 +280,36 @@ class AgentToolRuntime:
                 return f"Argument {field_name} must use a recognizable time format like HH:MM or YYYY-MM-DD HH:MM:SS."
 
         return ""
+
+    def _summarize_tool_result_for_console(self, tool_name: str, result: Any) -> str:
+        if isinstance(result, dict):
+            if result.get("ok") is False:
+                return str(result.get("message") or result.get("error") or "tool returned failure")[:160]
+            normalized_tool = str(tool_name or "").strip().lower()
+            if normalized_tool == "read_text_file":
+                path = str(result.get("path") or "").strip()
+                content = str(result.get("content") or "").strip().replace("\n", " ")
+                preview = content[:80] + ("..." if len(content) > 80 else "")
+                return f"path={path} | content={preview}" if path or preview else "read ok"
+            if normalized_tool == "list_directory":
+                return f"path={result.get('path', '')} | entries={result.get('entry_count', 0)}"
+            if normalized_tool == "grep_text":
+                return f"path={result.get('path', '')} | matches={len(result.get('matches', []) or [])}"
+            if normalized_tool == "write_text_file":
+                return f"path={result.get('path', '')} | bytes={result.get('bytes_written', 0)}"
+            if normalized_tool == "json_query":
+                value = str(result.get("value", "")).replace("\n", " ")
+                return f"path={result.get('path', '')} | value={value[:80]}"
+            summary_parts = []
+            for key in ("path", "result", "value", "message"):
+                if key in result and str(result.get(key) or "").strip():
+                    summary_parts.append(f"{key}={str(result.get(key)).replace(chr(10), ' ')[:80]}")
+            if summary_parts:
+                return " | ".join(summary_parts[:3])
+        if isinstance(result, str):
+            compact = str(result).strip().replace("\n", " ")
+            return compact[:160]
+        return str(result)[:160]
 
     def prevalidate_tool_arguments(self, tool_name: str, args_schema, kwargs: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
         if not args_schema:
@@ -360,36 +430,46 @@ class AgentToolRuntime:
                         continue
                 result, error_payload = self.normalize_tool_result_payload(tool_name, result)
                 if error_payload:
+                    error_type = str(error_payload.get("error_type", "execution_error") or "execution_error")
+                    retryable = bool(error_payload.get("retryable", False))
+                    is_retryable_no_output = retryable and error_type == "no_output"
+                    log_level = logging.WARNING if is_retryable_no_output else logging.ERROR
+                    log_outcome = "retryable" if is_retryable_no_output else "recorded"
                     stage_name = "tool_rejected" if not bool(error_payload.get("retryable", False)) else "tool_failed"
+                    summary = str(error_payload.get("message") or error_payload.get("reason") or "").strip()
                     llm_manager.log_checkpoint(
                         stage_name,
-                        details=f"tool={tool_name} | error_type={error_payload.get('error_type', 'execution_error')}",
+                        details=f"tool={tool_name} | error_type={error_type} | summary={summary[:160]}",
                         request_id=request_id,
-                        level=40,
+                        level=log_level,
                         console=True,
                         duration_ms=(time.monotonic() - started_at) * 1000,
                         tool_name=tool_name,
-                        error_type=error_payload.get("error_type", "execution_error"),
-                        retryable=bool(error_payload.get("retryable", False)),
+                        error_type=error_type,
+                        retryable=retryable,
+                        summary=summary[:160],
+                        outcome=log_outcome,
                     )
                     llm_manager.log_event(
                         (
                             f"Tool execution returned failure payload | tool={tool_name} | "
-                            f"error_type={error_payload.get('error_type', 'execution_error')} | "
-                            f"retryable={bool(error_payload.get('retryable', False))} | "
+                            f"error_type={error_type} | "
+                            f"retryable={retryable} | "
                             f"message={error_payload.get('message', '')}"
                         ),
-                        level=40,
+                        level=log_level,
                         request_id=request_id,
                     )
                     return result
+                result_summary = self._summarize_tool_result_for_console(tool_name, result)
                 llm_manager.log_checkpoint(
                     "tool_succeeded",
-                    details=f"tool={tool_name}",
+                    details=f"tool={tool_name} | summary={result_summary[:160]}",
                     request_id=request_id,
                     console=True,
                     duration_ms=(time.monotonic() - started_at) * 1000,
                     tool_name=tool_name,
+                    summary=result_summary[:160],
                 )
                 return result
             except RequestCancelledError as exc:
@@ -502,6 +582,8 @@ class AgentToolRuntime:
         key = str(subtask_index)
         existing = set(merged.get(key, []))
         for item in recent_failures:
+            if bool(item.get("retryable", False)):
+                continue
             existing.add(str(item.get("tool", "")))
         merged[key] = sorted(name for name in existing if name)
         return merged
@@ -734,6 +816,7 @@ class AgentToolRuntime:
         error_types = {str(item.get("error_type", "")) for item in recent_failures}
         retryable_failures = [item for item in recent_failures if bool(item.get("retryable", False))]
         non_retryable_failures = [item for item in recent_failures if not bool(item.get("retryable", False))]
+        retryable_no_output_failures = [item for item in retryable_failures if str(item.get("error_type", "") or "") == "no_output"]
 
         if non_retryable_failures and "invalid_arguments" in error_types:
             return {
@@ -742,6 +825,19 @@ class AgentToolRuntime:
                 "tool_skills": [],
                 "alternatives": [],
                 "reason": "latest tool failures indicate invalid arguments or missing required input",
+            }
+
+        if retryable_no_output_failures and selected_tools:
+            affected_tools = sorted({str(item.get("tool", "") or "").strip() for item in retryable_no_output_failures if str(item.get("tool", "") or "").strip()})
+            return {
+                "mode": "retry_same_tool_with_diagnostics",
+                "selected_tools": selected_tools,
+                "tool_skills": tool_skills,
+                "alternatives": affected_tools,
+                "reason": (
+                    "the latest tool invocation returned no output, so keep the tool available and retry with a "
+                    "diagnostic command that prints verifiable evidence instead of inferring success"
+                ),
             }
 
         high_risk_historical_names = sorted(

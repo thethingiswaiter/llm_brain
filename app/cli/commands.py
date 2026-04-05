@@ -2,6 +2,8 @@ from dataclasses import dataclass
 import re
 from typing import Any, Callable
 
+RESPONSE_DIVIDER = "----------------------------------------"
+
 
 @dataclass(frozen=True)
 class CLICommand:
@@ -14,6 +16,7 @@ def emit_response(output_func, response: str, request_id: str) -> None:
     if request_id:
         output_func(f"Request ID: {request_id}")
     output_func(f"\nResponse: {response}")
+    output_func(RESPONSE_DIVIDER)
 
 
 def build_request_mode_label(summary: dict[str, Any] | None) -> str:
@@ -35,7 +38,8 @@ def parse_detail_fields(details: str) -> dict[str, str]:
 def build_blocked_reason(summary: dict[str, Any] | None) -> str:
     if not summary:
         return ""
-    if str(summary.get("status") or "").strip().lower() != "blocked":
+    normalized_status = str(summary.get("status") or "").strip().lower()
+    if normalized_status not in {"blocked", "waiting_user"}:
         return ""
     triage = summary.get("triage", {}) or {}
     details = parse_detail_fields(str(triage.get("latest_failure_details", "") or ""))
@@ -56,6 +60,8 @@ def build_blocked_reason(summary: dict[str, Any] | None) -> str:
         return "当前路径已达到重试上限，继续沿用同一路径的收益较低。"
     if stage == "agent_blocked":
         return "当前请求已进入阻塞状态，需要调整输入或切换恢复路径。"
+    if stage == "agent_waiting_user":
+        return "当前请求正在等待你补充信息，补充后即可继续。"
     if reason:
         return f"当前请求被阻塞，原因: {reason}。"
     if error:
@@ -68,7 +74,7 @@ def build_next_action_suggestions(summary: dict[str, Any] | None) -> list[str]:
         return []
     request_id = str(summary.get("request_id") or "").strip()
     status = str(summary.get("status") or "").strip().lower()
-    if status == "blocked":
+    if status in {"blocked", "waiting_user"}:
         triage = summary.get("triage", {}) or {}
         details = parse_detail_fields(str(triage.get("latest_failure_details", "") or ""))
         suggestions = [
@@ -210,6 +216,7 @@ def emit_agent_response(context: dict[str, Any], response: str, request_id: str,
     if summary:
         emit_conversation_context(context["output_func"], summary)
     emit_plain_section(context["output_func"], "Response", [response], leading_blank_line=True)
+    context["output_func"](RESPONSE_DIVIDER)
 
 
 def set_selection_context(context: dict[str, Any], payload: dict[str, Any] | None) -> None:
@@ -443,6 +450,35 @@ def handle_load_tool(user_input: str, context: dict[str, Any]) -> bool:
         output_func(context["agent_instance"].load_tool(parts[1]))
     else:
         output_func("Usage: /load_tool <tool_name.py>")
+    return True
+
+
+def handle_grant_write(user_input: str, context: dict[str, Any]) -> bool:
+    output_func = context["output_func"]
+    parts = user_input.split(maxsplit=1)
+    if len(parts) == 2:
+        output_func(context["agent_instance"].grant_write_access(parts[1]))
+    else:
+        output_func("Usage: /grant_write <folder_path>")
+    return True
+
+
+def handle_revoke_write(user_input: str, context: dict[str, Any]) -> bool:
+    output_func = context["output_func"]
+    parts = user_input.split(maxsplit=1)
+    if len(parts) == 2:
+        output_func(context["agent_instance"].revoke_write_access(parts[1]))
+    else:
+        output_func("Usage: /revoke_write <folder_path>")
+    return True
+
+
+def handle_list_write_roots(_user_input: str, context: dict[str, Any]) -> bool:
+    output_func = context["output_func"]
+    roots = context["agent_instance"].list_write_access_roots()
+    output_func("Writable roots:")
+    for item in roots:
+        output_func(f"  {item}")
     return True
 
 
@@ -721,9 +757,9 @@ def handle_latest_failure(user_input: str, context: dict[str, Any]) -> bool:
         output_func("Usage: /latest_failure [summary|snapshots|resume]")
         return True
 
-    summary = get_latest_request_summary(context, statuses=["failed", "blocked", "timed_out", "cancelled"], attention_only=True)
+    summary = get_latest_request_summary(context, statuses=["failed", "blocked", "waiting_user", "timed_out", "cancelled"], attention_only=True)
     if not summary:
-        output_func("No recent failed or blocked request found.")
+        output_func("No recent failed, waiting, or blocked request found.")
         return True
     request_id = str(summary.get("request_id") or "").strip()
     if action == "summary":
@@ -738,9 +774,9 @@ def handle_latest_failure(user_input: str, context: dict[str, Any]) -> bool:
 
 def handle_resume_last_blocked(_user_input: str, context: dict[str, Any]) -> bool:
     output_func = context["output_func"]
-    summary = get_latest_request_summary(context, statuses=["blocked"], attention_only=True)
+    summary = get_latest_request_summary(context, statuses=["waiting_user", "blocked"], attention_only=True)
     if not summary:
-        output_func("No recent blocked request found.")
+        output_func("No recent waiting-user or blocked request found.")
         return True
     request_id = str(summary.get("request_id") or "").strip()
     snapshot_name = choose_resume_snapshot_name(context["agent_instance"], request_id, reroute=True)
@@ -803,7 +839,7 @@ def build_subtask_view_rows(summary: dict[str, Any]) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     for index, item in enumerate(plan, start=1):
         description = str(item.get("description") or "").strip() or f"Step {index}"
-        expected_outcome = str(item.get("expected_outcome") or "").strip() or "-"
+        execution_mode = str(item.get("execution_mode") or "leaf").strip() or "leaf"
         if index < current_index:
             row_status = "completed"
         elif index == current_index:
@@ -812,9 +848,9 @@ def build_subtask_view_rows(summary: dict[str, Any]) -> list[dict[str, str]]:
             row_status = "pending"
         if status_text == "completed" and index <= max(current_index, 1):
             row_status = "completed"
-        if status_text == "blocked" and index == max(current_index, 1):
+        if status_text in {"blocked", "waiting_user"} and index == max(current_index, 1):
             row_status = "blocked"
-        rows.append({"step": description, "status": row_status, "detail": expected_outcome})
+        rows.append({"step": description, "status": row_status, "detail": f"mode={execution_mode}"})
     return rows
 
 
@@ -882,7 +918,8 @@ def build_tool_feedback_rows(summary: dict[str, Any]) -> list[dict[str, str]]:
     triage = summary.get("triage", {}) or {}
     failure_details = parse_detail_fields(str(triage.get("latest_failure_details") or ""))
     if failure_details.get("tool"):
-        row_status = "blocked" if str(summary.get("status") or "").strip().lower() == "blocked" else "failed"
+        normalized_status = str(summary.get("status") or "").strip().lower()
+        row_status = "blocked" if normalized_status in {"blocked", "waiting_user"} else "failed"
         summary_parts = []
         if failure_details.get("reason"):
             summary_parts.append(f"reason={failure_details['reason']}")
@@ -1131,7 +1168,7 @@ def parse_request_filter_args(parts: list[str], usage_text: str) -> tuple[int, l
         except ValueError:
             next_index = 1
 
-    valid_statuses = {"active", "blocked", "cancelled", "completed", "failed", "in_progress", "not_found", "timed_out"}
+    valid_statuses = {"active", "blocked", "waiting_user", "cancelled", "completed", "failed", "in_progress", "not_found", "timed_out"}
     for token in parts[next_index:]:
         normalized = token.strip().lower()
         if not normalized:
@@ -1425,13 +1462,13 @@ def handle_request_rollup(user_input: str, context: dict[str, Any]) -> bool:
 
 def handle_failed_requests(user_input: str, context: dict[str, Any]) -> bool:
     parts = user_input.split()
-    usage_text = "/failed_requests [limit] [status=failed,blocked,timed_out,cancelled,...] [resumed] [attention] [since=30m]"
+    usage_text = "/failed_requests [limit] [status=failed,waiting_user,blocked,timed_out,cancelled,...] [resumed] [attention] [since=30m]"
     return handle_recent_request_query(
         context,
         parts,
         usage_text,
-        "Recent failed or blocked requests:",
-        default_statuses=["failed", "blocked", "timed_out", "cancelled"],
+        "Recent failed, waiting, or blocked requests:",
+        default_statuses=["failed", "waiting_user", "blocked", "timed_out", "cancelled"],
     )
 
 
@@ -1679,6 +1716,9 @@ def build_commands() -> tuple[dict[str, CLICommand], list[str]]:
     command_specs = [
         CLICommand("/llm", "/llm [model_key|list] - List configured LLM models, select with /pick, or switch by configured model key; use /llm raw <provider> <model> ... for manual override", handle_llm),
         CLICommand("/load_tool", "/load_tool <tool_name.py> - Load a local python tool", handle_load_tool),
+        CLICommand("/grant_write", "/grant_write <folder_path> - Temporarily allow write access to a specific folder", handle_grant_write),
+        CLICommand("/revoke_write", "/revoke_write <folder_path> - Revoke a previously granted write folder", handle_revoke_write),
+        CLICommand("/list_write_roots", "/list_write_roots - Show the current writable root directories", handle_list_write_roots),
         CLICommand("/load_skill", "/load_skill <skill_name.md> - Load a local markdown skill", handle_load_skill),
         CLICommand("/replay", "/replay <memory_id> [injected features...] - Replay memory with optional injected features", handle_replay),
         CLICommand("/convert_skill", "/convert_skill <memory_id> - Convert memory into a markdown skill", handle_convert_skill),
@@ -1692,14 +1732,14 @@ def build_commands() -> tuple[dict[str, CLICommand], list[str]]:
         CLICommand("/request_summary", "/request_summary [request_id] - Show the aggregated status, checkpoints, snapshots, and memories for a request", handle_request_summary),
         CLICommand("/summary", "/summary [request_id] - Alias of /request_summary using the latest request by default", handle_request_summary),
         CLICommand("/history", "/history [limit] - Show a compact view of recent user inputs, rewritten intents, and replies", handle_history),
-        CLICommand("/recent_requests", "/recent_requests [limit] [status=failed,blocked,...] [resumed] [attention] [since=30m] - Show recent request summaries and key metrics", handle_recent_requests),
-        CLICommand("/recent", "/recent [limit] [status=failed,blocked,...] [resumed] [attention] [since=30m] - Alias of /recent_requests", handle_recent_requests),
-        CLICommand("/request_rollup", "/request_rollup [limit] [status=failed,blocked,...] [resumed] [attention] [since=30m] - Show aggregate metrics across recent requests", handle_request_rollup),
-        CLICommand("/rollup", "/rollup [limit] [status=failed,blocked,...] [resumed] [attention] [since=30m] - Alias of /request_rollup", handle_request_rollup),
-        CLICommand("/failed_requests", "/failed_requests [limit] [status=failed,blocked,timed_out,cancelled,...] [resumed] [attention] [since=30m] - Alias of recent request query with failure-oriented defaults", handle_failed_requests),
-        CLICommand("/latest_failure", "/latest_failure [summary|snapshots|resume] - Open the most recent failed or blocked request with a preset action", handle_latest_failure),
-        CLICommand("/resumed_requests", "/resumed_requests [limit] [status=failed,blocked,...] [attention] [since=30m] - Alias of recent request query scoped to resumed requests", handle_resumed_requests),
-        CLICommand("/resume_last_blocked", "/resume_last_blocked - Reroute resume the most recent blocked request", handle_resume_last_blocked),
+        CLICommand("/recent_requests", "/recent_requests [limit] [status=failed,waiting_user,blocked,...] [resumed] [attention] [since=30m] - Show recent request summaries and key metrics", handle_recent_requests),
+        CLICommand("/recent", "/recent [limit] [status=failed,waiting_user,blocked,...] [resumed] [attention] [since=30m] - Alias of /recent_requests", handle_recent_requests),
+        CLICommand("/request_rollup", "/request_rollup [limit] [status=failed,waiting_user,blocked,...] [resumed] [attention] [since=30m] - Show aggregate metrics across recent requests", handle_request_rollup),
+        CLICommand("/rollup", "/rollup [limit] [status=failed,waiting_user,blocked,...] [resumed] [attention] [since=30m] - Alias of /request_rollup", handle_request_rollup),
+        CLICommand("/failed_requests", "/failed_requests [limit] [status=failed,waiting_user,blocked,timed_out,cancelled,...] [resumed] [attention] [since=30m] - Alias of recent request query with failure-oriented defaults", handle_failed_requests),
+        CLICommand("/latest_failure", "/latest_failure [summary|snapshots|resume] - Open the most recent failed, waiting, or blocked request with a preset action", handle_latest_failure),
+        CLICommand("/resumed_requests", "/resumed_requests [limit] [status=failed,waiting_user,blocked,...] [attention] [since=30m] - Alias of recent request query scoped to resumed requests", handle_resumed_requests),
+        CLICommand("/resume_last_blocked", "/resume_last_blocked - Reroute resume the most recent waiting-user or blocked request", handle_resume_last_blocked),
         CLICommand("/list_tool_runs", "/list_tool_runs [request_id] [running|detached] - Show tracked in-flight or detached tool runs", handle_list_tool_runs),
         CLICommand("/detached_tools", "/detached_tools [request_id] - Show detached tools for a request, defaulting to the latest request", handle_detached_tools),
         CLICommand("/suggest", "/suggest [prefix] - Suggest commands, request ids, snapshots, and recent inputs for the given prefix", handle_suggest),

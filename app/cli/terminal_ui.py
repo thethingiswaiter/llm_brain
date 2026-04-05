@@ -4,15 +4,69 @@ from contextlib import contextmanager
 import logging
 from typing import Any, Callable
 
+from app.cli.commands import RESPONSE_DIVIDER
+
 
 class TerminalUI:
     def __init__(self, output_func: Callable[[str], None], input_func: Callable[[str], str]):
         self.output_func = output_func
         self.input_func = input_func
         self.structured_output_enabled = False
+        self._last_stage_request_id = ""
 
     def emit(self, message: str = "") -> None:
         self.output_func(str(message or ""))
+
+    def _emit_divider(self, label: str = "") -> None:
+        if label:
+            self.emit(f"{RESPONSE_DIVIDER} {label} {RESPONSE_DIVIDER}")
+            return
+        self.emit(RESPONSE_DIVIDER)
+
+    def _format_stage_label(self, stage: str) -> str:
+        normalized = str(stage or "").strip().lower()
+        stage_map = {
+            "agent_started": "agent start",
+            "planning_started": "planning",
+            "planning_completed": "plan ready",
+            "subtask_started": "subtask",
+            "reflection_completed": "reflect",
+            "subtask_replanned": "replan",
+            "tool_started": "tool start",
+            "tool_succeeded": "tool ok",
+            "tool_failed": "tool failed",
+            "tool_reroute_applied": "tool reroute",
+            "agent_completed": "agent done",
+            "agent_finished": "finished",
+            "agent_blocked": "blocked",
+            "agent_waiting_user": "waiting",
+            "agent_timeout": "timeout",
+        }
+        return stage_map.get(normalized, normalized.replace("_", " "))
+
+    def _stage_marker(self, stage: str, level: int) -> str:
+        normalized = str(stage or "").strip().lower()
+        if level >= logging.ERROR or any(token in normalized for token in ("failed", "blocked", "timeout", "rejected", "detached")):
+            return "!"
+        return ">"
+
+    def _format_stage_event_line(self, stage: str, request_id: str = "", level: int = logging.INFO, details: str = "") -> str:
+        marker = self._stage_marker(stage, level)
+        header_parts = [f"{marker} {self._format_stage_label(stage)}"]
+        normalized_request_id = str(request_id or "").strip()
+        normalized_details = str(details or "").strip()
+        if normalized_request_id and normalized_request_id != self._last_stage_request_id:
+            header_parts.append(f"request={normalized_request_id}")
+            self._last_stage_request_id = normalized_request_id
+        if not normalized_details:
+            return " | ".join(header_parts)
+        detail_lines = [line.strip() for line in normalized_details.splitlines() if line.strip()]
+        if not detail_lines:
+            return " | ".join(header_parts)
+        first_line = " | ".join(header_parts + [detail_lines[0]])
+        if len(detail_lines) == 1:
+            return first_line
+        return first_line + "\n" + "\n".join(f"  {line}" for line in detail_lines[1:])
 
     def _emit_plain_section(self, title: str, lines: list[str], leading_blank_line: bool = False) -> None:
         section_lines = [str(item) for item in lines if str(item or "").strip()]
@@ -39,11 +93,14 @@ class TerminalUI:
         return
 
     def render_welcome(self, session_id: str) -> None:
+        self._emit_divider("CLI")
         self.emit("Welcome to the General Agent CLI (LangGraph 1.x based)")
         self.emit(f"Session: {session_id}")
         self.emit("Type 'help' to see special commands or just type your query.")
+        self.emit("Responses end with a divider so consecutive replies are easier to distinguish.")
 
     def render_help(self, command_texts: list[str]) -> None:
+        self._emit_divider("HELP")
         self.emit("Available commands:")
         for item in command_texts:
             self.emit(f"  {item}")
@@ -82,7 +139,9 @@ class TerminalUI:
             suggestions = summary.get("suggested_actions") or []
             if suggestions:
                 self._emit_plain_section("Next Actions", ["Next: " + " | ".join(str(item) for item in suggestions)], leading_blank_line=True)
-        self._emit_plain_section("Response", [response], leading_blank_line=True)
+        response_lines = str(response or "").splitlines() or [""]
+        self._emit_plain_section("Response", response_lines, leading_blank_line=True)
+        self._emit_divider()
 
     def render_key_value_block(self, title: str, rows: list[tuple[str, Any]]) -> None:
         lines = [f"{key}: {value}" for key, value in rows]
@@ -234,9 +293,13 @@ class TerminalUI:
         for row in rows:
             self.emit("  - " + " | ".join(str(item) for item in row))
 
-    def render_stage_event(self, stage: str, request_id: str = "", level: int = logging.INFO) -> None:
-        return
+    def render_stage_event(self, stage: str, request_id: str = "", level: int = logging.INFO, details: str = "") -> None:
+        self.emit(self._format_stage_event_line(stage, request_id=request_id, level=level, details=details))
 
     @contextmanager
     def busy(self, status_text: str):
-        yield
+        self.emit(f"> status | {status_text}")
+        try:
+            yield
+        finally:
+            self.emit(f"> status | completed: {status_text}")

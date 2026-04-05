@@ -120,8 +120,14 @@ class LLMManager:
     def log_event(self, message: str, level: int = logging.INFO, request_id: str | None = None, **fields) -> None:
         self.logging.log_event(message, level=level, request_id=request_id, **fields)
 
-    def console_event(self, stage: str, request_id: str | None = None, level: int = logging.INFO) -> None:
-        self.logging.console_event(stage, request_id=request_id, level=level)
+    def console_event(
+        self,
+        stage: str,
+        request_id: str | None = None,
+        level: int = logging.INFO,
+        details: str = "",
+    ) -> None:
+        self.logging.console_event(stage, request_id=request_id, level=level, details=details)
 
     def log_checkpoint(
         self,

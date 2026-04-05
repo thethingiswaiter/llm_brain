@@ -92,10 +92,12 @@ class AgentRuntime:
             "retry_counts": {},
             "replan_counts": {},
             "blocked": False,
+            "waiting_for_user": False,
             "final_response": "",
             "lite_mode": False,
             "normalized_query": query,
             "subtask_feature_cache": {},
+            "agent_action": "",
         }
 
     def _execute_graph(self, inputs: dict[str, Any], request_id: str):
@@ -213,7 +215,11 @@ class AgentRuntime:
                     return dependency_message
 
                 final_output = result.get("final_response") or result["messages"][-1].content
-                latest_stage = "agent_blocked" if result.get("blocked") else "request_completed"
+                latest_stage = "request_completed"
+                if result.get("waiting_for_user"):
+                    latest_stage = "agent_waiting_user"
+                elif result.get("blocked"):
+                    latest_stage = "agent_blocked"
                 if latest_stage == "request_completed":
                     self.agent._persist_state_snapshot(
                         request_id,
@@ -231,7 +237,7 @@ class AgentRuntime:
                         duration_ms=(time.monotonic() - request_started_at) * 1000,
                         outcome="completed",
                     )
-                else:
+                elif latest_stage == "agent_blocked":
                     llm_manager.log_structured_event(
                         "agent_request",
                         message="Agent request blocked",
@@ -241,6 +247,17 @@ class AgentRuntime:
                         source="agent.invoke",
                         duration_ms=(time.monotonic() - request_started_at) * 1000,
                         outcome="blocked",
+                    )
+                else:
+                    llm_manager.log_structured_event(
+                        "agent_request",
+                        message="Agent request is waiting for user input",
+                        request_id=request_id,
+                        session_id=active_session_id,
+                        stage="agent_waiting_user",
+                        source="agent.invoke",
+                        duration_ms=(time.monotonic() - request_started_at) * 1000,
+                        outcome="waiting_user",
                     )
                 llm_manager.console_event("agent_finished", request_id=request_id)
                 llm_manager.log_event(f"Agent response | session_id={active_session_id}\n{final_output}")
@@ -381,7 +398,7 @@ class AgentRuntime:
             )
 
         stored_state = payload.get("state", {})
-        if stored_state.get("blocked") and not reroute:
+        if (stored_state.get("blocked") or stored_state.get("waiting_for_user")) and not reroute:
             return stored_state.get("final_response") or "Snapshot is already in a blocked terminal state."
         if stored_state.get("final_response") and stored_state.get("current_subtask_index", 0) >= len(stored_state.get("plan", [])):
             return stored_state.get("final_response")

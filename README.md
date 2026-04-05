@@ -11,6 +11,7 @@
 - 项目总览：./docs/project_overview.md
 - 项目定位（速览）：./docs/project_positioning.md
 - 能力说明：./docs/agent.md
+- 能力边界清单：./docs/capabilities_reference.md
 - 后续路线：./docs/completeness_roadmap.md
 
 建议阅读顺序：

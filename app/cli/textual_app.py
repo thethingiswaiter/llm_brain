@@ -13,6 +13,7 @@ from textual.widgets import Footer, Header, Input, RichLog, Static
 
 from app.agent.core import agent
 from app.cli.commands import (
+    RESPONSE_DIVIDER,
     build_commands,
     build_input_suggestions,
     build_natural_language_command,
@@ -120,12 +121,14 @@ class AgentTextualApp(App[None]):
             "session_id": agent_instance.start_session(),
             "recent_inputs": [],
         }
+        self.structured_output_enabled = False
         self.commands, self.command_order = build_commands()
         self._busy = False
         self._autocomplete_seed = ""
         self._autocomplete_suggestions: list[str] = []
         self._autocomplete_index = -1
         self._response_block_active = False
+        self._last_stage_request_id = ""
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -217,7 +220,7 @@ class AgentTextualApp(App[None]):
                 "agent_instance": self.agent_instance,
                 "llm_manager_instance": self.llm_manager_instance,
                 "output_func": self._threadsafe_emit,
-                "ui": None,
+                "ui": self,
                 "session_state": self.session_state,
                 "commands": self.commands,
                 "command_order": self.command_order,
@@ -344,6 +347,48 @@ class AgentTextualApp(App[None]):
             log.write(renderable)
             self._response_block_active = response_block_active
 
+    def render_response(self, request_id: str, response: str, summary: dict[str, Any] | None = None) -> None:
+        if request_id:
+            self._threadsafe_emit(f"Request ID: {request_id}")
+        if summary:
+            metrics = summary.get("metrics", {}) or {}
+            self._threadsafe_emit("Summary:")
+            self._threadsafe_emit(
+                "  "
+                f"request={summary.get('request_id') or '-'} | "
+                f"stage={summary.get('latest_stage') or '-'} | "
+                f"mode={'lite_chat' if summary.get('lite_mode') else 'task'} | "
+                f"progress={summary.get('subtask_index', 0)}/{summary.get('plan_length', 0)} | "
+                f"tool_calls={metrics.get('tool_call_count', 0)} | "
+                f"total_ms={metrics.get('total_duration_ms', '-') }"
+            )
+            raw_query = str(summary.get("raw_query") or "").strip()
+            normalized_query = str(summary.get("normalized_query") or "").strip()
+            mode_text = "lite_chat" if summary.get("lite_mode") else "task"
+            status_text = str(summary.get("status") or "-")
+            self._threadsafe_emit("")
+            self._threadsafe_emit("Conversation Context:")
+            if raw_query:
+                self._threadsafe_emit(f"  Input: {raw_query}")
+            if normalized_query and normalized_query != raw_query:
+                self._threadsafe_emit(f"  Intent: {normalized_query}")
+            self._threadsafe_emit(f"  Mode: {mode_text} | Status: {status_text}")
+            blocked_reason = str(summary.get("blocked_reason") or "").strip()
+            if blocked_reason:
+                self._threadsafe_emit("")
+                self._threadsafe_emit("Risk:")
+                self._threadsafe_emit(f"  Blocked Reason: {blocked_reason}")
+            suggestions = summary.get("suggested_actions") or []
+            if suggestions:
+                self._threadsafe_emit("")
+                self._threadsafe_emit("Next Actions:")
+                self._threadsafe_emit("  Next: " + " | ".join(str(item) for item in suggestions))
+        response_lines = str(response or "").splitlines() or [""]
+        self._threadsafe_emit("Agent>")
+        for line in response_lines:
+            self._threadsafe_emit(line)
+        self._threadsafe_emit(RESPONSE_DIVIDER)
+
     def _write_welcome(self) -> None:
         self._write("llm_brain Textual Terminal")
         self._write(f"Session: {self.session_state['session_id']}")
@@ -403,6 +448,51 @@ class AgentTextualApp(App[None]):
         self._append_status_segment(text, "mcp", str(mcp_count), "bold #fca5a5")
         return text
 
+    def _format_stage_label(self, stage: str) -> str:
+        normalized = str(stage or "").strip().lower()
+        stage_map = {
+            "agent_started": "agent start",
+            "planning_started": "planning",
+            "planning_completed": "plan ready",
+            "subtask_started": "subtask",
+            "reflection_completed": "reflect",
+            "subtask_replanned": "replan",
+            "tool_started": "tool start",
+            "tool_succeeded": "tool ok",
+            "tool_failed": "tool failed",
+            "tool_reroute_applied": "tool reroute",
+            "agent_completed": "agent done",
+            "agent_finished": "finished",
+            "agent_blocked": "blocked",
+            "agent_waiting_user": "waiting",
+            "agent_timeout": "timeout",
+        }
+        return stage_map.get(normalized, normalized.replace("_", " "))
+
+    def _stage_marker(self, stage: str, level: int) -> str:
+        normalized = str(stage or "").strip().lower()
+        if level >= logging.ERROR or any(token in normalized for token in ("failed", "blocked", "timeout", "rejected", "detached")):
+            return "!"
+        return ">"
+
+    def _format_stage_event_line(self, stage: str, request_id: str = "", level: int = logging.INFO, details: str = "") -> str:
+        prefix = self._stage_marker(stage, level)
+        header_parts = [f"{prefix} {self._format_stage_label(stage)}"]
+        normalized_request_id = str(request_id or "").strip()
+        normalized_details = str(details or "").strip()
+        if normalized_request_id and normalized_request_id != self._last_stage_request_id:
+            header_parts.append(f"request={normalized_request_id}")
+            self._last_stage_request_id = normalized_request_id
+        if not normalized_details:
+            return " | ".join(header_parts)
+        detail_lines = [line.strip() for line in normalized_details.splitlines() if line.strip()]
+        if not detail_lines:
+            return " | ".join(header_parts)
+        first_line = " | ".join(header_parts + [detail_lines[0]])
+        if len(detail_lines) == 1:
+            return first_line
+        return first_line + "\n" + "\n".join(f"  {line}" for line in detail_lines[1:])
+
     def _build_autocomplete_panel_renderable(self) -> Text:
         text = Text()
         text.append("Commands\n", style="bold #c4b5fd")
@@ -423,15 +513,34 @@ class AgentTextualApp(App[None]):
 
         timestamp = now_china().strftime("%H:%M:%S")
 
+        if raw_line == RESPONSE_DIVIDER:
+            text = self._build_log_prefix(timestamp)
+            text.append(raw_line, style="#475569")
+            return text, False
+
         if raw_line in {"Response:", "Final Response:"}:
             text = self._build_log_prefix(timestamp)
-            text.append(raw_line, style="bold #0b1020 on #f8fafc")
+            text.append("Agent", style="bold #34d399")
+            text.append(">", style="#6ee7b7")
             return text, True
 
         if response_block_active and not raw_line.endswith(":"):
             text = self._build_log_prefix(timestamp)
-            text.append(raw_line, style="bold #f8fafc on #1e3a5f")
+            text.append(raw_line, style="#e2e8f0")
             return text, True
+
+        if raw_line == "Agent>":
+            text = self._build_log_prefix(timestamp)
+            text.append("Agent", style="bold #34d399")
+            text.append("> ", style="#6ee7b7")
+            return text, True
+
+        if raw_line.startswith("Agent> "):
+            text = self._build_log_prefix(timestamp)
+            text.append("Agent", style="bold #34d399")
+            text.append("> ", style="#6ee7b7")
+            text.append(raw_line[7:], style="#e2e8f0")
+            return text, False
 
         if raw_line.startswith("You> "):
             text = self._build_log_prefix(timestamp)
@@ -465,10 +574,15 @@ class AgentTextualApp(App[None]):
             parts = raw_line.split(" ", 2)
             if len(parts) >= 2:
                 prefix, stage = parts[0], parts[1]
+                details = parts[2] if len(parts) >= 3 else ""
                 text = self._build_log_prefix(timestamp)
                 text.append(prefix, style="bold #ef4444" if prefix == "!" else "bold #22c55e")
                 text.append(" ")
                 text.append(stage, style=self._stage_style(stage))
+                if details:
+                    text.append(" ")
+                    detail_style = "#fecaca" if prefix == "!" else "#cbd5e1"
+                    text.append(details, style=detail_style)
                 return text, False
 
         if raw_line.startswith("Session: "):
@@ -530,9 +644,24 @@ class AgentTextualApp(App[None]):
 
         original_console_event = logging_facade.console_event
 
-        def bridged_console_event(stage: str, request_id: str | None = None, level: int = logging.INFO) -> None:
-            prefix = "!" if level >= logging.ERROR else ">"
-            self._threadsafe_emit(f"{prefix} {stage}")
+        def bridged_console_event(
+            stage: str,
+            request_id: str | None = None,
+            level: int = logging.INFO,
+            details: str = "",
+        ) -> None:
+            if str(stage or "").strip().lower() == "tool_started":
+                return
+            normalized_details = str(details or "")
+            summarize = getattr(logging_facade, "_summarize_console_details", None)
+            format_details = getattr(logging_facade, "_format_console_details", None)
+            if callable(summarize):
+                normalized_details = summarize(stage, normalized_details)
+            if callable(format_details):
+                normalized_details = format_details(normalized_details)
+            self._threadsafe_emit(
+                self._format_stage_event_line(stage, request_id=request_id or "", level=level, details=normalized_details)
+            )
             self._refresh_dashboard_from_thread()
 
         logging_facade._original_console_event = original_console_event

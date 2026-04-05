@@ -142,11 +142,11 @@ class AgentObservability:
             outcome = str(event.get("outcome", "")).lower()
             level = str(event.get("level", "")).upper()
             stage = str(event.get("stage", ""))
-            if outcome in {"failed", "cancelled", "timed_out", "blocked", "error"}:
+            if outcome in {"failed", "cancelled", "timed_out", "blocked", "waiting_user", "error"}:
                 return event
             if level == "ERROR":
                 return event
-            if stage in {"agent_blocked", "request_failed", "request_cancelled", "request_timed_out", "tool_failed", "tool_rejected", "tool_cancelled", "tool_detached"}:
+            if stage in {"agent_blocked", "agent_waiting_user", "request_failed", "request_cancelled", "request_timed_out", "tool_failed", "tool_rejected", "tool_cancelled", "tool_detached"}:
                 return event
         return None
 
@@ -172,7 +172,7 @@ class AgentObservability:
                 return "tool_runtime"
             if stage_bucket == "reflection":
                 return "reflection"
-            if stage in {"agent_blocked"}:
+            if stage in {"agent_blocked", "agent_waiting_user"}:
                 return "reflection"
             return "checkpoint"
         if normalized_source.startswith("agent."):
@@ -187,11 +187,11 @@ class AgentObservability:
             source = self.normalize_failure_source(str(event.get("source", "") or ""), stage)
             if not source:
                 continue
-            if outcome in {"failed", "cancelled", "timed_out", "blocked", "error"}:
+            if outcome in {"failed", "cancelled", "timed_out", "blocked", "waiting_user", "error"}:
                 return source
             if level == "ERROR":
                 return source
-            if stage in {"agent_blocked", "request_failed", "request_cancelled", "request_timed_out", "tool_failed", "tool_rejected", "tool_cancelled", "tool_detached"}:
+            if stage in {"agent_blocked", "agent_waiting_user", "request_failed", "request_cancelled", "request_timed_out", "tool_failed", "tool_rejected", "tool_cancelled", "tool_detached"}:
                 return source
         return ""
 
@@ -213,7 +213,7 @@ class AgentObservability:
         latest_reroute_details = ""
         for item in reversed(checkpoints):
             stage = str(item.get("stage", ""))
-            if stage in {"agent_blocked", "request_failed", "request_cancelled", "request_timed_out", "tool_failed", "tool_rejected", "tool_cancelled", "tool_detached"}:
+            if stage in {"agent_blocked", "agent_waiting_user", "request_failed", "request_cancelled", "request_timed_out", "tool_failed", "tool_rejected", "tool_cancelled", "tool_detached"}:
                 latest_failure_stage = stage
                 latest_failure_details = self.enrich_failure_detail_fields(str(item.get("details", "")), latest_extra)
                 latest_failure_source = self.normalize_failure_source(str(item.get("source", "") or ""), stage)
@@ -229,7 +229,7 @@ class AgentObservability:
             latest_reroute_details = str(item.get("details", "") or "")
             break
 
-        if not latest_failure_stage and status in {"blocked", "failed", "cancelled", "timed_out"}:
+        if not latest_failure_stage and status in {"waiting_user", "blocked", "failed", "cancelled", "timed_out"}:
             latest_failure_stage = str(latest_stage or latest_extra.get("stage", "") or "")
         if not latest_failure_details:
             latest_failure_details = self.enrich_failure_detail_fields("", latest_extra)
@@ -248,7 +248,7 @@ class AgentObservability:
         )
 
         return {
-            "needs_attention": status in {"blocked", "failed", "cancelled", "timed_out"} or detached_tool_count > 0,
+            "needs_attention": status in {"waiting_user", "blocked", "failed", "cancelled", "timed_out"} or detached_tool_count > 0,
             "is_resumed": bool(source_request_id),
             "source_request_id": source_request_id,
             "latest_failure_stage": latest_failure_stage,
@@ -264,11 +264,14 @@ class AgentObservability:
             "has_detached_tools": detached_tool_count > 0,
             "retry_count": int(metrics.get("retry_count", 0) or 0),
             "blocked": bool(latest_state.get("blocked", False)),
+            "waiting_for_user": bool(latest_state.get("waiting_for_user", False)),
         }
 
     def derive_request_status(self, latest_stage: str, latest_state: dict[str, Any], active: bool) -> str:
         if active:
             return "active"
+        if latest_state.get("waiting_for_user"):
+            return "waiting_user"
         if latest_state.get("blocked"):
             return "blocked"
 
@@ -278,6 +281,7 @@ class AgentObservability:
             "request_failed": "failed",
             "request_cancelled": "cancelled",
             "request_timed_out": "timed_out",
+            "agent_waiting_user": "waiting_user",
             "agent_blocked": "blocked",
         }
         if latest_stage in stage_to_status:
@@ -375,6 +379,7 @@ class AgentObservability:
             "subtask_count": subtask_count,
             "reflection_failure_count": reflection_failure_count,
             "blocked_rate": 1.0 if status == "blocked" else 0.0,
+            "waiting_user_rate": 1.0 if status == "waiting_user" else 0.0,
         }
 
     def get_request_summary(self, request_id: str) -> dict[str, Any] | None:
@@ -434,6 +439,7 @@ class AgentObservability:
             "plan_length": len(latest_state.get("plan", [])),
             "plan": self.agent.snapshot_store.normalize_plan(latest_state.get("plan", [])),
             "blocked": latest_state.get("blocked", False),
+            "waiting_for_user": latest_state.get("waiting_for_user", False),
             "final_response": final_response,
             "snapshot_count": len(snapshots),
             "snapshots": snapshots,

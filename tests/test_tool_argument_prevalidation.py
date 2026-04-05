@@ -122,6 +122,24 @@ class ToolArgumentPrevalidationTests(unittest.TestCase):
         self.assertIsNone(error_payload)
         self.assertEqual(normalized_kwargs, {"a": 1.5, "b": 2.0})
 
+    def test_normalize_bash_empty_output_as_retryable_no_output(self):
+        normalized_result, error_payload = self.agent.tool_runtime.normalize_tool_result_payload(
+            "bash",
+            {
+                "ok": True,
+                "stdout": "",
+                "stderr": "",
+                "exit_code": 0,
+                "shell": "powershell",
+            },
+        )
+
+        self.assertIsInstance(normalized_result, dict)
+        self.assertEqual(normalized_result["error_type"], "no_output")
+        self.assertTrue(normalized_result["retryable"])
+        self.assertIsNotNone(error_payload)
+        self.assertEqual(error_payload["error_type"], "no_output")
+
 
 if __name__ == "__main__":
     unittest.main()
