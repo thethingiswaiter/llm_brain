@@ -813,6 +813,28 @@ class AgentToolRuntime:
                 "reason": "",
             }
 
+        normalized_description = str(subtask_description or "").lower()
+        write_markers = ["写", "写入", "创建", "保存", "修改", "更新", "write", "create", "save", "append", "overwrite", "modify", "update"]
+        looks_like_write_task = any(marker in normalized_description for marker in write_markers)
+        terminal_tool_names = {
+            str(name or "").strip().lower()
+            for name in getattr(self.agent.skills, "TERMINAL_TOOL_NAMES", {"bash"})
+            if str(name or "").strip()
+        }
+
+        def is_blocked_terminal_failure(item: dict[str, Any]) -> bool:
+            tool_name = str(item.get("tool", "") or "").strip().lower()
+            if tool_name not in terminal_tool_names:
+                return False
+            error_type = str(item.get("error_type", "") or "").strip().lower()
+            message = str(item.get("message", "") or "").strip().lower()
+            blocked_markers = ["blocked", "allowlist", "not allowed", "not permitted", "disallowed", "shell operator", "operator"]
+            return error_type in {"blocked", "invalid_arguments"} or any(marker in message for marker in blocked_markers)
+
+        prefer_write_tool_after_blocked_terminal = looks_like_write_task and any(
+            is_blocked_terminal_failure(item) for item in recent_failures
+        )
+
         error_types = {str(item.get("error_type", "")) for item in recent_failures}
         retryable_failures = [item for item in recent_failures if bool(item.get("retryable", False))]
         non_retryable_failures = [item for item in recent_failures if not bool(item.get("retryable", False))]
@@ -855,6 +877,44 @@ class AgentToolRuntime:
             excluded_tool_names=[getattr(tool, "name", "") for tool in selected_tools],
             historical_failure_severity_threshold=historical_failure_severity_threshold,
         )
+        if prefer_write_tool_after_blocked_terminal:
+            preferred_write_tool_skills = []
+            for item in alternative_tool_skills:
+                name = str(item.get("name", "") or "").strip().lower()
+                description = str(item.get("description", "") or "").strip().lower()
+                if any(marker in name or marker in description for marker in ("write", "file", "save", "create", "append", "overwrite", "修改", "写", "保存", "创建")):
+                    preferred_write_tool_skills.append(item)
+            if not preferred_write_tool_skills:
+                excluded_names = {
+                    str(item.get("name", "") or "").strip().lower()
+                    for item in alternative_tool_skills
+                    if str(item.get("name", "") or "").strip()
+                } | {
+                    str(getattr(tool, "name", "") or "").strip().lower()
+                    for tool in selected_tools
+                    if str(getattr(tool, "name", "") or "").strip()
+                } | {
+                    str(name or "").strip().lower()
+                    for name in failed_tool_names or []
+                    if str(name or "").strip()
+                }
+                for item in self.agent.skills.loaded_tool_skills.values():
+                    name = str(item.get("name", "") or "").strip()
+                    marker = name.lower()
+                    description = str(item.get("description", "") or "").strip().lower()
+                    if not name or marker in excluded_names:
+                        continue
+                    if any(token in marker or token in description for token in ("write", "file", "save", "create", "append", "overwrite", "修改", "写", "保存", "创建")):
+                        preferred_write_tool_skills.append(dict(item))
+            if preferred_write_tool_skills:
+                return {
+                    "mode": "prefer_write_tools_for_blocked_terminal_write",
+                    "selected_tools": [item["tool"] for item in preferred_write_tool_skills],
+                    "tool_skills": preferred_write_tool_skills,
+                    "alternatives": [item.get("name", "") for item in preferred_write_tool_skills],
+                    "reason": "write task hit a blocked terminal path, so reroute to direct file-writing tools before retrying shell-based approaches",
+                }
+
         if alternative_tool_skills:
             return {
                 "mode": "alternative_tools",

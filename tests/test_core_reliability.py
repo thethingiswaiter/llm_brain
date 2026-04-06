@@ -16,13 +16,131 @@ from langchain_core.tools import tool
 from core.config import config
 from cognitive.structured_output import (
     StructuredOutputFormatError,
+    StructuredOutputFunctionCallError,
     StructuredOutputSchemaError,
+    extract_tool_call_arguments,
+    invoke_function_call,
     parse_json_array,
     parse_json_object,
 )
 
 
 class StructuredOutputParserTests(unittest.TestCase):
+    def test_extract_tool_call_arguments_accepts_dict_args(self):
+        response = AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "submit_reflection",
+                    "args": {"success": True, "reflection": "ok", "action": "continue"},
+                    "id": "call_1",
+                }
+            ],
+        )
+
+        parsed = extract_tool_call_arguments(response, expected_name="submit_reflection")
+
+        self.assertTrue(parsed["success"])
+        self.assertEqual(parsed["reflection"], "ok")
+        self.assertEqual(parsed["action"], "continue")
+
+    def test_extract_tool_call_arguments_accepts_json_string_args(self):
+        response = AIMessage(
+            content="",
+            additional_kwargs={
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "submit_plan",
+                            "arguments": '{"subtasks": [{"id": 1, "description": "step", "execution_mode": "leaf"}]}'
+                        },
+                        "id": "call_1",
+                    }
+                ]
+            },
+        )
+
+        parsed = extract_tool_call_arguments(response, expected_name="submit_plan")
+
+        self.assertEqual(len(parsed["subtasks"]), 1)
+        self.assertEqual(parsed["subtasks"][0]["description"], "step")
+
+    def test_invoke_function_call_uses_bound_llm_tool_call_result(self):
+        import cognitive.structured_output as structured_module
+
+        class FakeBoundLLM:
+            def invoke(self, payload):
+                return AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "submit_reflection",
+                            "args": {"success": True, "reflection": "via function", "action": "continue"},
+                            "id": "call_1",
+                        }
+                    ],
+                )
+
+        class FakeLLM:
+            def bind_tools(self, tools, tool_choice=None):
+                return FakeBoundLLM()
+
+        original_get_llm = structured_module.llm_manager.get_llm
+        original_invoke = structured_module.llm_manager.invoke
+        structured_module.llm_manager.get_llm = lambda: FakeLLM()
+        structured_module.llm_manager.invoke = lambda payload, source="", llm=None: llm.invoke(payload)
+        try:
+            parsed = invoke_function_call(
+                "prompt",
+                function_name="submit_reflection",
+                function_description="desc",
+                parameters_schema={"type": "object", "properties": {}, "required": []},
+                source="test.function_call",
+            )
+        finally:
+            structured_module.llm_manager.get_llm = original_get_llm
+            structured_module.llm_manager.invoke = original_invoke
+
+        self.assertTrue(parsed["success"])
+        self.assertEqual(parsed["reflection"], "via function")
+
+    def test_invoke_function_call_reuses_same_response_when_content_contains_json(self):
+        import cognitive.structured_output as structured_module
+
+        class FakeBoundLLM:
+            def invoke(self, payload):
+                return AIMessage(
+                    content='{"success": true, "reflection": "content fallback", "action": "continue"}',
+                    tool_calls=[],
+                )
+
+        class FakeLLM:
+            def bind_tools(self, tools, tool_choice=None):
+                return FakeBoundLLM()
+
+        original_get_llm = structured_module.llm_manager.get_llm
+        original_invoke = structured_module.llm_manager.invoke
+        structured_module.llm_manager.get_llm = lambda: FakeLLM()
+        structured_module.llm_manager.invoke = lambda payload, source="", llm=None: llm.invoke(payload)
+        try:
+            parsed = invoke_function_call(
+                "prompt",
+                function_name="submit_reflection",
+                function_description="desc",
+                parameters_schema={"type": "object", "properties": {}, "required": []},
+                source="test.function_call",
+                fallback_content_parser=lambda value: parse_json_object(
+                    value,
+                    required_fields={"success": bool, "reflection": str, "action": str},
+                ),
+            )
+        finally:
+            structured_module.llm_manager.get_llm = original_get_llm
+            structured_module.llm_manager.invoke = original_invoke
+
+        self.assertTrue(parsed["success"])
+        self.assertEqual(parsed["reflection"], "content fallback")
+
     def test_parse_json_object_from_code_fence(self):
         payload = """```json
         {
@@ -82,6 +200,77 @@ class StructuredOutputParserTests(unittest.TestCase):
         self.assertEqual(reflection, "ok")
         self.assertEqual(action, "continue")
 
+    def test_reflector_prefers_function_call_result(self):
+        import cognitive.reflector as reflector_module
+
+        class FakeBoundLLM:
+            def invoke(self, payload):
+                return AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "submit_reflection",
+                            "args": {"success": True, "reflection": "function result", "action": "continue"},
+                            "id": "call_1",
+                        }
+                    ],
+                )
+
+        class FakeLLM:
+            def bind_tools(self, tools, tool_choice=None):
+                return FakeBoundLLM()
+
+        original_get_llm = reflector_module.llm_manager.get_llm
+        original_invoke = reflector_module.llm_manager.invoke
+        reflector_module.llm_manager.get_llm = lambda: FakeLLM()
+        reflector_module.llm_manager.invoke = lambda payload, source="", llm=None: llm.invoke(payload) if llm else AIMessage(content="{}")
+        try:
+            success, reflection, action = reflector_module.Reflector().verify_and_reflect("subtask", "expected", "actual")
+        finally:
+            reflector_module.llm_manager.get_llm = original_get_llm
+            reflector_module.llm_manager.invoke = original_invoke
+
+        self.assertTrue(success)
+        self.assertEqual(reflection, "function result")
+        self.assertEqual(action, "continue")
+
+    def test_reflector_reuses_function_call_response_content_without_second_llm_call(self):
+        import cognitive.reflector as reflector_module
+
+        class FakeBoundLLM:
+            def invoke(self, payload):
+                return AIMessage(
+                    content='```json\n{"success": true, "reflection": "inline json", "action": "continue"}\n```',
+                    tool_calls=[],
+                )
+
+        class FakeLLM:
+            def bind_tools(self, tools, tool_choice=None):
+                return FakeBoundLLM()
+
+        captured_sources = []
+        original_get_llm = reflector_module.llm_manager.get_llm
+        original_invoke = reflector_module.llm_manager.invoke
+        reflector_module.llm_manager.get_llm = lambda: FakeLLM()
+
+        def fake_invoke(payload, source="", llm=None):
+            captured_sources.append(source)
+            if llm is None:
+                raise AssertionError("reflector should not issue a second plain JSON call")
+            return llm.invoke(payload)
+
+        reflector_module.llm_manager.invoke = fake_invoke
+        try:
+            success, reflection, action = reflector_module.Reflector().verify_and_reflect("subtask", "expected", "actual")
+        finally:
+            reflector_module.llm_manager.get_llm = original_get_llm
+            reflector_module.llm_manager.invoke = original_invoke
+
+        self.assertTrue(success)
+        self.assertEqual(reflection, "inline json")
+        self.assertEqual(action, "continue")
+        self.assertEqual(captured_sources, ["reflector.verify_and_reflect.function_call"])
+
     def test_reflector_short_circuits_observation_task_with_concrete_result(self):
         import cognitive.reflector as reflector_module
 
@@ -101,8 +290,146 @@ class StructuredOutputParserTests(unittest.TestCase):
         self.assertIn("可直接返回", reflection)
         self.assertEqual(action, "continue")
 
+    def test_reflector_does_not_short_circuit_write_task_with_read_result(self):
+        import cognitive.reflector as reflector_module
+
+        class FakeResponse:
+            def __init__(self, content):
+                self.content = content
+
+        captured = {}
+        original_invoke = reflector_module.llm_manager.invoke
+        reflector = reflector_module.Reflector()
+
+        def fake_invoke(prompt, source=""):
+            captured["prompt"] = prompt
+            return FakeResponse('{"success": false, "reflection": "只读取了原文件内容，尚未执行写入。", "action": "retry"}')
+
+        reflector_module.llm_manager.invoke = fake_invoke
+        try:
+            success, reflection, action = reflector.verify_and_reflect(
+                r"把常规 nginx 配置补充到 D:\file\vscode\llm_brain\runtime_state\snapshots\nginx.conf",
+                "",
+                "文件内容如下：\n`旧内容`",
+            )
+        finally:
+            reflector_module.llm_manager.invoke = original_invoke
+
+        self.assertFalse(success)
+        self.assertEqual(action, "retry")
+        self.assertIn("尚未执行写入", reflection)
+        self.assertIn("实际结果", captured["prompt"])
+
 
 class TaskPlannerTests(unittest.TestCase):
+    def test_split_task_prefers_function_call_plan(self):
+        import cognitive.planner as planner_module
+        from cognitive.planner import TaskPlanner
+
+        class FakeBoundLLM:
+            def invoke(self, payload):
+                return AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "submit_plan",
+                            "args": {
+                                "subtasks": [
+                                    {"id": 1, "description": "通过函数调用返回的计划", "execution_mode": "leaf"}
+                                ]
+                            },
+                            "id": "call_1",
+                        }
+                    ],
+                )
+
+        class FakeLLM:
+            def bind_tools(self, tools, tool_choice=None):
+                return FakeBoundLLM()
+
+        planner = TaskPlanner()
+        original_get_llm = planner_module.llm_manager.get_llm
+        original_invoke = planner_module.llm_manager.invoke
+        planner_module.llm_manager.get_llm = lambda: FakeLLM()
+        planner_module.llm_manager.invoke = lambda payload, source="", llm=None: llm.invoke(payload) if llm else AIMessage(content="[]")
+        try:
+            result = planner.split_task("给我一个计划")
+        finally:
+            planner_module.llm_manager.get_llm = original_get_llm
+            planner_module.llm_manager.invoke = original_invoke
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["description"], "通过函数调用返回的计划")
+
+    def test_split_task_reuses_function_call_response_content_without_second_llm_call(self):
+        import cognitive.planner as planner_module
+        from cognitive.planner import TaskPlanner
+
+        class FakeBoundLLM:
+            def invoke(self, payload):
+                return AIMessage(
+                    content='[{"id": 1, "description": "来自同一次响应的计划", "execution_mode": "leaf"}]',
+                    tool_calls=[],
+                )
+
+        class FakeLLM:
+            def bind_tools(self, tools, tool_choice=None):
+                return FakeBoundLLM()
+
+        planner = TaskPlanner()
+        captured_sources = []
+        original_get_llm = planner_module.llm_manager.get_llm
+        original_invoke = planner_module.llm_manager.invoke
+        planner_module.llm_manager.get_llm = lambda: FakeLLM()
+
+        def fake_invoke(payload, source="", llm=None):
+            captured_sources.append(source)
+            if llm is None:
+                raise AssertionError("planner should not issue a second plain JSON call")
+            return llm.invoke(payload)
+
+        planner_module.llm_manager.invoke = fake_invoke
+        try:
+            result = planner.split_task("给我一个计划")
+        finally:
+            planner_module.llm_manager.get_llm = original_get_llm
+            planner_module.llm_manager.invoke = original_invoke
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["description"], "来自同一次响应的计划")
+        self.assertEqual(captured_sources, ["planner.split_task.function_call"])
+
+    def test_split_task_single_task_fallback_uses_failed_subtask_from_replan_wrapper(self):
+        import cognitive.planner as planner_module
+        from cognitive.planner import TaskPlanner
+
+        class NoFunctionCallLLM:
+            pass
+
+        class FakeResponse:
+            def __init__(self, content):
+                self.content = content
+
+        planner = TaskPlanner()
+        original_get_llm = planner_module.llm_manager.get_llm
+        original_invoke = planner_module.llm_manager.invoke
+        planner_module.llm_manager.get_llm = lambda: NoFunctionCallLLM()
+        planner_module.llm_manager.invoke = lambda prompt, source="", llm=None: FakeResponse("not-json")
+        try:
+            result = planner.split_task(
+                "请重新规划并完成下面这个失败的子任务，优先补充缺失信息、调整执行顺序，避免重复失败路径。\n\n"
+                "原始用户请求: 写一个 nginx 配置\n\n"
+                "失败子任务: 把常规 nginx 配置写入 D:\\file\\vscode\\llm_brain\\nginx.conf\n\n"
+                "当前执行模式: leaf\n\n"
+                "实际观察到的输出: bash 被 allowlist 拦截"
+            )
+        finally:
+            planner_module.llm_manager.get_llm = original_get_llm
+            planner_module.llm_manager.invoke = original_invoke
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["description"], "把常规 nginx 配置写入 D:\\file\\vscode\\llm_brain\\nginx.conf")
+
     def test_split_task_preserves_llm_output_without_direct_lookup_collapse(self):
         import cognitive.planner as planner_module
         from cognitive.planner import TaskPlanner
@@ -251,6 +578,29 @@ class TaskPlannerTests(unittest.TestCase):
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0]["execution_mode"], "decomposable")
 
+    def test_split_task_preserves_full_file_path_in_subtask_description(self):
+        import cognitive.planner as planner_module
+        from cognitive.planner import TaskPlanner
+
+        class FakeResponse:
+            def __init__(self, content):
+                self.content = content
+
+        planner = TaskPlanner()
+        original_invoke = planner_module.llm_manager.invoke
+        planner_module.llm_manager.invoke = lambda prompt, source="": FakeResponse(
+            """[
+              {"id": 1, "description": "在 snapshots 中补充常规 nginx 配置", "execution_mode": "leaf"}
+            ]"""
+        )
+        try:
+            result = planner.split_task(r"D:\file\vscode\llm_brain\runtime_state\snapshots\nginx.conf补充一个常规的nginx的配置到这个文件")
+        finally:
+            planner_module.llm_manager.invoke = original_invoke
+
+        self.assertEqual(len(result), 1)
+        self.assertIn(r"D:\file\vscode\llm_brain\runtime_state\snapshots\nginx.conf", result[0]["description"])
+
     def test_split_task_preserves_validation_style_subtasks_in_thinking_mode(self):
         import cognitive.planner as planner_module
         from cognitive.planner import TaskPlanner
@@ -299,6 +649,54 @@ class TaskPlannerTests(unittest.TestCase):
 
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0]["description"], "查看 nginx.conf 文件内容")
+
+    def test_split_task_drops_redundant_save_step_after_write_step(self):
+        import cognitive.planner as planner_module
+        from cognitive.planner import TaskPlanner
+
+        class FakeResponse:
+            def __init__(self, content):
+                self.content = content
+
+        planner = TaskPlanner()
+        original_invoke = planner_module.llm_manager.invoke
+        planner_module.llm_manager.invoke = lambda prompt, source="": FakeResponse(
+            """[
+              {"id": 1, "description": "创建 date.py 文件并写入获取当前时间的方法", "execution_mode": "leaf"},
+              {"id": 2, "description": "保存date.py文件", "execution_mode": "leaf"}
+            ]"""
+        )
+        try:
+            result = planner.split_task("创建一个date.py文件并写入时间函数")
+        finally:
+            planner_module.llm_manager.invoke = original_invoke
+
+        self.assertEqual(len(result), 1)
+        self.assertIn("date.py", result[0]["description"])
+
+    def test_split_task_appends_missing_write_step_when_original_request_requires_update(self):
+        import cognitive.planner as planner_module
+        from cognitive.planner import TaskPlanner
+
+        class FakeResponse:
+            def __init__(self, content):
+                self.content = content
+
+        planner = TaskPlanner()
+        original_invoke = planner_module.llm_manager.invoke
+        planner_module.llm_manager.invoke = lambda prompt, source="": FakeResponse(
+            """[
+              {"id": 1, "description": "查找当前目录下的 nginx.conf 文件", "execution_mode": "leaf"},
+              {"id": 2, "description": "读取 nginx.conf 文件的内容", "execution_mode": "leaf"}
+            ]"""
+        )
+        try:
+            result = planner.split_task("在当前目录下找到nginx.conf文件, 读取并补充基础配置")
+        finally:
+            planner_module.llm_manager.invoke = original_invoke
+
+        self.assertEqual(len(result), 3)
+        self.assertEqual(result[2]["description"], "补充 nginx.conf 的基础配置")
 
 
 class DomainClassificationTests(unittest.TestCase):
@@ -555,6 +953,8 @@ class TimeoutControlTests(unittest.TestCase):
         self.assertEqual(payload["session_id"], "session_guardrail")
         self.assertEqual(payload["source"], "test.core")
         self.assertEqual(payload["outcome"], "started")
+        self.assertEqual(list(payload.keys())[:3], ["request_id", "level", "event_type"])
+        self.assertEqual(list(payload.keys())[-3:], ["logged_at", "session_id", "source"])
 
     def test_llm_manager_timeout_raises_timeout_error(self):
         from core.llm.manager import llm_manager
@@ -1533,6 +1933,76 @@ class ToolRerouteTests(unittest.TestCase):
 
         self.assertTrue(should_downgrade)
 
+    def test_has_verified_write_tool_success_detects_write_text_file_payload(self):
+        messages = [
+            HumanMessage(content="question"),
+            ToolMessage(
+                content=json.dumps({
+                    "ok": True,
+                    "path": "date.py",
+                    "mode": "create",
+                    "bytes_written": 42,
+                }, ensure_ascii=False),
+                tool_call_id="tool-call-write",
+            ),
+        ]
+
+        self.assertTrue(self.agent._has_verified_write_tool_success(messages))
+
+    def test_append_builtin_fallback_tools_skips_bash_for_write_task(self):
+        @tool
+        def bash(command: str) -> str:
+            """bash"""
+            return command
+
+        wrapped_bash = self.agent._wrap_tool_for_runtime(bash)
+        original_tools = list(self.agent.tools)
+        try:
+            self.agent.tools = [wrapped_bash]
+            merged = self.agent._append_builtin_fallback_tools([], task_description="创建一个 date.py 文件并写入内容")
+        finally:
+            self.agent.tools = original_tools
+
+        self.assertEqual(merged, [])
+
+    def test_append_builtin_fallback_tools_skips_bash_for_observation_task_with_specialized_tool(self):
+        @tool
+        def bash(command: str) -> str:
+            """bash"""
+            return command
+
+        @tool
+        def read_text_file(path: str) -> str:
+            """Read a text file."""
+            return path
+
+        wrapped_bash = self.agent._wrap_tool_for_runtime(bash)
+        wrapped_read = self.agent._wrap_tool_for_runtime(read_text_file)
+        original_tools = list(self.agent.tools)
+        try:
+            self.agent.tools = [wrapped_bash]
+            merged = self.agent._append_builtin_fallback_tools([wrapped_read], task_description="读取 nginx.conf 文件的内容")
+        finally:
+            self.agent.tools = original_tools
+
+        self.assertEqual([tool.name for tool in merged], [wrapped_read.name])
+
+    def test_append_builtin_fallback_tools_keeps_bash_for_observation_task_without_specialized_tool(self):
+        @tool
+        def bash(command: str) -> str:
+            """bash"""
+            return command
+
+        wrapped_bash = self.agent._wrap_tool_for_runtime(bash)
+        original_tools = list(self.agent.tools)
+        try:
+            self.agent.tools = [wrapped_bash]
+            merged = self.agent._append_builtin_fallback_tools([], task_description="读取 nginx.conf 文件的内容")
+        finally:
+            self.agent.tools = original_tools
+
+        self.assertEqual([tool.name for tool in merged], [wrapped_bash.name])
+
     def test_filter_failed_tools_for_subtask_excludes_failed_candidates(self):
         @tool
         def first_tool() -> str:
@@ -1735,6 +2205,39 @@ class ToolRerouteTests(unittest.TestCase):
         self.assertEqual(reroute_plan["mode"], "retry_same_tool_with_diagnostics")
         self.assertEqual([tool.name for tool in reroute_plan["selected_tools"]], [wrapped_bash.name])
         self.assertEqual(reroute_plan["alternatives"], [wrapped_bash.name])
+
+    def test_build_tool_reroute_plan_prefers_write_tool_after_blocked_terminal_write_failure(self):
+        @tool
+        def bash(command: str) -> str:
+            """Run a shell command."""
+            return command
+
+        @tool
+        def write_text_file(path: str, content: str) -> str:
+            """Write text content to a file."""
+            return f"wrote {path}"
+
+        wrapped_bash = self.agent._wrap_tool_for_runtime(bash)
+        wrapped_write = self.agent._wrap_tool_for_runtime(write_text_file)
+        self.agent.skills.register_tools([wrapped_bash, wrapped_write], source_type="test")
+
+        reroute_plan = self.agent._build_tool_reroute_plan(
+            "把常规 nginx 配置写入 nginx.conf",
+            ["nginx.conf", "写入", "配置"],
+            [wrapped_bash],
+            [{"name": wrapped_bash.name, "tool": wrapped_bash, "description": "Run a shell command."}],
+            [{
+                "tool": wrapped_bash.name,
+                "error_type": "blocked",
+                "retryable": False,
+                "message": "Only allowlist prefixes are permitted; shell operators are not allowed.",
+            }],
+            [wrapped_bash.name],
+        )
+
+        self.assertEqual(reroute_plan["mode"], "prefer_write_tools_for_blocked_terminal_write")
+        self.assertEqual([tool.name for tool in reroute_plan["selected_tools"]], [wrapped_write.name])
+        self.assertEqual(reroute_plan["alternatives"], [wrapped_write.name])
 
     def test_build_tool_reroute_plan_falls_back_for_invalid_arguments(self):
         @tool
@@ -2050,7 +2553,7 @@ class ObservabilityTests(unittest.TestCase):
         config.memory_backup_dir = os.path.join(self.tempdir.name, "backups")
         config.state_snapshot_dir = os.path.join(self.tempdir.name, "snapshots")
         config.log_dir = os.path.join(self.tempdir.name, "logs")
-        config.llm_log_file = "observability.log"
+        config.llm_log_file = "observability.jsonl"
         from core.llm import manager as llm_manager
         from app.agent import core as agent_core
         self.llm_manager_module = importlib.reload(llm_manager)
@@ -2167,12 +2670,16 @@ class ObservabilityTests(unittest.TestCase):
         self.assertTrue(log_path.exists())
 
         log_line = log_path.read_text(encoding="utf-8").strip().splitlines()[-1]
-        payload = json.loads(log_line.split(" | ", 2)[2])
+        payload = json.loads(log_line)
 
+        self.assertIn("logged_at", payload)
+        self.assertEqual(payload["level"], "INFO")
         self.assertEqual(payload["event_type"], "checkpoint")
         self.assertEqual(payload["request_id"], request_id)
         self.assertEqual(payload["stage"], "subtask_started")
         self.assertEqual(payload["details"], "index=1")
+        self.assertEqual(list(payload.keys())[:3], ["request_id", "level", "event_type"])
+        self.assertEqual(list(payload.keys())[-3:], ["logged_at", "session_id", "source"])
 
     def test_console_checkpoint_output_includes_details(self):
         request_id = "req_console_details"

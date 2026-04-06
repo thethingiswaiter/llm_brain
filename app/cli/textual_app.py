@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import threading
 from typing import Any
+from pathlib import Path
 
 from rich.text import Text
 from textual import events
@@ -16,8 +17,11 @@ from app.cli.commands import (
     RESPONSE_DIVIDER,
     build_commands,
     build_input_suggestions,
+    get_selection_context_label,
     build_natural_language_command,
     handle_plain_message,
+    resume_with_followup,
+    should_auto_resume_from_followup,
 )
 from core.config import config
 from core.llm.manager import llm_manager
@@ -111,6 +115,7 @@ class AgentTextualApp(App[None]):
         ("ctrl+c", "quit", "Quit"),
         ("ctrl+l", "clear_log", "Clear"),
         ("ctrl+r", "refresh_dashboard", "Refresh"),
+        ("ctrl+o", "browse_workspace", "Browse Files"),
     ]
 
     def __init__(self, agent_instance=agent, llm_manager_instance=llm_manager):
@@ -153,6 +158,23 @@ class AgentTextualApp(App[None]):
 
     def action_refresh_dashboard(self) -> None:
         self._refresh_dashboard()
+
+    def refresh_dashboard(self) -> None:
+        self._refresh_dashboard()
+
+    def action_browse_workspace(self) -> None:
+        if self._busy:
+            self._write("System> 当前仍有请求在执行，请稍后。")
+            return
+        self._write("You> /workspace_files")
+        self._process_input("/workspace_files")
+
+    def set_input_value(self, value: str) -> None:
+        input_widget = self.query_one("#input", Input)
+        input_widget.value = str(value or "")
+        if hasattr(input_widget, "cursor_position"):
+            input_widget.cursor_position = len(input_widget.value)
+        input_widget.focus()
 
     def action_autocomplete(self) -> None:
         input_widget = self.query_one("#input", Input)
@@ -239,6 +261,11 @@ class AgentTextualApp(App[None]):
                 if mapped_handler is not None:
                     mapped_handler.handler(mapped_command, context)
                     return
+
+            should_auto_resume, resume_request_id = should_auto_resume_from_followup(self.agent_instance, user_input)
+            if should_auto_resume:
+                resume_with_followup(context, resume_request_id, user_input)
+                return
 
             handle_plain_message(user_input, context)
         except Exception as exc:
@@ -394,6 +421,7 @@ class AgentTextualApp(App[None]):
         self._write(f"Session: {self.session_state['session_id']}")
         self._write("输入普通文本发送给 Agent；输入 help 查看命令；输入 quit 退出。")
         self._write("输入 / 后会出现命令候选；继续输入会实时过滤，Tab 会在候选之间轮换并写回输入框。")
+        self._write("输入 /workspace_files 或按 Ctrl+O 浏览当前配置工作区的文件，并可用 /pick 选择。")
         self._write("")
 
     def _get_latest_summary(self) -> dict[str, Any]:
@@ -413,9 +441,12 @@ class AgentTextualApp(App[None]):
         request_id = str(summary.get("request_id") or "-")
         stage_text = str(summary.get("latest_stage") or "-")
         progress_text = f"{summary.get('subtask_index', 0)}/{summary.get('plan_length', 0)}" if summary else "-"
+        workspace_label = Path(config.get_workspace_root()).name or config.get_workspace_root()
+        selection_label = get_selection_context_label(self.session_state.get("selection_context") or {}) or "-"
         return (
             f"status {status_text} | request {request_id} | stage {stage_text} | "
-            f"progress {progress_text} | model {model_label} | mcp {mcp_count}"
+            f"progress {progress_text} | workspace {workspace_label} | selection {selection_label} | "
+            f"model {model_label} | mcp {mcp_count}"
         )
 
     def _refresh_status(self) -> None:

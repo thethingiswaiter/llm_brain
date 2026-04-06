@@ -71,8 +71,12 @@ class SkillManager:
         "list", "count", "read", "write", "search", "grep", "directory", "file", "path",
     }
     WRITE_INTENT_MARKERS = {
-        "写", "写入", "保存", "创建", "追加", "覆盖", "修改", "更新", "生成", "输出到文件",
+        "写", "写入", "保存", "创建", "追加", "覆盖", "修改", "更新", "生成", "输出到文件", "补充", "添加",
         "write", "save", "create", "append", "overwrite", "update",
+    }
+    READ_ONLY_INTENT_MARKERS = {
+        "查看", "读取", "列出", "查询", "显示", "检查", "搜索", "查找", "统计", "获取",
+        "read", "show", "list", "inspect", "query", "search", "find", "grep", "count", "get",
     }
     WRITE_TOOL_NAME_MARKERS = ("write", "save", "append", "delete", "remove")
     TERMINAL_TOOL_NAMES = {"bash"}
@@ -87,7 +91,7 @@ class SkillManager:
     }
 
     def __init__(self, skill_dir: str = None):
-        self.skill_dir = config.resolve_path(skill_dir or config.skill_dir)
+        self.skill_dir = config.resolve_workspace_path(skill_dir or config.skill_dir)
         self.loaded_skills: List[Dict[str, Any]] = []
         self.loaded_tool_skills: Dict[str, Dict[str, Any]] = {}
         self.loaded_skill_files: set[str] = set()
@@ -207,13 +211,26 @@ class SkillManager:
             for marker in self.WRITE_INTENT_MARKERS
         )
 
+    def _looks_like_read_only_task(self, task_description: str, extracted_keywords: List[str]) -> bool:
+        task_terms = set(self._tokenize_text(task_description))
+        keyword_terms = set(self._normalize_keywords(extracted_keywords))
+        combined_terms = task_terms | keyword_terms
+        if not combined_terms:
+            return False
+        if self._has_write_intent(task_description, extracted_keywords):
+            return False
+        return any(
+            marker in combined_terms or any(marker in term for term in combined_terms)
+            for marker in self.READ_ONLY_INTENT_MARKERS
+        )
+
     def _filter_task_incompatible_tools(
         self,
         tool_skills: List[Dict[str, Any]],
         task_description: str,
         extracted_keywords: List[str],
     ) -> List[Dict[str, Any]]:
-        if self._has_write_intent(task_description, extracted_keywords):
+        if not self._looks_like_read_only_task(task_description, extracted_keywords):
             return tool_skills
 
         filtered: List[Dict[str, Any]] = []

@@ -1,6 +1,9 @@
 from dataclasses import dataclass
+from pathlib import Path
 import re
 from typing import Any, Callable
+
+from core.config import config
 
 RESPONSE_DIVIDER = "----------------------------------------"
 
@@ -234,6 +237,9 @@ def get_selection_context_label(selection_context: dict[str, Any] | None) -> str
         return f"snapshot_list:{request_id or '-'}"
     if selection_type == "llm_model_list":
         return f"llm_model_list:{len(items)}"
+    if selection_type == "workspace_path_list":
+        current_dir = str(context_payload.get("current_dir") or "").strip() or "."
+        return f"workspace_path_list:{current_dir}:{len(items)}"
     return ""
 
 
@@ -244,7 +250,150 @@ def build_selection_hint(selection_type: str) -> str:
         return "Select: /pick <index> to resume from a listed snapshot."
     if selection_type == "llm_model_list":
         return "Select: /pick <index> to switch to a listed LLM model."
+    if selection_type == "workspace_path_list":
+        return "Select: /pick <index> to enter a directory or place a file path into the input box."
     return ""
+
+
+def _workspace_root_path() -> Path:
+    return Path(config.get_workspace_root()).resolve()
+
+
+def _workspace_relative_label(path: Path) -> str:
+    root = _workspace_root_path()
+    resolved = path.resolve()
+    if resolved == root:
+        return "."
+    try:
+        return resolved.relative_to(root).as_posix()
+    except ValueError:
+        return resolved.as_posix()
+
+
+def _resolve_workspace_target(path_value: str | None) -> Path:
+    root = _workspace_root_path()
+    normalized = str(path_value or "").strip()
+    if not normalized:
+        return root
+
+    candidate = Path(normalized)
+    resolved = candidate if candidate.is_absolute() else (root / candidate)
+    resolved = resolved.resolve()
+    if resolved != root and root not in resolved.parents:
+        raise ValueError(f"Path is outside workspace root: {resolved}")
+    return resolved
+
+
+def _set_selected_workspace_file(context: dict[str, Any], relative_path: str) -> None:
+    session_state = context.get("session_state") or {}
+    session_state["selected_workspace_file"] = relative_path
+    ui = context.get("ui")
+    if ui and hasattr(ui, "set_input_value"):
+        ui.set_input_value(relative_path)
+
+
+def _emit_selected_workspace_file_message(context: dict[str, Any], relative_path: str) -> None:
+    output_func = context["output_func"]
+    ui = context.get("ui")
+    output_func(f"Selected workspace file: {relative_path}")
+    if ui and hasattr(ui, "set_input_value"):
+        output_func("File path has been placed into the input box.")
+        return
+    output_func(f"Use this path in your next command or prompt: {relative_path}")
+
+
+def _emit_workspace_path_listing(context: dict[str, Any], target_path: Path) -> bool:
+    output_func = context["output_func"]
+    ui = context.get("ui")
+    workspace_root = _workspace_root_path()
+
+    if not target_path.exists():
+        output_func(f"Workspace path not found: {target_path}")
+        return True
+
+    if target_path.is_file():
+        relative_path = _workspace_relative_label(target_path)
+        _set_selected_workspace_file(context, relative_path)
+        _emit_selected_workspace_file_message(context, relative_path)
+        set_selection_context(
+            context,
+            {
+                "type": "workspace_path_list",
+                "current_dir": _workspace_relative_label(target_path.parent),
+                "items": [
+                    {
+                        "index": 1,
+                        "name": target_path.name,
+                        "path": str(target_path),
+                        "relative_path": relative_path,
+                        "is_dir": False,
+                        "is_file": True,
+                    }
+                ],
+            },
+        )
+        return True
+
+    entries = []
+    index = 1
+    if target_path != workspace_root:
+        parent_path = target_path.parent
+        entries.append(
+            {
+                "index": index,
+                "name": "..",
+                "path": str(parent_path),
+                "relative_path": _workspace_relative_label(parent_path),
+                "is_dir": True,
+                "is_file": False,
+            }
+        )
+        index += 1
+
+    for item in sorted(target_path.iterdir(), key=lambda candidate: (not candidate.is_dir(), candidate.name.lower())):
+        entries.append(
+            {
+                "index": index,
+                "name": item.name,
+                "path": str(item.resolve()),
+                "relative_path": _workspace_relative_label(item),
+                "is_dir": item.is_dir(),
+                "is_file": item.is_file(),
+            }
+        )
+        index += 1
+
+    current_dir = _workspace_relative_label(target_path)
+    set_selection_context(
+        context,
+        {
+            "type": "workspace_path_list",
+            "current_dir": current_dir,
+            "items": entries,
+        },
+    )
+
+    output_func(f"Workspace files: {current_dir}")
+    for item in entries:
+        kind = "dir" if item["is_dir"] else "file"
+        output_func(f"  [{item['index']}] {item['name']} | {kind} | path={item['relative_path']}")
+    selection_hint = build_selection_hint("workspace_path_list")
+    if selection_hint:
+        output_func(selection_hint)
+    if ui and hasattr(ui, "refresh_dashboard"):
+        ui.refresh_dashboard()
+    return True
+
+
+def handle_workspace_files(user_input: str, context: dict[str, Any]) -> bool:
+    output_func = context["output_func"]
+    path_arg = user_input.split(maxsplit=1)[1] if len(user_input.split(maxsplit=1)) == 2 else ""
+    try:
+        target_path = _resolve_workspace_target(path_arg)
+    except Exception as exc:
+        output_func(f"Workspace browse failed: {exc}")
+        return True
+    return _emit_workspace_path_listing(context, target_path)
 
 
 def choose_resume_snapshot_name(agent_instance, request_id: str, reroute: bool = False) -> str | None:
@@ -279,6 +428,54 @@ def choose_resume_snapshot_name(agent_instance, request_id: str, reroute: bool =
 
     last_item = snapshots[-1]
     return str(last_item.get("file") or "").strip() or None
+
+
+def should_auto_resume_from_followup(agent_instance, followup_text: str) -> tuple[bool, str]:
+    normalized_followup = str(followup_text or "").strip()
+    if not normalized_followup:
+        return False, ""
+
+    last_request_id = ""
+    if hasattr(agent_instance, "get_last_request_id"):
+        last_request_id = str(agent_instance.get_last_request_id() or "").strip()
+    if not last_request_id:
+        return False, ""
+
+    if not hasattr(agent_instance, "get_request_summary"):
+        return False, ""
+    summary = agent_instance.get_request_summary(last_request_id) or {}
+    status = str(summary.get("status") or "").strip().lower()
+    if status not in {"waiting_user", "blocked"}:
+        return False, ""
+    return True, last_request_id
+
+
+def resume_with_followup(context: dict[str, Any], request_id: str, followup_text: str) -> None:
+    agent_instance = context["agent_instance"]
+    snapshot_name = choose_resume_snapshot_name(agent_instance, request_id, reroute=True) or "planning_completed"
+    followup = str(followup_text or "").strip()
+    try:
+        response = agent_instance.resume_from_snapshot(
+            request_id,
+            snapshot_name=snapshot_name,
+            reroute=True,
+            user_followup=followup,
+        )
+    except TypeError:
+        response = agent_instance.resume_from_snapshot(
+            request_id,
+            snapshot_name=snapshot_name,
+            reroute=True,
+        )
+
+    summary = agent_instance.get_request_summary(agent_instance.get_last_request_id()) if hasattr(agent_instance, "get_request_summary") else None
+    if summary:
+        summary = dict(summary)
+
+    announcement = f"Auto-resume: continued request {request_id} with your follow-up input."
+    context["output_func"](announcement)
+
+    emit_agent_response(context, response, agent_instance.get_last_request_id(), summary=summary)
 
 
 def build_attention_detail_summary(triage: dict[str, Any]) -> str:
@@ -701,6 +898,24 @@ def handle_pick(user_input: str, context: dict[str, Any]) -> bool:
             output_func(context["llm_manager_instance"].set_model_by_key(model_key))
         except KeyError as exc:
             output_func(str(exc))
+        return True
+
+    if selection_type == "workspace_path_list":
+        selected_path = str(selected_item.get("path") or "").strip()
+        relative_path = str(selected_item.get("relative_path") or "").strip()
+        if not selected_path:
+            output_func("Selected workspace path is invalid.")
+            return True
+        if selected_item.get("is_dir"):
+            if action and action not in {"open", "enter", "browse"}:
+                output_func("Usage: /pick <index>")
+                return True
+            return _emit_workspace_path_listing(context, Path(selected_path))
+        if action and action not in {"open", "use", "select"}:
+            output_func("Usage: /pick <index>")
+            return True
+        _set_selected_workspace_file(context, relative_path)
+        _emit_selected_workspace_file_message(context, relative_path)
         return True
 
     output_func("Current selection type is not supported.")
@@ -1715,6 +1930,8 @@ def handle_plain_message(user_input: str, context: dict[str, Any]) -> bool:
 def build_commands() -> tuple[dict[str, CLICommand], list[str]]:
     command_specs = [
         CLICommand("/llm", "/llm [model_key|list] - List configured LLM models, select with /pick, or switch by configured model key; use /llm raw <provider> <model> ... for manual override", handle_llm),
+        CLICommand("/workspace_files", "/workspace_files [path] - Browse files under the configured workspace root and select entries with /pick", handle_workspace_files),
+        CLICommand("/files", "/files [path] - Alias of /workspace_files", handle_workspace_files),
         CLICommand("/load_tool", "/load_tool <tool_name.py> - Load a local python tool", handle_load_tool),
         CLICommand("/grant_write", "/grant_write <folder_path> - Temporarily allow write access to a specific folder", handle_grant_write),
         CLICommand("/revoke_write", "/revoke_write <folder_path> - Revoke a previously granted write folder", handle_revoke_write),

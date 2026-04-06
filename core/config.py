@@ -16,6 +16,7 @@ class AppConfig:
         # core/config.py lives under core/, but runtime paths should resolve from project root.
         self.base_dir = str(Path(__file__).resolve().parents[1])
         self.config_path = os.path.join(self.base_dir, "config.json")
+        self.workspace_root = self.base_dir
         self.models_config = {}
         self.default_model_key = ""
         self.mcp_dir = "mcp_servers"
@@ -24,7 +25,7 @@ class AppConfig:
         self.memory_db_path = os.path.join("memory", "memory.db")
         self.memory_backup_dir = os.path.join("memory", "backups")
         self.log_dir = "logs"
-        self.llm_log_file = "llm_trace.log"
+        self.llm_log_file = "llm_trace.jsonl"
         self.llm_log_max_chars = 4000
         self.state_snapshot_dir = os.path.join("runtime_state", "snapshots")
         self.audit_log_dir = os.path.join("runtime_state", "audit")
@@ -70,12 +71,29 @@ class AppConfig:
             return path
         return os.path.abspath(os.path.join(self.base_dir, path))
 
+    def resolve_workspace_path(self, path: str) -> str:
+        if os.path.isabs(path):
+            return path
+        return os.path.abspath(os.path.join(self.workspace_root, path))
+
+    def get_workspace_root(self) -> str:
+        return os.path.abspath(self.workspace_root)
+
+    def set_workspace_root(self, path: str) -> str:
+        normalized = str(path or "").strip()
+        if not normalized:
+            self.workspace_root = self.base_dir
+        else:
+            resolved = normalized if os.path.isabs(normalized) else os.path.join(self.base_dir, normalized)
+            self.workspace_root = os.path.abspath(resolved)
+        return self.get_workspace_root()
+
     def _normalize_root_path(self, path: str) -> str:
-        resolved = self.resolve_path(path)
+        resolved = self.resolve_workspace_path(path)
         return os.path.abspath(resolved)
 
     def list_write_roots(self) -> list[str]:
-        roots = [self.resolve_path(".")]
+        roots = [self.get_workspace_root()]
         for item in self.extra_write_roots:
             normalized = self._normalize_root_path(str(item))
             if normalized not in roots:
@@ -84,7 +102,7 @@ class AppConfig:
 
     def grant_write_root(self, path: str) -> str:
         normalized = self._normalize_root_path(path)
-        if normalized == self.resolve_path("."):
+        if normalized == self.get_workspace_root():
             return normalized
         if normalized not in self.extra_write_roots:
             self.extra_write_roots.append(normalized)
@@ -120,6 +138,8 @@ class AppConfig:
             with open(self.config_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
 
+            self.workspace_root = self._read_value(data, "paths.workspace_root", "workspace_root", self.base_dir)
+            self.set_workspace_root(self.workspace_root)
             self.models_config = self._read_value(data, "llm.models", "models", {})
             self.default_model_key = self._read_value(data, "llm.default_model_key", "default_model", "")
             self.mcp_dir = self._read_value(data, "paths.mcp_servers_dir", "mcp_dir", "mcp_servers")
@@ -138,7 +158,7 @@ class AppConfig:
                 os.path.join("memory", "backups"),
             )
             self.log_dir = self._read_value(data, "paths.logs_dir", "log_dir", "logs")
-            self.llm_log_file = self._read_value(data, "llm.logging.file_name", "llm_log_file", "llm_trace.log")
+            self.llm_log_file = self._read_value(data, "llm.logging.file_name", "llm_log_file", "llm_trace.jsonl")
             self.llm_log_max_chars = self._read_value(data, "llm.logging.max_chars", "llm_log_max_chars", 4000)
             self.state_snapshot_dir = self._read_value(
                 data,
@@ -330,7 +350,7 @@ class AppConfig:
                     if not value:
                         continue
                     normalized = self._normalize_root_path(value)
-                    if normalized not in self.extra_write_roots and normalized != self.resolve_path("."):
+                    if normalized not in self.extra_write_roots and normalized != self.get_workspace_root():
                         self.extra_write_roots.append(normalized)
             
             # Load default model

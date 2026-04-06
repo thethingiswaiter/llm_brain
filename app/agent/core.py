@@ -391,6 +391,7 @@ class AgentCore:
         return (
             "请严格基于最新工具结果继续处理当前子任务。"
             "如果工具结果已经足够支持结论，请直接给出最终答复，并且必须使用中文。"
+            "如果最新工具结果表示已经写入、追加、覆盖或创建文件，最终答复必须明确说明目标路径、执行的写入动作，以及是否已经实际落盘成功。"
             "如果工具结果仍不足以支持结论，请继续调用合适的工具或明确说明缺失信息。"
             "如果上一个工具已经成功且返回了完整结果，不要重复调用同一个工具和相同目的的参数。"
             "不要无依据切换到英文，也不要输出与工具结果不一致的结论。"
@@ -413,10 +414,12 @@ class AgentCore:
             lines.append(f"... 其余 {len(plan) - max_items} 步省略")
         return " || ".join(lines)
 
-    def _build_leaf_routing_keywords(self, state: AgentState, subtask_desc: str, limit: int = 5) -> List[str]:
+    def _build_leaf_routing_keywords(self, state: AgentState, subtask_desc: str, limit: int = 8) -> List[str]:
         seen: set[str] = set()
         normalized_keywords: list[str] = []
-        for item in list(state.get("global_keywords", []) or []) + sorted(self._tokenize_text(subtask_desc)):
+        raw_query = str(state.get("raw_query", "") or "").strip()
+        raw_query_tokens = sorted(self._tokenize_text(raw_query)) if raw_query else []
+        for item in raw_query_tokens + list(state.get("global_keywords", []) or []) + sorted(self._tokenize_text(subtask_desc)):
             value = str(item).strip()
             marker = value.lower()
             if not value or marker in seen:
@@ -520,8 +523,95 @@ class AgentCore:
             return False
         if self._looks_like_tool_capability_block(actual, reflection_note):
             return False
-        observation_markers = ["查看", "读取", "列出", "查询", "显示", "检查", "内容", "路径", "文件", "目录"]
+        write_markers = ["写", "写入", "保存", "创建", "追加", "覆盖", "修改", "更新", "生成", "补充", "添加"]
+        if any(marker in str(subtask_desc or "") for marker in write_markers):
+            return False
+        observation_markers = ["查看", "读取", "列出", "查询", "显示", "检查", "搜索", "查找", "统计", "获取"]
         return any(marker in str(subtask_desc or "") for marker in observation_markers)
+
+    def _looks_like_write_task_description(self, description: str) -> bool:
+        normalized = str(description or "").strip().lower()
+        if not normalized:
+            return False
+        write_markers = [
+            "写", "写入", "保存", "创建", "追加", "覆盖", "修改", "更新", "生成", "补充", "添加",
+            "write", "save", "create", "append", "overwrite", "update",
+        ]
+        return any(marker in normalized for marker in write_markers)
+
+    def _looks_like_observation_task_description(self, description: str) -> bool:
+        normalized = str(description or "").strip().lower()
+        if not normalized:
+            return False
+        observation_markers = [
+            "查看", "读取", "列出", "查询", "显示", "检查", "搜索", "查找", "统计", "获取",
+            "read", "list", "show", "query", "search", "find", "inspect", "get",
+        ]
+        return any(marker in normalized for marker in observation_markers)
+
+    def _should_skip_terminal_fallback_tools(self, selected_tools: List[Any], task_description: str) -> bool:
+        if self._looks_like_write_task_description(task_description):
+            return True
+        if not self._looks_like_observation_task_description(task_description):
+            return False
+
+        terminal_tool_names = set(getattr(self.skills, "TERMINAL_TOOL_NAMES", {"bash"}))
+        return any(
+            str(getattr(tool, "name", "") or "").strip().lower() not in terminal_tool_names
+            for tool in list(selected_tools or [])
+            if str(getattr(tool, "name", "") or "").strip()
+        )
+
+    def _has_verified_write_tool_success(self, messages: List[BaseMessage]) -> bool:
+        if not messages:
+            return False
+        for item in reversed(messages):
+            if not isinstance(item, ToolMessage):
+                continue
+            payload_text = str(getattr(item, "content", "") or "").strip()
+            if not payload_text:
+                continue
+            try:
+                payload = json.loads(payload_text)
+            except Exception:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            if not bool(payload.get("ok", False)):
+                continue
+            if "path" not in payload:
+                continue
+            if "mode" in payload and "bytes_written" in payload:
+                return True
+        return False
+
+    def _prefer_write_tools_over_terminal(
+        self,
+        selected_tools: List[Any],
+        tool_skills: List[Dict[str, Any]],
+        task_description: str,
+    ) -> tuple[List[Any], List[Dict[str, Any]]]:
+        if not self._looks_like_write_task_description(task_description):
+            return selected_tools, tool_skills
+
+        write_tool_names = {
+            str(getattr(tool, "name", "") or "").strip()
+            for tool in selected_tools
+            if "write" in str(getattr(tool, "name", "") or "").strip().lower()
+        }
+        if not write_tool_names:
+            return selected_tools, tool_skills
+
+        terminal_tool_names = set(getattr(self.skills, "TERMINAL_TOOL_NAMES", {"bash"}))
+        filtered_tools = [
+            tool for tool in selected_tools
+            if str(getattr(tool, "name", "") or "").strip().lower() not in terminal_tool_names
+        ]
+        filtered_skills = [
+            item for item in tool_skills
+            if str(item.get("name", "") or "").strip().lower() not in terminal_tool_names
+        ]
+        return filtered_tools, filtered_skills
 
     def _enrich_successful_request_metadata(
         self,
@@ -620,7 +710,7 @@ class AgentCore:
                 raise
             return split_task(user_query, thinking_mode=thinking_mode)
 
-    def _append_builtin_fallback_tools(self, selected_tools: List[Any] | None) -> List[Any]:
+    def _append_builtin_fallback_tools(self, selected_tools: List[Any] | None, task_description: str = "") -> List[Any]:
         merged_tools: List[Any] = []
         seen_names: set[str] = set()
 
@@ -632,7 +722,12 @@ class AgentCore:
             if tool_name:
                 seen_names.add(tool_name)
 
-        fallback_names = getattr(self.skills, "ALWAYS_APPEND_TOOL_NAMES", {"bash"})
+        fallback_names = set(getattr(self.skills, "ALWAYS_APPEND_TOOL_NAMES", {"bash"}))
+        if self._should_skip_terminal_fallback_tools(merged_tools, task_description):
+            fallback_names = {
+                name for name in fallback_names
+                if name not in set(getattr(self.skills, "TERMINAL_TOOL_NAMES", {"bash"}))
+            }
         for tool in self.tools:
             tool_name = str(getattr(tool, "name", "") or "").strip()
             if not tool_name or tool_name not in fallback_names or tool_name in seen_names:
@@ -1057,7 +1152,7 @@ class AgentCore:
         routing_terms = [term for term in query_terms if term in known_tool_terms] or query_terms
         capability_bundle = self.skills.assign_capabilities_to_task(query, routing_terms)
         selected_tools = capability_bundle.get("tools", [])
-        return self._append_builtin_fallback_tools(selected_tools)
+        return self._append_builtin_fallback_tools(selected_tools, task_description=query)
 
     def add_tool(self, tool):
         safe_tool = self._wrap_tool_for_runtime(tool)
@@ -1647,7 +1742,12 @@ class AgentCore:
                     request_id=request_id,
                     console=True,
                 )
-            selected_tools = self._append_builtin_fallback_tools(selected_tools)
+            selected_tools, tool_skills = self._prefer_write_tools_over_terminal(
+                selected_tools,
+                tool_skills,
+                subtask_desc,
+            )
+            selected_tools = self._append_builtin_fallback_tools(selected_tools, task_description=subtask_desc)
             
             normalized_query = str(state.get("normalized_query", "")).strip()
             execution_messages = self._build_execution_messages(
@@ -1826,6 +1926,15 @@ class AgentCore:
                 reflection_note = (
                     (str(reflection_note or "").strip() + " ").strip() + "已经拿到可直接返回给用户的观测结果，因此不应阻塞并追问用户。"
                 ).strip()
+            if self._looks_like_write_task_description(current_subtask.get("description", "")):
+                if not self._has_verified_write_tool_success(messages):
+                    if success or action == "continue":
+                        success = False
+                        action = "retry"
+                        reflection_note = (
+                            (str(reflection_note or "").strip() + " ").strip()
+                            + "未检测到可验证的写入成功回执（例如 write_text_file 的 ok/path/mode/bytes_written），不能判定写入已完成。"
+                        ).strip()
             self._raise_if_request_cancelled(request_id)
             llm_manager.log_checkpoint(
                 "reflection_completed",
@@ -2126,8 +2235,19 @@ class AgentCore:
     def get_last_request_id(self) -> str:
         return self.last_request_id
 
-    def resume_from_snapshot(self, request_id: str, snapshot_name: str = None, reroute: bool = False):
-        return self.runtime.resume_from_snapshot(request_id, snapshot_name=snapshot_name, reroute=reroute)
+    def resume_from_snapshot(
+        self,
+        request_id: str,
+        snapshot_name: str = None,
+        reroute: bool = False,
+        user_followup: str | None = None,
+    ):
+        return self.runtime.resume_from_snapshot(
+            request_id,
+            snapshot_name=snapshot_name,
+            reroute=reroute,
+            user_followup=user_followup,
+        )
 
     def replay(self, memory_id: int, injected_features: list[str] = None):
         """

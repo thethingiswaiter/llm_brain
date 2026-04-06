@@ -1,344 +1,364 @@
 # llm_brain 项目总览
 
-## 1. 文档定位
+## 1. 文档目的
 
-这份文档只做一件事：基于当前源码，总结 llm_brain 现在已经实现了什么、主执行链如何运转、主要模块分别负责什么，以及哪些地方仍然只是基础版。
+这份文档只描述当前代码库已经实现的事实，不讲路线图，不复述历史方案，也不替 README 做快速上手。
 
-阅读原则：
+文档目标只有三个：
 
-- 以源码现状为准。
-- README 用于快速入口，路线图用于后续开发，不替代当前实现说明。
+- 说明这个项目现在是什么
+- 说明主执行链如何跑起来
+- 说明主要模块、能力边界和当前短板分别在哪里
+
+如果源码和本文不一致，以源码为准。
 
 ## 2. 一句话定义
 
-llm_brain 是一个基于 LangGraph 的命令行 Agent 原型，主循环围绕“特征提取 -> 任务规划 -> 子任务执行 -> 工具调用 -> 反思推进”展开，已经接入记忆、技能路由、请求级观测、运行时快照恢复、工具运行时治理，以及基础版真实 MCP stdio transport（默认弱化、按需启用）。
+llm_brain 是一个以 LangGraph 为执行骨架的 Agent 原型系统，当前以 Textual TUI 作为终端入口；系统围绕“意图重写/轻聊天判断 -> 任务规划 -> 子任务执行 -> 工具调用 -> 反思推进 -> 可恢复收尾”运行，并已经接入工作空间级文件访问、技能/工具统一路由、请求级快照恢复、跨请求观测、运行时保留治理，以及可按需启用的 MCP server。
 
 ## 3. 当前项目画像
 
-### 3.1 项目定位
+### 3.1 当前定位
 
-- 项目类型：命令行交互式 Agent 原型
-- 启动入口：main.py
-- CLI 主入口：app/cli/main.py 中的 start_cli
-- 主协调器：app/agent/core.py 中的 AgentCore
-- 状态编排：LangGraph StateGraph
-- 模型提供方：Ollama / OpenAI
-- 记忆存储：SQLite
-- 工具来源：Python 工具 + MCP 工具
-- Prompt 技能来源：Markdown Front-matter 技能
-- MCP 现状：配置式本地工具 + 真实 stdio MCP server 双模接入，默认不自动加载
-- 当前测试状态：148 个 unittest 用例通过
+- 形态上，是一个带恢复、观测、安全边界和终端交互层的 Agent 原型。
+- 交互上，根目录入口 [main.py](main.py) 直接启动 Textual TUI；legacy CLI [app/cli/main.py](app/cli/main.py) 仍作为兼容与测试入口保留，但不再是默认用户入口。
+- 架构上，核心编排集中在 [app/agent/core.py](app/agent/core.py)，运行生命周期收口在 [app/agent/runtime.py](app/agent/runtime.py)，快照恢复、可观测性、工具治理、保留策略分别拆成独立子系统。
+- 能力来源上，系统同时支持 Python 工具、Markdown Prompt 技能和 MCP 工具，并把它们统一注册到同一条任务执行链中。
 
-### 3.2 当前主线重点
+### 3.2 当前最重要的实现特征
 
-当前项目已经不再只是最小可运行骨架，最近一轮增强主要集中在稳定性和可观测性：
+- 用户面对的终端形态已经收口到 Textual TUI；legacy CLI 主要保留给兼容与测试使用，不再作为产品层面的第二终端入口。
+- 仓库根和工作空间根已经分离。工具读写、技能目录、MCP 允许根、UI 文件浏览都优先基于 `workspace_root`，而不是硬编码仓库目录。
+- 请求执行不只是单轮 invoke，还具备 request 级快照、恢复、reroute、取消、超时、失败聚合和历史失败信号路由。
+- 当前实现已经开始显式区分“普通完成”“等待用户补充”“阻塞”“失败”“超时”“恢复后继续”等不同请求状态。
 
-- request 级快照恢复与显式 reroute 恢复
-- 跨子任务失败累计后的工具降级、排除和替代排序
-- 高严重度历史失败触发 no-tool 降级
-- request_summary、recent_requests、request_rollup 三层请求观测
-- failure source 归一化为稳定 source bucket，并输出分布、占比和 recent-vs-earlier 趋势
-- detached tool run 跟踪与回收
-- runtime retention 覆盖日志、快照、审计和 memory backup
-- 模型依赖缺失在 invoke / resume 入口的稳定识别
+## 4. 启动与交互入口
 
-## 4. 主执行链
+### 4.1 启动入口
 
-### 4.1 主流程
+- 根入口：[main.py](main.py)
+- 默认 UI：Textual TUI，实现在 [app/cli/textual_app.py](app/cli/textual_app.py)
 
-1. CLI 接收普通文本输入或管理命令。
-2. 普通文本输入进入 AgentCore.invoke(query, session_id)。
-3. 每次调用都会生成新的 request_id，并进入 llm_manager.request_scope()。
-4. planner 节点提取全局关键词、判断领域、召回摘要级记忆、写入会话主记忆并拆解子任务。
-5. agent 节点执行当前子任务，统一选择 Prompt 技能与候选工具，并结合失败历史做 reroute 或 no-tool 降级判断。
-6. 如果模型返回 tool_calls，则进入 ToolNode 执行工具，再回到 agent。
-7. reflect_and_advance 节点根据 expected_outcome 与实际结果决定 continue、retry 或 ask_user。
-8. retry 首次失败时，系统可触发一次针对当前失败子任务的更小粒度重规划。
-9. 成功时返回最终结果；阻断、超时、取消或依赖故障时返回明确的可诊断消息，并同步写入快照和日志。
+当前启动逻辑很直接：
 
-补充约束：
+1. `main.py` 直接启动 Textual TUI。
+2. 如果 Textual 依赖缺失，应视为运行环境不满足，而不是回退到另一套用户终端。
 
-- 规划阶段会显式携带当前已注册的 Prompt 技能和工具清单，规划器只能基于当前能力做任务拆解。
-- “查路径”“查数量”“查文件名”这类具体问题不再在 planner/core 中做硬编码特判，相关处理应通过技能正文、工具描述或配置表达。
+### 4.2 两套终端交互层的关系
 
-### 4.2 LangGraph 节点
+当前仓库里仍然有两套终端代码路径，但对外定位已经不同：
 
-AgentCore._build_graph() 当前主节点如下：
+- Textual TUI：当前唯一默认用户入口，提供固定工作台、状态栏、日志窗口、输入框、自动补全、快捷键和工作空间文件浏览。
+- legacy CLI：保留的兼容/测试入口，用于复用命令处理与集成测试覆盖。
 
-| 节点名 | 内部函数 | 作用 |
-| --- | --- | --- |
-| planner | initial_planning | 全局特征提取、领域判断、记忆召回、会话主记忆初始化、任务拆解 |
-| agent | call_model_subtask | 执行当前子任务、选择技能与工具、调用模型 |
-| reflect_and_advance | reflect_and_advance | 判断成功、重试、重规划或 ask_user |
-| tools | ToolNode(self.tools) | 执行模型发起的工具调用 |
+两层共享大部分命令与输出逻辑，但产品层面不再强调“双终端”。现在更准确的说法是：
 
-主链路可以概括为：
+- 公共命令体系来自 [app/cli/commands.py](app/cli/commands.py)
+- Textual TUI 与 legacy CLI 共用大部分命令与恢复策略
+- “普通补充句自动续接最近 waiting_user/blocked 请求”的能力现在已经同时接到 Textual TUI 和 legacy CLI
 
-START -> planner -> agent -> tools 或 reflect_and_advance -> agent 或 END
+也就是说，当前“用户补一句话后自动续接上下文”的能力已经是共享行为，不再只属于 legacy CLI。
 
-## 5. 当前核心状态
+## 5. 工作空间模型
 
-AgentState 当前字段如下：
+### 5.1 仓库根与工作空间根
 
-| 字段 | 类型 | 作用 |
-| --- | --- | --- |
-| messages | list[BaseMessage] | LangGraph 消息历史 |
-| plan | List[Dict[str, Any]] | 当前子任务计划 |
-| current_subtask_index | int | 当前执行到的子任务索引 |
-| reflections | List[str] | 每轮反思文本 |
-| global_keywords | List[str] | 全局任务关键词 |
-| failed_tools | Dict[str, List[str]] | 按子任务记录已失败工具名，供 reroute 过滤 |
-| failed_tool_signals | Dict[str, Dict[str, Dict[str, Any]]] | 按子任务记录失败工具的结构化信号与严重度 |
-| request_id | str | 单次调用唯一追踪 ID |
-| session_id | str | 会话级唯一标识 |
-| session_memory_id | int | 当前会话主记录在记忆库中的 ID |
-| domain_label | str | 当前任务的领域标签 |
-| memory_summaries | List[Dict[str, Any]] | 摘要级记忆召回结果 |
-| retry_counts | Dict[str, int] | 每个子任务的当前重试次数 |
-| replan_counts | Dict[str, int] | 每个子任务已触发的重规划次数 |
-| blocked | bool | 当前流程是否阻断 |
-| final_response | str | 最终返回文本 |
+[core/config.py](core/config.py) 现在区分了两个重要概念：
 
-## 6. 当前已经具备的能力
+- `base_dir`：应用仓库根，用来定位项目自身代码和默认配置
+- `workspace_root`：当前任务实际操作的工作区根，用来约束文件浏览、读写和 MCP 允许根
 
-### 6.1 执行与恢复
+这意味着项目本身可以驻留在一个目录里，但实际允许操作的文件空间由配置决定。
 
-- 基于 LangGraph 的可运行状态图执行骨架
-- 基于 LLM 的特征提取、领域判断、任务拆解与反思判断
-- 领域树为中文图书分类风格，并扩展到工业技术、文学、艺术、历史地理、医药卫生等更细粒度标签
-- request_id 级运行时状态快照持久化
-- 从最新、索引、阶段名或显式快照文件恢复执行
-- 对 blocked 或中途中断快照支持显式 reroute 恢复模式
-- 恢复前语义一致性校验，拒绝明显不一致的快照
-- retry 路径上的一次性失败子任务重规划
-- LLM、工具、整次请求三级超时控制
-- 按 request_id 的协作式主动取消
-- 模型依赖不可用在 invoke / resume 入口的稳定识别，不再退化成笼统错误
+### 5.2 当前基于工作空间根的能力
 
-### 6.2 工具与 reroute
+以下能力已经改成基于 `workspace_root`：
 
-- 工具异常统一分类、结构化失败返回与参数预校验
-- 工具运行生命周期跟踪、detached 标记与后台完成回收
-- 工具失败后的自动排除、替代工具搜索与无工具降级
-- 跨子任务失败累计进入 reroute 策略
-- 历史失败严重度进入当前工具优先级和 reroute 候选排序
-- 超过 severity 阈值的工具会被直接排除，必要时降级到 no-tool 路径
-- no-tool 提示已区分 ask-user 补参与 direct-answer 安全收敛
+- 本地读写工具路径解析
+- 默认可写根与额外授权写根
+- Markdown 技能目录定位
+- system MCP server 的允许路径根
+- CLI/TUI 的工作区文件浏览与选择
 
-### 6.3 记忆与技能
+### 5.3 工作区文件选择能力
 
-- 会话级与步骤级记忆写入
-- 摘要级记忆召回与按需详情加载
-- failure_case 失败案例记忆视图
-- replay 历史记忆重放
-- memory -> Markdown skill 转换
+当前终端交互层已经支持在工作空间内浏览和选择文件：
+
+- 命令入口：`/workspace_files` 与 `/files`
+- 选择机制：`/pick`
+- Textual 快捷键：`Ctrl+O`
+
+选择后的文件路径会写入当前会话选择上下文；在 TUI 中会直接回填到输入框，便于继续提问或拼接命令。
+
+## 6. 主执行链
+
+### 6.1 高层流程
+
+普通请求的主链路可以概括为：
+
+1. UI 接收用户输入。
+2. 请求进入 `AgentCore.invoke(query, session_id)`。
+3. 系统生成新的 `request_id`，建立 request scope。
+4. 规划阶段提取特征、确定领域、召回记忆、拆解子任务。
+5. 执行阶段为当前子任务选择技能、工具和补充提示。
+6. 模型如发起 `tool_calls`，则进入工具节点执行，再回到模型节点。
+7. 反思阶段判断当前子任务应当 `continue`、`retry` 还是 `ask_user`。
+8. 成功则推进到下一子任务或结束；失败则可能重试、重规划、阻塞、等待用户或转入恢复路径。
+
+### 6.2 LangGraph 节点
+
+[app/agent/core.py](app/agent/core.py) 当前构建的主状态图包含四个核心节点：
+
+- `planner`：初始规划
+- `agent`：当前子任务执行
+- `tools`：工具调用
+- `reflect_and_advance`：反思与推进
+
+主流程仍然是标准的 Planner-Agent-Tools-Reflect 结构，但项目已经在每个阶段上叠加了更多运行时治理：
+
+- request 级快照
+- 工具失败历史
+- reroute 与 no-tool 降级
+- 请求取消/超时
+- 失败来源归因
+
+## 7. Agent 状态模型
+
+当前 `AgentState` 定义在 [app/agent/core.py](app/agent/core.py)，不是极简消息列表，而是一个带执行状态和治理信号的运行态对象。关键字段包括：
+
+- `messages`：LangGraph 消息历史
+- `raw_query`：用户原始输入
+- `normalized_query`：重写后的意图文本
+- `plan`：当前子任务计划
+- `current_subtask_index`：当前执行到哪一步
+- `reflections`：反思结果历史
+- `global_keywords`：全局关键词
+- `failed_tools`：按子任务记录失败工具
+- `failed_tool_signals`：失败工具的结构化信号与严重度
+- `retry_counts` / `replan_counts`：重试与重规划计数
+- `blocked` / `waiting_for_user`：是否阻塞或等待用户补充
+- `final_response`：当前请求最终输出
+- `lite_mode`：是否走轻聊天模式
+- `subtask_feature_cache`：子任务级特征缓存
+- `agent_action`：当前代理动作标签
+
+这套状态设计决定了项目当前重点不是“单次回答”，而是“可追踪、可恢复、可诊断的一次请求”。
+
+## 8. 核心子系统分工
+
+### 8.1 核心编排
+
+- [app/agent/core.py](app/agent/core.py)：Agent 门面、状态图构建、主执行策略、子系统协调
+- [app/agent/runtime.py](app/agent/runtime.py)：invoke / resume / timeout / cancel 等请求级生命周期收口
+- [app/agent/snapshots.py](app/agent/snapshots.py)：快照落盘、迁移、校验、恢复状态构造
+
+### 8.2 认知与决策
+
+- [cognitive/feature_extractor.py](cognitive/feature_extractor.py)：特征提取与领域判断
+- [cognitive/planner.py](cognitive/planner.py)：任务拆解
+- [cognitive/reflector.py](cognitive/reflector.py)：反思与行动决策
+- [cognitive/structured_output.py](cognitive/structured_output.py)：结构化输出解析与约束
+
+### 8.3 工具与技能
+
+- [app/agent/tools_runtime.py](app/agent/tools_runtime.py)：工具包装、参数预校验、失败分类、运行态跟踪
+- [app/agent/skill_parser.py](app/agent/skill_parser.py)：Markdown Prompt 技能加载与路由
+- [tools/langchain_common_tools.py](tools/langchain_common_tools.py)：本地文件/目录/搜索等常用工具
+
+### 8.4 记忆、观测与保留
+
+- [memory/memory_manager.py](memory/memory_manager.py)：SQLite 记忆存储、召回与备份
+- [app/agent/observability.py](app/agent/observability.py)：request_summary / recent_requests / rollup 聚合
+- [app/agent/retention.py](app/agent/retention.py)：logs / snapshots / audit / memory backups 的保留与清理
+
+### 8.5 模型与日志
+
+- [core/llm/manager.py](core/llm/manager.py)：模型门面
+- [core/llm/factory.py](core/llm/factory.py)：Provider 实例构造
+- [core/llm/runtime.py](core/llm/runtime.py)：request scope、超时与取消基础设施
+- [core/llm/logging.py](core/llm/logging.py)：结构化日志与阶段事件
+
+## 9. 当前已经具备的主要能力
+
+### 9.1 请求执行与恢复
+
+- 基于 LangGraph 的多阶段请求执行
+- 每次请求分配 `request_id`，与 `session_id` 组成双层追踪
+- request 级状态快照持久化
+- 从最新快照、索引、阶段名或显式文件名恢复
+- blocked / waiting_user / 中断请求的 reroute 恢复
+- 恢复前做快照一致性校验，避免在坏状态上继续跑
+- Textual TUI 与 legacy CLI 都已支持“用户直接补一句话”自动续接最近 waiting_user/blocked 请求
+- 恢复链路已经可以携带 follow-up 文本，把补充信息注入 reroute 上下文
+
+### 9.2 工具治理
+
+- 工具参数预校验
+- 工具失败统一结构化返回
+- detached tool run 跟踪
+- 超时、取消、执行失败、阻塞等失败类型归一化
+- 跨子任务累积失败历史，并进入后续工具选择排序
+- 高严重度失败工具可直接排除
+- 无安全工具路径时可降级为 no-tool 路径
+- 写任务场景下优先写工具而不是终端 fallback
+- 写任务成功需要可验证写入回执，不能仅凭“看起来像成功”判定完成
+
+### 9.3 技能与能力路由
+
 - Python 工具自动扫描加载
-- 自动跳过 sample_*.py 与 test_*.py 这类示例/测试技能文件
-- Markdown Prompt 技能自动扫描、Front-matter 解析和统一匹配
-- Prompt 技能、Python 工具、MCP 工具统一能力注册和路由
-- 规划阶段共享当前能力清单，避免 planner 脱离真实能力做抽象拆解
+- Markdown Front-matter 技能自动扫描和解析
+- Prompt 技能、Python 工具、MCP 工具统一注册到同一能力面
+- 路由时会考虑任务关键词、匹配比例、只读/写入意图和终端命令偏置
+- 规划阶段会看到当前可用能力，而不是脱离真实工具集做抽象拆解
 
-### 6.4 MCP 与运行时治理
+### 9.4 观测与排障
 
-- 配置式 MCP 工具注册
-- 真实 MCP stdio server 的加载、列举工具、远端调用、连接复用、自动重连、刷新与卸载
-- 仓库内置 Python MCP server，支持终端命令、系统信息和文件信息查看
-- AgentCore 默认关闭 MCP 自动加载，需显式启用或通过命令加载
-- runtime retention 已覆盖 logs、snapshots、audit logs 和 memory backups
-- retention 支持 retention_days、max_files 或 max_request_dirs、max_bytes 三类约束
-- retention_status 与 prune_runtime_data 支持 dry-run / apply
-- 自动 prune 具备低频节流与执行/跳过原因记录
+- 单请求聚合：`request_summary`
+- 最近请求聚合：`recent_requests`
+- 跨请求聚合：`request_rollup`
+- triage 中保留 latest failure stage / source / details / reroute mode
+- rollup 中聚合 failure signals、failure combinations、source buckets 和趋势
+- 日志目录、审计目录、快照目录分离
+- request 失败、模型依赖不可用、工具超时、阻塞路径都能进入统一观测口径
 
-### 6.5 观测与排障
+### 9.5 运行时保留治理
 
-- request_id 与 session_id 双层追踪
-- 文件日志中的结构化 JSON 事件与控制台阶段日志
-- request_summary 单请求聚合视图
-- recent_requests 最近请求摘要视图
-- request_rollup 跨请求聚合视图
-- request_failed 快照 extra 中的 error_type / error 会回填到 triage 与 rollup
-- 最新失败来源会归一化为稳定 source bucket，例如 agent_invoke、agent_resume、model、tool_runtime、reflection、retention
-- rollup 会输出 top failure signals、failure combinations、source bucket 分布、占比和 recent-vs-earlier 趋势
-- detached tool 计数、明细与运行态查询视图
-- checkpoint 级阶段耗时分布聚合
+- 覆盖 logs、snapshots、audit logs、memory backups
+- 支持按保留天数、数量上限、容量上限裁剪
+- 支持 dry-run 和 apply
+- 支持低频自动 prune 和执行原因记录
 
-## 7. 当前仍属于基础版的部分
+### 9.6 工作空间与权限边界
 
-- MCP 真实 transport 目前只覆盖 stdio 基础版，尚未补资源同步、订阅刷新和更细粒度健康检查
-- 超时与取消目前仍以逻辑取消为主，不是底层线程、进程或网络调用的硬终止
-- 技能与工具路由仍以关键词和阈值匹配为主，没有混合检索或更强语义检索
-- 记忆治理已有质量标签和精确去重，但还没有归档、衰减、相似合并和长期压缩策略
-- 可观测性已经具备请求聚合与跨请求 rollup，但还不是完整的全局指标系统
+- 默认读操作相对 `workspace_root`
+- 默认写根为 `workspace_root`
+- 可额外 grant / revoke 写根
+- system MCP server 的允许根默认绑定 `workspace_root`
+- shell 命令通过 allowlist 前缀与危险操作标记约束
+- 禁止 `&&`、`||`、`;`、换行等多段拼接式 shell 操作
 
-## 8. 项目结构与职责
+## 10. CLI / TUI 当前能力面
 
-| 路径 | 角色 |
-| --- | --- |
-| app/agent/core.py | Agent 门面、图构建、子系统编排 |
-| app/agent/runtime.py | 请求生命周期、invoke / resume 收口、取消与超时协调 |
-| app/agent/snapshots.py | 快照序列化、落盘、恢复与校验 |
-| app/agent/observability.py | request_summary、recent_requests、request_rollup 聚合 |
-| app/agent/tools_runtime.py | 工具包装、参数预校验、失败解析、reroute 计划与运行态跟踪 |
-| app/agent/retention.py | 运行时产物 retention 统计、清理和自动 prune |
-| main.py | 根目录 CLI 启动入口 |
-| app/cli/main.py | CLI 入口与主循环 |
-| app/cli/commands.py | CLI 命令元数据、帮助文本与 handler 注册 |
-| app/cli/terminal_ui.py | 终端渲染与富文本交互层 |
-| core/config.py | 全局配置装载与路径解析 |
-| core/time_utils.py | 中国时区与统一时间工具 |
-| core/llm/manager.py | LLM 对外门面 |
-| core/llm/logging.py | 结构化日志、控制台输出、request_id 事件反查 |
-| core/llm/runtime.py | request_scope、超时等待与取消检查 |
-| core/llm/factory.py | provider 对应 LLM 实例构造 |
-| cognitive/ | 特征提取、规划、反思与结构化输出解析 |
-| memory/ | SQLite 记忆管理与大输入备份 |
-| tools/ | 真实运行时 Python 工具目录 |
-| examples/skills/ | 示例 Python 工具（历史目录名保留），不参与自动加载 |
-| skills/ | Markdown Prompt 技能目录 |
-| mcp_servers/mcp_manager.py | MCP 双模接入层 |
-| mcp_servers/system_mcp_server.py | 内置独立 Python MCP server |
-| logs/ | LLM 日志目录 |
-| runtime_state/ | 快照、审计与运行时状态目录 |
-| tests/ | 回归测试目录 |
-| docs/ | 文档目录 |
+### 10.1 终端层已具备的核心交互
 
-## 9. 对外接口
+- 模型切换
+- Python 工具/Markdown 技能/MCP server 动态加载与卸载
+- 快照列举与恢复
+- 请求摘要、最近请求、请求 rollup
+- detached tools、failure memories、retention status
+- 工作区文件浏览与选择
+- 最近输入、输入候选、自然语言安全映射
 
-### 9.1 CLI 主要命令
+### 10.2 当前比较重要的命令类别
 
-| 命令 | 作用 |
-| --- | --- |
-| /llm <provider> <model> [base_url] [api_key] | 切换当前模型配置 |
-| /load_tool <tool_name.py> | 增量加载 Python 工具 |
-| /load_skill <skill_name.md> | 增量加载 Markdown 技能 |
-| /load_mcp <config\|server.py\|stdio:command ...> | 加载配置式 MCP 工具或真实 stdio MCP server |
-| /list_mcp | 查看已加载 MCP server 与 transport |
-| /refresh_mcp <server_name\|source> | 刷新 MCP server 并重新枚举工具 |
-| /unload_mcp <server_name\|source> | 卸载 MCP server 并移除其工具 |
-| /cancel_request <request_id> | 对活跃请求发起协作式取消 |
-| /list_snapshots <request_id> | 列出可用恢复点 |
-| /resume_snapshot <request_id> [latest\|index\|stage\|snapshot_file] [reroute] | 从快照恢复；可选 reroute 重规划 |
-| /request_summary <request_id> | 查看单请求摘要、指标、checkpoint、快照和记忆 |
-| /recent_requests [limit] [status=...] [resumed] [attention] [since=30m] | 查看最近请求摘要与 attention 原因 |
-| /failed_requests [limit] [status=...] [resumed] [attention] [since=30m] | 失败导向的 recent 查询别名 |
-| /resumed_requests [limit] [status=...] [attention] [since=30m] | 恢复请求导向的 recent 查询别名 |
-| /request_rollup [limit] [status=...] [resumed] [attention] [since=30m] | 查看最近请求的聚合统计、failure 热点和 source 摘要 |
-| /list_tool_runs [request_id] [running\|detached] | 查看运行中或 detached 的工具运行态 |
-| /failure_memories [limit] [keywords...] | 查看 failure_case 记忆视图 |
-| /retention_status | 查看 retention 状态、可回收体积、最近自动 prune 摘要 |
-| /prune_runtime_data [apply] | 对 retention 范围内的运行时产物做 dry-run 或实际清理 |
-| /replay <memory_id> [injected features...] | 重放历史记忆并重新执行 |
-| /convert_skill <memory_id> | 将历史记忆转换成 Markdown 技能 |
-| /new_session | 创建新的会话 ID |
-| exit / quit | 退出 CLI |
+代表性命令包括：
 
-### 9.2 AgentCore 主要方法
+- `/llm`
+- `/workspace_files` 和 `/files`
+- `/grant_write`、`/revoke_write`、`/list_write_roots`
+- `/list_snapshots`、`/resume_snapshot`、`/resume`
+- `/request_summary`、`/summary`
+- `/recent_requests`、`/recent`
+- `/request_rollup`、`/rollup`
+- `/latest_failure`
+- `/resume_last_blocked`
+- `/pick`、`/selection`
+- `/failure_memories`
+- `/retention_status`
+- `/prune_runtime_data`
 
-| 方法 | 作用 |
-| --- | --- |
-| invoke(query, session_id=None) | 执行一次完整 Agent 调用 |
-| replay(memory_id, injected_features=None) | 重放历史记忆并重新执行 |
-| resume_from_snapshot(request_id, snapshot_name=None, reroute=False) | 从指定快照恢复继续执行 |
-| list_snapshots(request_id) | 列出指定请求的可用快照 |
-| get_request_summary(request_id) | 聚合单次请求的快照、checkpoint、memory 与指标 |
-| get_recent_request_summaries(limit=10, statuses=None, resumed_only=False, attention_only=False, since_seconds=None) | 聚合最近请求摘要视图 |
-| get_request_rollup(limit=20, statuses=None, resumed_only=False, attention_only=False, since_seconds=None) | 聚合最近请求的全局状态、计数、阶段耗时与 failure 热点 |
-| list_tool_runs(request_id="", status="") | 查看 tracked tool run 运行态 |
-| get_failure_memories(match_keywords=None, limit=5, exclude_conv_id=None, exclude_ids=None) | 聚合失败案例记忆视图 |
-| get_retention_status() | 汇总运行时产物的 retention 状态和最近自动 prune 信息 |
-| prune_runtime_data(apply=False) | 预览或执行运行时产物清理 |
-| load_tool(tool_name) | 手动加载 Python 工具 |
-| load_skill(skill_name) | 手动加载 Markdown 技能 |
-| load_mcp_server(server_ref) | 加载配置式 MCP 工具或真实 stdio MCP server |
-| list_mcp_servers() | 列出当前已加载的 MCP server |
-| refresh_mcp_server(server_ref) | 刷新某个 MCP server 并重新枚举工具 |
-| unload_mcp_server(server_ref) | 卸载某个 MCP server 并移除其工具 |
-| add_tool(tool) | 运行时动态添加工具 |
-| start_session(session_id=None) | 新建或切换 session_id |
-| get_last_request_id() | 获取最近一次调用生成的 request_id |
+### 10.3 Textual TUI 当前特征
 
-## 10. 观测、日志与恢复细节
+Textual TUI 不是简单终端包装，而是固定工作台：
 
-### 10.1 追踪标识
+- 顶部状态区
+- 中央日志区
+- 输入框与自动补全面板
+- 工作区文件浏览快捷键 `Ctrl+O`
 
-- session_id：标识同一会话
-- request_id：标识一次具体 Agent 调用
+它已经具备较好的日常交互体验，当前用户应当把它视为唯一默认终端入口。
 
-一次 invoke 会生成新的 request_id，并把整个执行包在 llm_manager.request_scope() 中。因此同一次请求的 LLM 调用、checkpoint、快照、工具运行态和记忆记录，都可以回溯到同一个 request_id。
+## 11. MCP 现状
 
-### 10.2 请求级聚合
+### 11.1 当前支持什么
 
-当前主要聚合入口有三层：
+- 配置式 MCP server 接入
+- 真实 stdio transport 的连接、刷新、卸载和工具枚举
+- 仓库内置 system MCP server
 
-- get_request_summary(request_id)：看单次请求的状态、进度、checkpoint、快照、记忆、triage 和指标
-- get_recent_request_summaries(...)：看最近请求的摘要列表，可按状态、是否恢复、是否需要 attention、时间窗口筛选
-- get_request_rollup(...)：看最近请求的跨请求聚合，包括状态分布、总量指标、failure 热点和 source bucket 摘要
+### 11.2 system MCP server 当前边界
 
-request_rollup 当前除基础指标外，还额外聚合：
+[mcp_servers/system_mcp_server.py](mcp_servers/system_mcp_server.py) 当前提供的是“受控系统观察能力”，不是无约束 shell：
 
-- top_failure_signals：stages、tools、reasons、error_types、actions、sources、reroute_modes、no_tool_fallbacks
-- top_failure_combinations：stage_tool、tool_reason、stage_source、stage_reroute
-- source_bucket_breakdown：失败来源分布与占比
-- source_bucket_trends：recent-vs-earlier 的 bucket 趋势变化
+- 默认允许根来自 `workspace_root`
+- 命令前缀必须在 allowlist 中
+- 危险命令片段会被拒绝
+- 多段 shell 运算符被拒绝
+- 所有调用进入审计日志
 
-### 10.3 快照恢复
+这意味着它更像一个受限系统检查器，而不是完全开放的远程终端。
 
-主执行链会把关键阶段状态写入 runtime_state/snapshots。当前支持：
+## 12. 当前测试形态
 
-- 按 request_id 恢复最新快照
-- 按索引、阶段名或显式文件名选择恢复点
-- 对已完成或已阻断的终态快照直接返回终态结果
-- 对 blocked 或中途中断的恢复点显式走 reroute 模式
-- 恢复前做语义一致性校验，避免在不一致状态上继续执行
+### 12.1 测试入口
 
-## 11. 测试现状
+[tests/run_tests.py](tests/run_tests.py) 当前把测试分成两层：
 
-当前 tests/ 主要覆盖：
+- 快速回归：核心、技能、记忆、工具安全、MCP server 等模块
+- 全量回归：在快速回归基础上再加入 CLI 与 MCP transport 的慢集成测试
 
-- 技能与工具路由阈值
-- 结构化输出、快照、超时、取消、reroute 与观测性路径
-- 记忆质量、失败案例与重复合并
-- 工具参数预校验与运行期输入拦截
-- CLI 命令与主链基础集成
-- 真实 MCP stdio transport、连接复用、自动重连、刷新与卸载
-- system MCP server 的安全控制与审计行为
+### 12.2 当前已验证的事实
 
-当前测试分层如下：
+最近已明确验证的回归包括：
 
-- 默认快速回归：python tests/run_tests.py（111 tests）
-- 全量回归：python tests/run_tests.py --all（148 tests）
+- `python -m unittest tests.test_cli_and_integration tests.test_core_reliability`
+- 结果：`Ran 186 tests`，`OK`
 
-当前最新验证结果为 148 个 unittest 用例通过。
+这说明近期这几轮新增的关键能力至少在以下方向上已经被回归覆盖：
 
-## 12. 当前实现判断
+- 工作空间根与文件选择
+- 请求恢复与 reroute
+- 写任务完成判定
+- Textual / CLI 续接与集成路径
 
-### 12.1 已经比较稳定的部分
+## 13. 当前最值得注意的实现边界
 
-- CLI -> AgentCore -> LangGraph 的主链可运行
-- request_id / session_id 双层追踪
-- 请求级快照、恢复、reroute 恢复与基础校验
-- 工具异常安全包装、历史失败降级与 no-tool fallback
-- request_summary、recent_requests、request_rollup 三层观测
-- runtime retention 基线与自动 prune
-- Python 工具、Markdown Prompt 技能、配置式 MCP 工具和真实 MCP 工具统一路由
+项目现在已经可用，但仍然是原型系统，不应被误判为“全能力闭环平台”。目前主要边界有这些：
 
-### 12.2 仍未闭环的部分
+- Textual TUI 和 legacy CLI 共享大部分命令，但两者的角色已经不同；默认交互应以 Textual TUI 为准。
+- 工具与技能路由仍以关键词、阈值和规则增强为主，不是更强的混合检索或长期学习路由。
+- 超时和取消主要是逻辑层面的协作式中止，不是对所有底层外部调用的硬中断。
+- MCP transport 当前以 stdio 基础能力为主，还不是完整协议工程化实现。
+- 记忆治理已经有质量标签、失败视图和基础去重，但还没有长期压缩、衰减、归档和聚类合并体系。
 
-- 更强的底层硬中止能力
-- 更细粒度的节点级恢复
-- 更强的语义检索与能力路由
-- 更长期的记忆治理策略
-- 更完整的全局指标和 MCP 工程化能力
+## 14. 适合怎么理解这个项目
 
-## 13. 建议阅读顺序
+如果只用一句更准确的话概括现在的 llm_brain，可以这样说：
 
-1. 先读本文件，建立整体认知。
-2. 再读 app/agent/core.py，理解主状态和主执行链。
-3. 接着读 app/agent/runtime.py、app/agent/snapshots.py、app/agent/observability.py、app/agent/tools_runtime.py、app/agent/retention.py，理解辅助职责拆分。
-4. 然后读 main.py、app/cli/main.py、app/cli/commands.py、core/llm/manager.py、core/llm/logging.py、core/llm/runtime.py、core/llm/factory.py，理解入口、命令分发、日志和 provider 封装。
-5. 再读 cognitive/、memory/、tools/、skills/、mcp_servers/。
-6. 最后再对照 README.md、docs/agent.md、docs/completeness_roadmap.md，区分当前事实、概念说明和后续路线图。
+它已经不是单纯的“命令行聊天脚本”，而是一个带工作空间边界、状态恢复、请求观测、工具治理和 Textual 终端外壳的 Agent 原型内核；真正成熟的部分在于执行链可追踪、失败可诊断、状态可恢复，而不是大而全的能力覆盖。
 
-## 14. 结论
+理解这个项目时，重点应该放在下面几件事上：
 
-llm_brain 当前仍是原型工程，但已经具备了可追踪的执行主链、基础记忆闭环、统一技能路由、请求级与跨请求观测、快照恢复、工具运行时治理，以及基础版真实 MCP stdio 接入。当前策略明确为“主链优先、MCP 可支持但默认弱化”。后续接手时，重点不该再放在“能不能跑起来”，而应放在恢复粒度、底层中止、路由质量、长期记忆治理和更完整的协议工程化上。
+- 它如何把一次请求变成一个有 `request_id` 的可恢复运行过程
+- 它如何基于真实工作空间根限制工具和文件访问
+- 它如何把工具失败、reroute、ask_user、blocked 和 resume 纳入同一条状态链
+- 它如何通过 summary / recent / rollup 把一次请求和多次请求都变成可观察对象
+
+## 15. 建议阅读顺序
+
+如果要继续接手开发，建议按这个顺序看：
+
+1. [main.py](main.py)
+2. [app/cli/textual_app.py](app/cli/textual_app.py)
+3. [app/cli/main.py](app/cli/main.py)
+4. [app/cli/commands.py](app/cli/commands.py)
+5. [app/agent/core.py](app/agent/core.py)
+6. [app/agent/runtime.py](app/agent/runtime.py)
+7. [app/agent/snapshots.py](app/agent/snapshots.py)
+8. [app/agent/tools_runtime.py](app/agent/tools_runtime.py)
+9. [app/agent/observability.py](app/agent/observability.py)
+10. [core/config.py](core/config.py)
+11. [tools/langchain_common_tools.py](tools/langchain_common_tools.py)
+12. [mcp_servers/system_mcp_server.py](mcp_servers/system_mcp_server.py)
+
+这样读，能先把外层交互、再把执行主链、最后把安全边界和周边治理串起来。

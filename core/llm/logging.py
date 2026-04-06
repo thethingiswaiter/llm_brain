@@ -10,6 +10,10 @@ from core.time_utils import CHINA_TIMEZONE
 
 
 class ChinaTimezoneFormatter(logging.Formatter):
+    @staticmethod
+    def current_timestamp() -> str:
+        return datetime.now(tz=CHINA_TIMEZONE).isoformat(sep=" ", timespec="seconds")
+
     def formatTime(self, record, datefmt=None):
         dt = datetime.fromtimestamp(record.created, tz=CHINA_TIMEZONE)
         if datefmt:
@@ -44,7 +48,7 @@ class LLMLogging:
 
         logger.setLevel(logging.INFO)
         logger.propagate = False
-        formatter = ChinaTimezoneFormatter("%(asctime)s | %(levelname)s | %(message)s")
+        formatter = logging.Formatter("%(message)s")
 
         if not logger.handlers:
             file_handler = logging.FileHandler(log_path, encoding="utf-8")
@@ -113,6 +117,7 @@ class LLMLogging:
         self,
         event_type: str,
         message: str = "",
+        level: int | str = logging.INFO,
         request_id: str | None = None,
         session_id: str | None = None,
         stage: str | None = None,
@@ -121,18 +126,21 @@ class LLMLogging:
     ) -> dict[str, Any]:
         source = fields.pop("source", "-")
         outcome = fields.pop("outcome", "-")
+        logged_at = fields.pop("logged_at", ChinaTimezoneFormatter.current_timestamp())
         payload = {
+            "request_id": request_id or self.runtime.get_request_id() or "-",
+            "level": self.stringify_field(logging.getLevelName(level) if isinstance(level, int) else level),
             "event_type": event_type,
             "message": message,
-            "request_id": request_id or self.runtime.get_request_id() or "-",
-            "session_id": session_id or self.runtime.get_session_id() or "-",
             "stage": stage,
-            "source": self.stringify_field(source),
             "outcome": self.stringify_field(outcome),
             "duration_ms": round(duration_ms, 2) if duration_ms is not None else None,
         }
         for key, value in fields.items():
             payload[key] = self.stringify_field(value)
+        payload["logged_at"] = self.stringify_field(logged_at)
+        payload["session_id"] = session_id or self.runtime.get_session_id() or "-"
+        payload["source"] = self.stringify_field(source)
         return {key: value for key, value in payload.items() if value not in (None, "")}
 
     def log_structured_event(
@@ -149,26 +157,27 @@ class LLMLogging:
         payload = self.build_structured_payload(
             event_type,
             message=message,
+            level=level,
             request_id=request_id,
             session_id=session_id,
             stage=stage,
             duration_ms=duration_ms,
             **fields,
         )
-        self._logger.log(level, json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        self._logger.log(level, json.dumps(payload, ensure_ascii=False))
 
-    def parse_text_log_message(self, raw_message: str) -> dict[str, Any]:
-        payload = {
-            "event_type": "text_event",
-            "message": raw_message,
-        }
-        request_match = re.search(r"request_id=([^|]+)", raw_message)
-        if request_match:
-            payload["request_id"] = request_match.group(1).strip()
-        stage_match = re.search(r"stage=([^|]+)", raw_message)
-        if stage_match:
-            payload["stage"] = stage_match.group(1).strip()
-        return payload
+    def parse_log_line(self, raw_line: str) -> dict[str, Any] | None:
+        line = str(raw_line or "").strip()
+        if not line:
+            return None
+
+        try:
+            payload = json.loads(line)
+            if isinstance(payload, dict):
+                return payload
+            return None
+        except json.JSONDecodeError:
+            return None
 
     def get_log_path(self) -> str:
         return str(Path(config.resolve_path(config.log_dir)) / config.llm_log_file)
@@ -181,21 +190,13 @@ class LLMLogging:
         events = []
         with open(log_path, "r", encoding="utf-8") as file_handle:
             for line in file_handle:
-                parts = line.rstrip("\n").split(" | ", 2)
-                raw_message = parts[2] if len(parts) == 3 else line.strip()
-                if request_id not in raw_message:
+                payload = self.parse_log_line(line)
+                if not payload:
                     continue
-
-                try:
-                    payload = json.loads(raw_message)
-                except json.JSONDecodeError:
-                    payload = self.parse_text_log_message(raw_message)
 
                 if payload.get("request_id") != request_id:
                     continue
 
-                payload["logged_at"] = parts[0] if len(parts) >= 1 else ""
-                payload["level"] = parts[1] if len(parts) >= 2 else ""
                 events.append(payload)
 
         if limit > 0:

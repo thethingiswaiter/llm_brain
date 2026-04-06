@@ -459,7 +459,7 @@ class AgentSnapshotStore:
                     return content
         return ""
 
-    def _build_resume_reroute_prompt(self, payload: dict[str, Any]) -> str:
+    def _build_resume_reroute_prompt(self, payload: dict[str, Any], user_followup: str = "") -> str:
         state = payload.get("state", {}) if isinstance(payload, dict) else {}
         plan = state.get("plan", []) if isinstance(state.get("plan", []), list) else []
         current_subtask_index = int(state.get("current_subtask_index", 0) or 0)
@@ -480,7 +480,10 @@ class AgentSnapshotStore:
                 failed_tool_counts[normalized_name] = failed_tool_counts.get(normalized_name, 0) + 1
 
         query = self._extract_resume_query(payload) or "Continue the original task with a safer route."
+        followup = str(user_followup or "").strip()
         prompt_lines = [query, "", "Resume reroute context:"]
+        if followup:
+            prompt_lines.append(f"- user_followup={followup}")
         prompt_lines.append(f"- source_stage={payload.get('stage', '')}")
         prompt_lines.append(f"- completed_subtasks={min(current_subtask_index, len(plan))}/{len(plan)}")
         if current_subtask_index < len(plan):
@@ -531,13 +534,19 @@ class AgentSnapshotStore:
         payload: dict[str, Any],
         request_id: str,
         reroute: bool = False,
+        user_followup: str = "",
     ) -> dict[str, Any]:
         restored_state = self.restore_state_from_snapshot(payload, request_id)
         if not reroute:
             return restored_state
 
+        followup = str(user_followup or "").strip()
+        normalized_query = self._extract_resume_query(payload)
+        if followup:
+            normalized_query = f"{normalized_query}\n\n用户补充信息:\n{followup}".strip()
+
         return {
-            "messages": [HumanMessage(content=self._build_resume_reroute_prompt(payload))],
+            "messages": [HumanMessage(content=self._build_resume_reroute_prompt(payload, user_followup=followup))],
             "plan": [],
             "current_subtask_index": 0,
             "reflections": restored_state.get("reflections", []),
@@ -555,7 +564,7 @@ class AgentSnapshotStore:
             "waiting_for_user": False,
             "final_response": "",
             "lite_mode": False,
-            "normalized_query": self._extract_resume_query(payload),
+            "normalized_query": normalized_query,
             "subtask_feature_cache": {},
             "agent_action": "",
         }

@@ -10,9 +10,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
-if str(WORKSPACE_ROOT) not in sys.path:
-    sys.path.insert(0, str(WORKSPACE_ROOT))
+APP_ROOT = Path(__file__).resolve().parents[1]
+if str(APP_ROOT) not in sys.path:
+    sys.path.insert(0, str(APP_ROOT))
 
 from core.config import config
 from core.time_utils import CHINA_TIMEZONE, now_china
@@ -85,9 +85,13 @@ DISALLOWED_SHELL_OPERATORS = [
 ]
 
 
+def _workspace_root() -> Path:
+    return Path(config.resolve_workspace_path(".")).resolve()
+
+
 def _get_allowed_root_strings() -> list[str]:
     extra_roots = os.getenv("LLM_BRAIN_MCP_ALLOWED_ROOTS", "").strip()
-    allowed_roots = [str(WORKSPACE_ROOT.resolve())]
+    allowed_roots = [str(_workspace_root())]
     if extra_roots:
         for raw_root in extra_roots.split(os.pathsep):
             cleaned = raw_root.strip()
@@ -134,7 +138,7 @@ def _truncate_text(value: str, limit: int = MAX_OUTPUT_CHARS) -> tuple[str, bool
 
 def _resolve_path(path_value: str | None, allow_outside_workspace: bool = False) -> Path:
     candidate = Path(path_value or ".")
-    resolved = candidate if candidate.is_absolute() else (WORKSPACE_ROOT / candidate)
+    resolved = candidate if candidate.is_absolute() else (_workspace_root() / candidate)
     resolved = resolved.resolve()
     if allow_outside_workspace:
         return resolved
@@ -158,7 +162,7 @@ def _is_command_allowed(command: str) -> tuple[bool, str, list[str]]:
 def get_mcp_security_policy() -> dict[str, Any]:
     return {
         "ok": True,
-        "workspace_root": str(WORKSPACE_ROOT),
+        "workspace_root": str(_workspace_root()),
         "audit_log_path": str(AUDIT_LOG_PATH),
         "allowed_roots": _get_allowed_root_strings(),
         "allowed_command_prefixes": _get_allowed_command_prefixes(),
@@ -349,7 +353,8 @@ def execute_terminal_command(
 
 def collect_system_info() -> dict[str, Any]:
     """Return local system info including hostname, user, platform, and workspace details."""
-    disk_root = Path(WORKSPACE_ROOT.anchor or WORKSPACE_ROOT.drive or "/")
+    workspace_root = _workspace_root()
+    disk_root = Path(workspace_root.anchor or workspace_root.drive or "/")
     disk_usage = shutil.disk_usage(disk_root)
     result = {
         "ok": True,
@@ -360,7 +365,7 @@ def collect_system_info() -> dict[str, Any]:
         "release": platform.release(),
         "python_version": sys.version.split()[0],
         "cpu_count": os.cpu_count(),
-        "workspace_root": str(WORKSPACE_ROOT),
+        "workspace_root": str(workspace_root),
         "current_time": now_china().isoformat(),
         "current_time_cn": now_china().isoformat(),
         "timezone": "Asia/Shanghai",

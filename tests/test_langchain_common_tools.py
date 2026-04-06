@@ -7,6 +7,12 @@ from core.config import config
 
 
 class LangchainCommonToolsTests(unittest.TestCase):
+    def setUp(self):
+        self._original_workspace_root = config.get_workspace_root()
+
+    def tearDown(self):
+        config.set_workspace_root(self._original_workspace_root)
+
     def test_tools_list_contains_common_tools(self):
         names = {getattr(tool_obj, "name", "") for tool_obj in tools_mod.tools}
         self.assertIn("get_current_time", names)
@@ -67,8 +73,9 @@ class LangchainCommonToolsTests(unittest.TestCase):
             root = Path(tempdir)
 
             original_extra_roots = list(config.extra_write_roots)
+            original_workspace_root = config.get_workspace_root()
             config.clear_write_roots()
-            config.grant_write_root(str(root))
+            config.set_workspace_root(str(root))
             try:
                 created = tools_mod.write_text_file.invoke(
                     {"path": "out.txt", "content": "hello", "overwrite": False, "append": False}
@@ -77,6 +84,7 @@ class LangchainCommonToolsTests(unittest.TestCase):
                     {"path": "out.txt", "content": "world", "overwrite": False, "append": False}
                 )
             finally:
+                config.set_workspace_root(original_workspace_root)
                 config.extra_write_roots = original_extra_roots
 
         self.assertTrue(created["ok"])
@@ -155,6 +163,15 @@ class LangchainCommonToolsTests(unittest.TestCase):
         self.assertEqual(result["value"], "alice")
         self.assertTrue(list_result["ok"])
         self.assertEqual(list_result["value"], 42)
+
+    def test_list_write_roots_defaults_to_configured_workspace_root(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            workspace_root = Path(tempdir) / "workspace"
+            workspace_root.mkdir()
+
+            config.set_workspace_root(str(workspace_root))
+
+            self.assertEqual(config.list_write_roots(), [str(workspace_root.resolve())])
 
 
 if __name__ == "__main__":

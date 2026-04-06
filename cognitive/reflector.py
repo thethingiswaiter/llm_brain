@@ -1,14 +1,28 @@
 from typing import Dict, Any, Tuple
 import re
 from core.llm.manager import llm_manager
-from cognitive.structured_output import parse_json_object, StructuredOutputError, StructuredOutputSchemaError
+from cognitive.structured_output import (
+    StructuredOutputError,
+    StructuredOutputFunctionCallError,
+    StructuredOutputSchemaError,
+    invoke_function_call,
+    parse_json_object,
+)
 
 class Reflector:
+    def _looks_like_write_task(self, subtask: str, expected_outcome: str = "") -> bool:
+        combined = f"{subtask}\n{expected_outcome}".lower()
+        markers = [
+            "写", "写入", "保存", "创建", "追加", "覆盖", "修改", "更新", "生成", "补充", "添加",
+            "write", "save", "create", "append", "overwrite", "modify", "update",
+        ]
+        return any(marker in combined for marker in markers)
+
     def _looks_like_observation_task(self, subtask: str, expected_outcome: str = "") -> bool:
         combined = f"{subtask}\n{expected_outcome}".lower()
         markers = [
-            "查看", "读取", "列出", "查询", "显示", "检查", "获取", "内容", "路径", "文件", "目录",
-            "read", "show", "list", "inspect", "query", "content", "path", "file", "directory",
+            "查看", "读取", "列出", "查询", "显示", "检查", "获取",
+            "read", "show", "list", "inspect", "query", "get",
         ]
         return any(marker in combined for marker in markers)
 
@@ -42,7 +56,11 @@ class Reflector:
             - reflection_note: str (分析原因：特征不足？外部缺失？推演错乱？)
             - action: 'continue', 'retry', 'ask_user'
         """
-        if self._looks_like_observation_task(subtask, expected_outcome) and self._has_concrete_observation(actual_result):
+        if (
+            self._looks_like_observation_task(subtask, expected_outcome)
+            and not self._looks_like_write_task(subtask, expected_outcome)
+            and self._has_concrete_observation(actual_result)
+        ):
             return True, "已基于现有工具结果获得可直接返回的观测结果。", "continue"
 
         expected_section = f"预期结果: {expected_outcome}\n" if str(expected_outcome or "").strip() else ""
@@ -61,7 +79,8 @@ class Reflector:
         - "retry" if a different approach to the same task might work.
         - "ask_user" if completely blocked and extra knowledge/action is needed.
 
-        只返回 JSON，不要输出解释或 Markdown 代码块。
+        如果模型支持函数调用，请直接调用函数返回结构化结果，不要输出解释文本。
+        如果模型不支持函数调用，只返回 JSON，不要输出解释或 Markdown 代码块。
         请严格按以下 JSON 返回:
         {{
             "success": true/false,
@@ -70,18 +89,39 @@ class Reflector:
         }}
         """
         try:
-            response = llm_manager.invoke(prompt, source="reflector.verify_and_reflect")
-            raw_payload = getattr(response, "content", response)
             try:
-                data = parse_json_object(
-                    raw_payload,
-                    required_fields={"success": bool, "reflection": str, "action": str},
+                data = invoke_function_call(
+                    prompt,
+                    function_name="submit_reflection",
+                    function_description="Return the validation result for the current subtask.",
+                    parameters_schema={
+                        "type": "object",
+                        "properties": {
+                            "success": {"type": "boolean"},
+                            "reflection": {"type": "string"},
+                            "action": {"type": "string", "enum": ["continue", "retry", "ask_user"]},
+                        },
+                        "required": ["success", "reflection", "action"],
+                    },
+                    source="reflector.verify_and_reflect.function_call",
+                    fallback_content_parser=lambda value: parse_json_object(
+                        value,
+                        required_fields={"success": bool, "reflection": str, "action": str},
+                    ),
                 )
-            except StructuredOutputError:
-                data = parse_json_object(
-                    llm_manager._stringify_response(response),
-                    required_fields={"success": bool, "reflection": str, "action": str},
-                )
+            except StructuredOutputFunctionCallError:
+                response = llm_manager.invoke(prompt, source="reflector.verify_and_reflect")
+                raw_payload = getattr(response, "content", response)
+                try:
+                    data = parse_json_object(
+                        raw_payload,
+                        required_fields={"success": bool, "reflection": str, "action": str},
+                    )
+                except StructuredOutputError:
+                    data = parse_json_object(
+                        llm_manager._stringify_response(response),
+                        required_fields={"success": bool, "reflection": str, "action": str},
+                    )
             if data["action"] not in {"continue", "retry", "ask_user"}:
                 raise StructuredOutputSchemaError("Field action must be one of continue/retry/ask_user.")
             return (

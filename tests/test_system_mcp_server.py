@@ -5,16 +5,19 @@ from pathlib import Path
 
 from mcp_servers import system_mcp_server
 from mcp_servers.system_mcp_server import collect_system_info, execute_terminal_command, get_mcp_security_policy, inspect_file_system_path
+from core.config import config
 
 
 class SystemMCPServerTests(unittest.TestCase):
     def setUp(self):
         self._original_audit_path = system_mcp_server.AUDIT_LOG_PATH
+        self._original_workspace_root = config.get_workspace_root()
         self._audit_dir = tempfile.TemporaryDirectory()
         system_mcp_server.AUDIT_LOG_PATH = Path(self._audit_dir.name) / "system_mcp_audit.jsonl"
 
     def tearDown(self):
         system_mcp_server.AUDIT_LOG_PATH = self._original_audit_path
+        config.set_workspace_root(self._original_workspace_root)
         self._audit_dir.cleanup()
 
     def test_execute_terminal_command_runs_simple_command(self):
@@ -107,6 +110,15 @@ class SystemMCPServerTests(unittest.TestCase):
 
         self.assertGreaterEqual(len(lines), 2)
         self.assertIn("execute_terminal_command", lines[0])
+
+    def test_security_policy_uses_configured_workspace_root(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            config.set_workspace_root(tempdir)
+
+            result = get_mcp_security_policy()
+
+        self.assertEqual(result["workspace_root"], str(Path(tempdir).resolve()))
+        self.assertIn(str(Path(tempdir).resolve()), result["allowed_roots"])
 
 
 if __name__ == "__main__":

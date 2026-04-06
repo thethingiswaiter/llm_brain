@@ -46,7 +46,7 @@ _UNARY_OPERATORS = {
 
 
 def _workspace_root() -> Path:
-    return Path(config.resolve_path(".")).resolve()
+    return Path(config.resolve_workspace_path(".")).resolve()
 
 
 def _resolve_read_path(path_value: str | None) -> Path:

@@ -11,7 +11,14 @@ if __package__ is None or __package__ == "":
 
 from core.llm.manager import llm_manager
 from app.agent.core import agent
-from app.cli.commands import build_commands, build_natural_language_command, build_request_mode_label, handle_plain_message
+from app.cli.commands import (
+    build_commands,
+    build_natural_language_command,
+    build_request_mode_label,
+    handle_plain_message,
+    resume_with_followup,
+    should_auto_resume_from_followup,
+)
 from app.cli.terminal_ui import TerminalUI
 
 
@@ -161,6 +168,12 @@ def start_cli(input_func=input, output_func=print, agent_instance=agent, llm_man
                     with ui.busy(_status_text_for_input(mapped_command, is_command=True)):
                         mapped_handler.handler(mapped_command, context)
                     continue
+
+            should_auto_resume, resume_request_id = should_auto_resume_from_followup(agent_instance, user_input)
+            if should_auto_resume:
+                with ui.busy("Resuming blocked request with follow-up"):
+                    resume_with_followup(context, resume_request_id, user_input)
+                continue
 
             with ui.busy(_status_text_for_input(user_input, is_command=False)):
                 handle_plain_message(user_input, context)

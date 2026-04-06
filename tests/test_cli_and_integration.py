@@ -92,10 +92,11 @@ class FakeCLIManager:
 class FakeCLIAgent:
     def __init__(self):
         self._last_request_id = "req_cli"
+        self._last_resume_followup = ""
         self.loaded_mcp_refs = []
         self.unloaded_mcp_refs = []
         self.refreshed_mcp_refs = []
-        self.write_roots = [config.resolve_path(".")]
+        self.write_roots = [config.get_workspace_root()]
         self._mcp_servers = [
             {
                 "name": "system_mcp_server",
@@ -491,10 +492,13 @@ class FakeCLIAgent:
             return list(self._blocked_request_snapshots)
         return []
 
-    def resume_from_snapshot(self, request_id, snapshot_name=None, reroute=False):
+    def resume_from_snapshot(self, request_id, snapshot_name=None, reroute=False, user_followup=None):
         self._last_request_id = "req_resume"
         mode = "reroute" if reroute else "continue"
-        return f"resumed:{request_id}:{snapshot_name}:{mode}"
+        followup_text = str(user_followup or "").strip()
+        self._last_resume_followup = followup_text
+        suffix = f":followup={followup_text}" if followup_text else ""
+        return f"resumed:{request_id}:{snapshot_name}:{mode}{suffix}"
 
     def get_recent_request_summaries(self, limit=10, statuses=None, resumed_only=False, attention_only=False, since_seconds=None):
         items = list(self._recent)
@@ -588,13 +592,13 @@ class FakeCLIAgent:
         return True, f"refreshed_mcp:{server_ref}"
 
     def grant_write_access(self, path):
-        normalized = config.resolve_path(path)
+        normalized = config.resolve_workspace_path(path)
         if normalized not in self.write_roots:
             self.write_roots.append(normalized)
         return f"Granted write access: {normalized}"
 
     def revoke_write_access(self, path):
-        normalized = config.resolve_path(path)
+        normalized = config.resolve_workspace_path(path)
         if normalized in self.write_roots[1:]:
             self.write_roots.remove(normalized)
             return f"Revoked write access: {normalized}"
@@ -605,6 +609,16 @@ class FakeCLIAgent:
 
 
 class CLITestCases(unittest.TestCase):
+    def test_shared_followup_auto_resume_detects_waiting_request(self):
+        from app.cli.commands import should_auto_resume_from_followup
+
+        agent = FakeCLIAgent()
+        agent.invoke("book something for me")
+        should_resume, request_id = should_auto_resume_from_followup(agent, "本地")
+
+        self.assertTrue(should_resume)
+        self.assertEqual("req_message_blocked", request_id)
+
     def test_textual_app_builds_status_line(self):
         from app.cli.textual_app import AgentTextualApp
 
@@ -615,6 +629,8 @@ class CLITestCases(unittest.TestCase):
         self.assertIn("request req_cli", status_line)
         self.assertIn("stage request_completed", status_line)
         self.assertIn("progress 1/1", status_line)
+        self.assertIn("workspace llm_brain", status_line)
+        self.assertIn("selection -", status_line)
         self.assertIn("model ollama:", status_line)
         self.assertIn("mcp 1", status_line)
 
@@ -764,6 +780,22 @@ class CLITestCases(unittest.TestCase):
 
         self.assertIn("req_recent_3", suggestions)
         self.assertIn("req_recent_2", suggestions)
+
+    def test_textual_app_process_input_auto_resumes_latest_waiting_request(self):
+        from app.cli.textual_app import AgentTextualApp
+
+        agent = FakeCLIAgent()
+        agent.invoke("book something for me")
+        app = AgentTextualApp(agent_instance=agent, llm_manager_instance=FakeCLIManager())
+        emitted: list[str] = []
+        app._threadsafe_emit = emitted.append
+        app._set_busy = lambda value: None
+
+        AgentTextualApp._process_input.__wrapped__(app, "本地")
+
+        rendered = "\n".join(emitted)
+        self.assertIn("Auto-resume: continued request req_message_blocked with your follow-up input.", rendered)
+        self.assertIn("resumed:req_message_blocked:planning_completed:reroute:followup=本地", rendered)
 
     def test_build_prompt_overview_includes_mode_status_and_tool_counts(self):
         from app.cli.main import _build_prompt_overview
@@ -1042,6 +1074,20 @@ class CLITestCases(unittest.TestCase):
         self.assertIn("----------------------------------------", rendered)
         self.assertIn("Response:", rendered)
         self.assertIn("Please confirm whether to query local or remote host.", rendered)
+
+    def test_plain_followup_auto_resumes_latest_waiting_request(self):
+        from app.cli import main as cli
+        output = FakeCLIOutput()
+        cli.start_cli(
+            input_func=FakeCLIInput(["book something for me", "本地", "quit"]),
+            output_func=output,
+            agent_instance=FakeCLIAgent(),
+            llm_manager_instance=FakeCLIManager(),
+        )
+
+        rendered = output.joined()
+        self.assertIn("Auto-resume: continued request req_message_blocked with your follow-up input.", rendered)
+        self.assertIn("resumed:req_message_blocked:planning_completed:reroute:followup=本地", rendered)
 
     def test_blocked_request_summary_renders_subtask_view(self):
         from app.cli import main as cli
@@ -1630,10 +1676,10 @@ class CLITestCases(unittest.TestCase):
         )
 
         rendered = output.joined()
-        self.assertIn(f"Granted write access: {config.resolve_path('runtime_state')}", rendered)
+        self.assertIn(f"Granted write access: {config.resolve_workspace_path('runtime_state')}", rendered)
         self.assertIn("Writable roots:", rendered)
-        self.assertIn(config.resolve_path("."), rendered)
-        self.assertIn(config.resolve_path("runtime_state"), rendered)
+        self.assertIn(config.get_workspace_root(), rendered)
+        self.assertIn(config.resolve_workspace_path("runtime_state"), rendered)
 
     def test_revoke_write_command_removes_granted_root(self):
         from app.cli import main as cli
@@ -1653,11 +1699,42 @@ class CLITestCases(unittest.TestCase):
         )
 
         rendered = output.joined()
-        self.assertIn(f"Revoked write access: {config.resolve_path('runtime_state')}", rendered)
+        self.assertIn(f"Revoked write access: {config.resolve_workspace_path('runtime_state')}", rendered)
         self.assertIn("Writable roots:", rendered)
         rendered_after_list = rendered.split("Writable roots:")[-1]
-        self.assertIn(config.resolve_path("."), rendered_after_list)
-        self.assertNotIn(config.resolve_path("runtime_state"), rendered_after_list)
+        self.assertIn(config.get_workspace_root(), rendered_after_list)
+        self.assertNotIn(config.resolve_workspace_path("runtime_state"), rendered_after_list)
+
+    def test_workspace_files_command_lists_and_selects_file(self):
+        from app.cli import main as cli
+
+        original_workspace_root = config.get_workspace_root()
+        try:
+            with tempfile.TemporaryDirectory() as tempdir:
+                file_path = os.path.join(tempdir, "demo.txt")
+                with open(file_path, "w", encoding="utf-8") as file_handle:
+                    file_handle.write("hello")
+
+                config.set_workspace_root(tempdir)
+                output = FakeCLIOutput()
+                cli.start_cli(
+                    input_func=FakeCLIInput([
+                        "/workspace_files",
+                        "/pick 1",
+                        "quit",
+                    ]),
+                    output_func=output,
+                    agent_instance=FakeCLIAgent(),
+                    llm_manager_instance=FakeCLIManager(),
+                )
+        finally:
+            config.set_workspace_root(original_workspace_root)
+
+        rendered = output.joined()
+        self.assertIn("Workspace files: .", rendered)
+        self.assertIn("[1] demo.txt | file | path=demo.txt", rendered)
+        self.assertIn("Selected workspace file: demo.txt", rendered)
+        self.assertIn("Use this path in your next command or prompt: demo.txt", rendered)
 
     def test_new_session_command_updates_session_for_following_message(self):
         from app.cli import main as cli

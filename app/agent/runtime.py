@@ -377,7 +377,13 @@ class AgentRuntime:
         finally:
             self.clear_request(request_id)
 
-    def resume_from_snapshot(self, request_id: str, snapshot_name: str = None, reroute: bool = False):
+    def resume_from_snapshot(
+        self,
+        request_id: str,
+        snapshot_name: str = None,
+        reroute: bool = False,
+        user_followup: str | None = None,
+    ):
         payload = self.agent._load_snapshot_payload(request_id, snapshot_name=snapshot_name)
         if not payload:
             return (
@@ -411,6 +417,7 @@ class AgentRuntime:
             payload,
             request_id=new_request_id,
             reroute=reroute,
+            user_followup=str(user_followup or "").strip(),
         )
         self.agent.session_id = restored_state.get("session_id", self.agent.session_id)
 

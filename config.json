@@ -20,7 +20,7 @@
             }
         },
         "logging": {
-            "file_name": "llm_trace.log",
+            "file_name": "llm_trace.jsonl",
             "max_chars": 10000
         },
         "timeouts": {
@@ -28,6 +28,7 @@
         }
     },
     "paths": {
+        "workspace_root": "d:/file/vscode/llm_brain",
         "mcp_servers_dir": "mcp_servers",
         "tools_dir": "tools",
         "skill_dir": "skills",

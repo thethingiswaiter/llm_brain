@@ -161,6 +161,19 @@ class SkillRoutingTests(unittest.TestCase):
 
         self.assertEqual([item["name"] for item in matched], ["list_directory"])
 
+    def test_file_update_query_keeps_write_tool_candidate(self):
+        read_tool = FakeTool("read_text_file", "读取工作区内 UTF-8 文本文件内容。")
+        write_tool = FakeTool("write_text_file", "在工作区内写入 UTF-8 文本文件。默认不覆盖已存在文件，可选 append。")
+        self.manager.register_tools([read_tool, write_tool])
+
+        matched = self.manager.find_relevant_tools(
+            r"D:\file\vscode\llm_brain\runtime_state\snapshots\nginx.conf补充一个常规的nginx的配置到这个文件",
+            ["nginx", "配置文件", "补充", "文件路径"],
+            limit=5,
+        )
+
+        self.assertIn("write_text_file", [item["name"] for item in matched])
+
     def test_file_search_does_not_route_builtin_terminal_tool(self):
         bash_tool = FakeTool("bash", "安全执行终端命令，可用于 rg、git、python、pytest 和工作区内文件搜索。")
         list_tool = FakeTool("list_directory", "列出工作区内目录项（安全边界：仅允许工作区内路径）。")
